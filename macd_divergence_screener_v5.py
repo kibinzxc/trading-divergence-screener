@@ -915,6 +915,8 @@ def classify_mover(m):
         flags.append("VOLUME SPIKE")
     if rm >= MOVER_RANGE_MULT:
         flags.append("RANGE EXPANSION")
+    if chg >= MOVER_MIN_CHG_PCT:
+        flags.append("BIG MOVE")
     if hi_d is not None and hi_d <= 0:
         flags.append("ABOVE 7D HIGH")
     elif hi_d is not None and hi_d <= MOVER_EDGE_PCT:
@@ -1155,11 +1157,28 @@ def add_no_cache_headers(resp):
 
 @app.route("/")
 def index():
-    return (HTML
-            .replace("__TF_CFG_JSON__", json.dumps({k: {"label": v["label"], "minutes": v["minutes"]}
-                                                    for k, v in TF_CFG.items()}))
-            .replace("__DEFAULT_VOL_M__", str(int(DEFAULT_MIN_WEEKLY_VOL / 1e6)))
-            .replace("__DEFAULT_MAX_PAIRS__", str(DEFAULT_MAX_PAIRS)))
+    # Thresholds are templated in so the dashboard's highlights and tooltips
+    # cannot drift from the constants the scans actually use.
+    tmpl = {
+        "__TF_CFG_JSON__": json.dumps({k: {"label": v["label"], "minutes": v["minutes"]}
+                                       for k, v in TF_CFG.items()}),
+        "__DEFAULT_VOL_M__": str(int(DEFAULT_MIN_WEEKLY_VOL / 1e6)),
+        "__DEFAULT_MAX_PAIRS__": str(DEFAULT_MAX_PAIRS),
+        "__MOVER_CHG__":   format(MOVER_MIN_CHG_PCT, "g"),
+        "__MOVER_VOL__":   format(MOVER_VOL_MULT, "g"),
+        "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
+        "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
+        "__OI_LB__":       str(OI_LOOKBACK_D),
+        "__OI_MIN__":      format(OI_MIN_CHANGE_PCT, "g"),
+        "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
+        "__FUND_SPOT__":   format(FUND_SPOT_LED_MAX, "g"),
+        "__FUND_CROWD__":  format(FUND_CROWDED_MIN, "g"),
+        "__FUND_SQUEEZE__": format(FUND_SQUEEZE_MAX, "g"),
+    }
+    html = HTML
+    for k, v in tmpl.items():
+        html = html.replace(k, v)
+    return html
 
 
 @app.route("/signals")
@@ -2090,6 +2109,7 @@ tbody tr{animation:ri .3s var(--eout) both}
 .mf-rng{background:#1B1030;color:#C4A0FF;border:1px solid #3A2A5A}
 .mf-hi{background:var(--bull-bg);color:var(--bull);border:1px solid #1a4020}
 .mf-lo{background:var(--bear-bg);color:var(--bear);border:1px solid #4a1a22}
+.mf-move{background:#0F2A3A;color:#7DD3FC;border:1px solid #1F4A66}
 .mpos{position:relative;width:88px;height:5px;background:var(--sf3);border-radius:3px}
 .mpos i{position:absolute;top:-3px;width:3px;height:11px;border-radius:2px;background:var(--tx);transform:translateX(-1px)}
 .mlv{font-family:var(--mono);font-size:10px;color:var(--tx2);white-space:nowrap;line-height:1.6}
@@ -2217,11 +2237,13 @@ tbody tr{animation:ri .3s var(--eout) both}
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th>Status</th><th>Type</th>
-          <th class="sortable sorted" data-sort="score">Setup score &#8595;</th>
-          <th class="sortable" data-sort="vol">Weekly vol</th>
-          <th class="sortable" data-sort="age">Signal date</th>
-          <th>Stop</th><th>Targets (1R / 2R / 3R)</th>
+          <th title="Where price is now relative to the signal. At the signal = still near the pivot. Extended = moved on without the stop or 1R being hit. Ran = reached 1R or better. Invalidated = traded through the stop.">Status</th>
+          <th title="Regular bullish: price makes a lower low while MACD makes a higher low. Regular bearish: price makes a higher high while MACD makes a lower high. Both are counter-trend reversal signatures.">Type</th>
+          <th class="sortable sorted" data-sort="score" title="How textbook the structure is, 0-100: divergence size vs the leg (30) + decisiveness of the price break in ATR terms (15) + pivot spacing (15) + classic side of the MACD zero line (15) + MACD crossing its signal line since the pivot (15) + liquidity (10). Describes the picture. Not a win rate, not backtested.">Setup score &#8595;</th>
+          <th class="sortable" data-sort="vol" title="Rolling 7-day traded value in USD, measured from the candles. The liquidity gate.">Weekly vol</th>
+          <th class="sortable" data-sort="age" title="Time of pivot B, the bar that completed the divergence. FRESH = it completed within the last few bars of this timeframe.">Signal date</th>
+          <th title="Just past pivot B (its low for bullish, its high for bearish) plus an ATR-sized buffer. Price trading through it means the divergence has failed. Risk = stop distance as a % of the entry reference.">Stop</th>
+          <th title="Multiples of the stop distance. Anchored to the signal price while the setup is still near it; re-anchored to the live price once it has run, because if you enter now your risk is measured from now.">Targets (1R / 2R / 3R)</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -2265,8 +2287,14 @@ tbody tr{animation:ri .3s var(--eout) both}
   <div class="tw" style="overflow:visible">
     <table id="wT" style="display:none">
       <thead><tr>
-        <th>Coin</th><th>&Delta;OI 7d</th><th>OI now</th><th>&Delta;Price 7d</th>
-        <th>Quadrant</th><th>Funding /day</th><th>Read</th><th>Weekly vol</th>
+        <th>Coin</th>
+        <th title="Open interest now vs about __OI_LB__ days ago, in USD. A pair is listed only if this moved at least __OI_MIN__% either way. OI only rises when new positions are opened, which is the whole reason to look.">&Delta;OI 7d</th>
+        <th title="Current open interest in USD. Underneath: OI as a multiple of average daily volume. Above __OI_VOL__x, positions cannot exit without moving the price.">OI now</th>
+        <th title="Close-to-close price change over the same __OI_LB__-day window.">&Delta;Price 7d</th>
+        <th title="Sign of price and OI together. Price up + OI up = NEW LONGS. Price down + OI up = NEW SHORTS. OI falling means positions closing (SHORT COVERING or CAPITULATION), shown dimmed: movement without new conviction. Hover a badge for detail.">Quadrant</th>
+        <th title="Funding rate normalised to % per day (intervals differ per contract). Neutral is about 0.03%/day. Positive = longs pay shorts.">Funding /day</th>
+        <th title="Health read from funding and crowding. Hover a tag for its definition and threshold.">Read</th>
+        <th title="Rolling 7-day traded value in USD. The liquidity gate.">Weekly vol</th>
       </tr></thead>
       <tbody id="wB"></tbody>
     </table>
@@ -2296,9 +2324,14 @@ tbody tr{animation:ri .3s var(--eout) both}
   <div class="tw" style="overflow:visible">
     <table id="mvT" style="display:none">
       <thead><tr>
-        <th>#</th><th>Coin</th><th>Standout</th><th>&Delta;1d</th>
-        <th>Vol vs 20d</th><th>Range vs ATR20</th><th>Position in 7d range</th>
-        <th>Levels</th><th>Read</th>
+        <th>#</th><th>Coin</th>
+        <th title="How unusual the day was, 0-100: volume anomaly (35) + range expansion (30) + proximity to a 7-day boundary (20) + size of the move (15). Has no direction. Not a win rate, not backtested.">Standout</th>
+        <th title="Last completed daily bar, close to close. Highlighted at __MOVER_CHG__%+, which is one of the three triggers. The small figure underneath is the live move since that close.">&Delta;1d</th>
+        <th title="Traded value of the last completed day as a multiple of this coin's own 20-day average. __MOVER_VOL__x+ is a trigger. A self-ratio only, never a dollar figure.">Vol vs 20d</th>
+        <th title="True range of the last completed day as a multiple of this coin's own 20-day ATR. __MOVER_RNG__x+ is a trigger.">Range vs ATR20</th>
+        <th title="Where the live price sits between the 7-day low (0%) and the 7-day high (100%).">Position in 7d range</th>
+        <th title="PDH / PDL: prior-day high and low. 7D: the 7-day range boundaries. The levels to plan around, and the point where you are wrong.">Levels</th>
+        <th title="Why this coin is on the list. Any one trigger qualifies. Hover a tag for its definition and threshold.">Read</th>
       </tr></thead>
       <tbody id="mvB"></tbody>
     </table>
@@ -2651,6 +2684,27 @@ var WQ = {
 };
 var WFLAG = {'SPOT-LED':'wf-spot','CROWDED LONGS':'wf-crowd','SQUEEZE FUEL':'wf-squeeze','HIGH OI/VOL':'wf-hioi'};
 
+var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__,
+          oiVol:__OI_VOL__, fundSpot:__FUND_SPOT__, fundCrowd:__FUND_CROWD__, fundSqueeze:__FUND_SQUEEZE__};
+var TIP = {
+  'NEW LONGS':       'Price up + OI up: new money opening longs. A real trend if funding is not rich.',
+  'NEW SHORTS':      'Price down + OI up: new money opening shorts. A real downtrend, or a squeeze being loaded.',
+  'SHORT COVERING':  'Price up + OI down: shorts closing, not buyers arriving. Movement without new conviction.',
+  'CAPITULATION':    'Price down + OI down: longs closing. Movement without new conviction.',
+  'SPOT-LED':        'New longs with funding at or below ' + TH.fundSpot + '%/day: buyers are in spot while shorts fight it. The healthy version.',
+  'CROWDED LONGS':   'New longs with funding at or above ' + TH.fundCrowd + '%/day: leverage arriving late and paying for it.',
+  'SQUEEZE FUEL':    'New shorts with funding at or below ' + TH.fundSqueeze + '%/day: shorts are crowded and paying. Fuel for a squeeze.',
+  'HIGH OI/VOL':     'Open interest above ' + TH.oiVol + 'x average daily volume: positions cannot exit without moving price. A crowding warning, no direction.',
+  'VOLUME SPIKE':    'Traded value at ' + TH.vol + 'x+ this coin\'s own 20-day average. Trigger.',
+  'RANGE EXPANSION': 'True range at ' + TH.rng + 'x+ this coin\'s own 20-day ATR. Trigger.',
+  'BIG MOVE':        'Close-to-close move of ' + TH.chg + '%+ on the last completed day. Trigger.',
+  'AT RANGE HIGH':   'Within ' + TH.edge + '% of the 7-day high.',
+  'ABOVE 7D HIGH':   'Price has traded through the 7-day high.',
+  'AT RANGE LOW':    'Within ' + TH.edge + '% of the 7-day low.',
+  'BELOW 7D LOW':    'Price has traded through the 7-day low.'
+};
+function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
+
 function wMatches(r, f){
   if(f === 'longs')   return r.quadrant === 'NEW LONGS';
   if(f === 'shorts')  return r.quadrant === 'NEW SHORTS';
@@ -2696,7 +2750,7 @@ function renderWatch(){
     var q = WQ[r.quadrant] || WQ['CAPITULATION'];
     var dimmed = (r.quadrant === 'SHORT COVERING' || r.quadrant === 'CAPITULATION');
     var flags = (r.flags || []).map(function(f){
-      return '<span class="wflag ' + (WFLAG[f] || 'wf-hioi') + '">' + f + '</span>';
+      return '<span class="wflag ' + (WFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
     }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
     var fund = r.funding_day_pct === null || r.funding_day_pct === undefined ? '&mdash;'
              : (r.funding_day_pct >= 0 ? '+' : '') + r.funding_day_pct.toFixed(3) + '%';
@@ -2707,7 +2761,7 @@ function renderWatch(){
       '<td><span style="font-family:var(--mono);font-weight:600;color:' + (r.oi_chg_pct >= 0 ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.oi_chg_pct) + '</span></td>' +
       '<td class="volc">' + fmtVol(r.oi_usd) + (r.oi_vol_ratio ? '<small>' + r.oi_vol_ratio + 'x daily vol</small>' : '') + '</td>' +
       '<td><span style="font-family:var(--mono);color:' + (r.price_chg_pct >= 0 ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.price_chg_pct) + '</span></td>' +
-      '<td><span class="' + q.cls + '">' + r.quadrant + '</span></td>' +
+      '<td><span class="' + q.cls + '"' + tip(r.quadrant) + '>' + r.quadrant + '</span></td>' +
       '<td><span style="font-family:var(--mono);font-size:11px;color:var(--tx2)">' + fund + '</span></td>' +
       '<td>' + flags + '</td>' +
       '<td>' + volCell(r) + '</td>';
@@ -2782,7 +2836,7 @@ function startWatch(){
 
 /* ── Movers (daily watchlist) ─────────────────────────────────────────────── */
 var _mf = 'all', _mrows = [], mes = null;
-var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng',
+var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-move',
              'AT RANGE HIGH':'mf-hi','ABOVE 7D HIGH':'mf-hi',
              'AT RANGE LOW':'mf-lo','BELOW 7D LOW':'mf-lo'};
 
@@ -2833,19 +2887,20 @@ function renderMovers(){
   document.getElementById('mvT').style.display = 'table';
   rows.forEach(function(r, i){
     var flags = (r.flags || []).map(function(f){
-      return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '">' + f + '</span>';
+      return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
     }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
-    var up = r.chg_1d_pct >= 0;
+    var up  = r.chg_1d_pct >= 0;
+    var big = Math.abs(r.chg_1d_pct || 0) >= TH.chg;
     var tr = document.createElement('tr');
     tr.className = up ? 'rb' : 'rr';
     tr.innerHTML =
       '<td><span class="mrank' + (i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
       '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div></td>' +
       '<td>' + qcell(r.score) + '</td>' +
-      '<td><span style="font-family:var(--mono);font-weight:600;color:' + (up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
+      '<td><span style="font-family:var(--mono);font-weight:600;color:' + (big ? 'var(--fresh)' : up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
         '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">today ' + fmtPct(r.chg_live_pct) + '</div></td>' +
-      '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= 2 ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
-      '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= 1.5 ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
+      '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= TH.vol ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
+      '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= TH.rng ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
       '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
         '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:3px">' + r.pos_in_range + '% of range</div></td>' +
       '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + ' &nbsp;<small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +

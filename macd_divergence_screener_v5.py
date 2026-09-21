@@ -2128,6 +2128,7 @@ tbody tr{animation:ri .3s var(--eout) both}
     <button class="nav-btn" data-pg="signals">Signals</button>
     <button class="nav-btn" data-pg="watch">Watchlist</button>
     <button class="nav-btn" data-pg="movers">Movers</button>
+    <button class="nav-btn" data-pg="routine">Routine</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
   <div class="t-right">
@@ -2336,6 +2337,88 @@ tbody tr{animation:ri .3s var(--eout) both}
       <tbody id="mvB"></tbody>
     </table>
     <div class="no-sig" id="mvEmpty">No movers scan yet &mdash; hit Scan Movers.</div>
+  </div>
+</div>
+
+<div id="pg-routine" class="page" style="overflow-y:auto;padding:24px">
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Daily routine &mdash; how to use the three scans together</div>
+    <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75;margin-bottom:18px">
+      Movers finds what moved, the Scanner finds where momentum disagrees with price, and the Watchlist
+      says whether new money is behind it. Run them in that order, once a day, after the daily candle has
+      closed. About fifteen minutes.
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Before you run anything</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run after the daily close.</b> Perp daily candles close at 00:00 UTC, which is 08:00 Manila. Every scan reads the last <b>completed</b> daily bar, so a run at 07:00 Manila still describes the day before yesterday. Aim for 08:00 to 10:00 Manila.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Pick the exchange with the deepest book.</b> Binance carries the most volume on most pairs. Some majors trade thinly on other venues and get volume-rejected there for no chart reason. Each tab has its own exchange dropdown; keep them the same.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One volume floor for everything.</b> The Min 7-day volume box on the Scanner tab applies to all three scans. Default is $70M a week, about $10M a day. Names under that do not exist to the screener. If a coin you expected is missing, check the audit line under the table before assuming there was no setup.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Read the audit line every time.</b> It says how many pairs were scanned, volume-rejected, errored, and whether the run finished. A short list from an unfinished scan is not a quiet market.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Step 1 &mdash; Movers: what did something unusual yesterday</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Scan Movers, keep the All filter, read by score.</b> Top 4 is a shortcut, not the list. The score ranks how unusual the day was and how close price sits to a 7-day boundary. It has no direction.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Extended runs are the rows flagged ABOVE 7D HIGH or AT RANGE HIGH with a big 1-day change.</b> The At range high filter isolates them. These names have already run for days. Treat them as fade-or-wait candidates, not chases, until the Scanner shows a bearish divergence or price gives back the prior-day low.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Breakdowns are the mirror.</b> BELOW 7D LOW or AT RANGE LOW with a big negative day. Same logic, other side.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Levels come with the row.</b> PDH and PDL are yesterday's high and low, the 7D range is the box price is in, and the position bar shows where in that box it sits now. Write the level down; that is the part a watchlist poster leaves out.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Known blind spot.</b> A coin that had a quiet day is dropped even if it is sitting in a clean consolidation after a breakout. Movers will not show you the pullback. Step 2 does.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Step 2 &mdash; Scanner on 4H: where momentum disagrees with price</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run 4H on Balanced.</b> Loose finds more and most of it is junk. Strict adds the zero-line rule and misses real setups. Balanced is the default for a reason.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>On the Signals tab, look at Fresh first, then At the signal.</b> Fresh means the second pivot formed within the last 12 bars, two days on 4H. At the signal means price is still within about 2% of where the divergence completed. Those two filters are your entry candidates.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Ran and invalidated are history.</b> Ran means the move already happened and the targets shown are re-anchored to spot. Invalidated means price traded through the stop. Neither is an entry. They are useful only for checking what the scanner saw before a coin appeared on someone's list.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Bullish rows are your pullback candidates.</b> A regular bullish divergence on 4H during a dip is the structural version of a first pullback after the impulse. This is where the pullback names show up, usually a few days before they get posted.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Bearish rows on extended names are your fade candidates.</b> Cross-check against Step 1: a name at its range high with a fresh bearish divergence is the only version of shorting the run that this screener will vouch for.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Then 1D for context.</b> Same reading, bigger picture. Fresh on 1D means within 3 bars. A 4H setup that agrees with a 1D one is worth more than either alone.</div></div>
+      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Symbols override for a specific name.</b> Type tickers into the Symbols box to scan only those. The volume floor is skipped for an override, so a thin name you are curious about still gets analysed.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Step 3 &mdash; Watchlist (OI flow): is new money behind it</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Qualify names here, do not hunt for them.</b> This tab is ranked by 7-day open-interest change and reads best on a Sunday. Use it to check the names you already have from Steps 1 and 2.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>For an extended run you want NEW LONGS with SPOT-LED.</b> Price up, OI up, funding near zero: the run is being bought in spot while shorts fight it. CROWDED LONGS is the same picture with latecomer leverage paying rich funding. A fade gets stronger with CROWDED, weaker with SPOT-LED.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>For a breakdown, NEW SHORTS with SQUEEZE FUEL is the warning.</b> Shorts crowded and paying deeply negative funding can be squeezed. A pullback long into that is a better trade than a short.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL means nobody can leave quietly.</b> Expect violent moves either way. Size down.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Step 4 &mdash; Build the shortlist</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Three to five names, no more.</b> Split them into two buckets. <b>Extended</b>: wait for a fade signal or a reclaim. <b>Pullback</b>: a fresh bullish divergence or a hold of the prior-day low.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Each name gets a level, a stop and a target before the session starts.</b> From Movers: PDH, PDL, the 7D range. From the Scanner: the stop price and the 1R, 2R, 3R levels. If you cannot fill those in, the name is not a setup, it is a ticker.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Scores rank, they do not predict.</b> Both scores describe structure. Neither is a backtested win rate. A 90 is a clean picture, not a promise.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">Step 5 &mdash; Compare with the mentor's poster</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Two minutes a day.</b> For each name on the poster, note which tab surfaced it, and if none did, why: volume-rejected, quiet day, or a real miss. The audit line answers the first one.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Volume-rejected is not a miss.</b> A name that trades under the floor is excluded by design. Decide once whether you want thin names, and if so lower the floor with your eyes open: thin book, wide spreads, funding-driven drift.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>A real miss is a name with a clear structure that no scan flagged.</b> Those are the ones to write down. If the same kind of miss repeats, the screener needs a new flag, not a lower floor.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">If something looks wrong</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Partial scan warning.</b> The tab was closed mid-run or the exchange rate-limited it. Re-run at the Safe speed before trusting the table.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>A ticker says NOT LISTED.</b> The exchange you chose does not carry that perp. Try another exchange.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Nothing fresh anywhere.</b> Normal in a one-way market: regular divergences need a trend extreme to argue with. Movers still works on those days.</div></div>
+    </div>
   </div>
 </div>
 

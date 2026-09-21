@@ -84,6 +84,75 @@ Common query params (all optional, sane defaults apply):
 - `max_pairs` — cap on pairs scanned (default `400`)
 - `symbols` — comma-separated symbol allowlist (`/scan` only)
 
+## Daily routine
+
+The three scans answer three different questions. Movers finds what moved,
+the Scanner finds where momentum disagrees with price, and the Watchlist says
+whether new money is behind it. Run them in that order once a day. The same
+guide lives in the dashboard under the **Routine** tab.
+
+**Before you run anything**
+
+1. Run after the daily close. Perp daily candles close at 00:00 UTC (08:00
+   Manila). Every scan reads the last *completed* daily bar, so aim for
+   08:00 to 10:00 Manila.
+2. Use the exchange with the deepest book (Binance for most pairs). Some
+   majors trade thinly elsewhere and get volume-rejected for no chart reason.
+3. The Min 7-day volume box on the Scanner tab applies to all three scans.
+   Default `$70M/week` is roughly `$10M/day`. Names under it do not exist to
+   the screener.
+4. Read the audit line under every table. A short list from an unfinished
+   scan is not a quiet market.
+
+**Step 1 — Movers: what did something unusual yesterday**
+
+- Keep the *All* filter and read by score. *Top 4* is a shortcut, not the list.
+- Extended runs: `ABOVE 7D HIGH` / `AT RANGE HIGH` plus a big 1-day change.
+  Treat as fade-or-wait candidates, not chases. Breakdowns are the mirror.
+- Every row carries PDH, PDL, the 7-day range and where price sits in it.
+  Write the level down.
+- Blind spot: a coin that had a quiet day is dropped even if it is in a clean
+  consolidation after a breakout. Step 2 covers that.
+
+**Step 2 — Scanner on 4H: where momentum disagrees with price**
+
+- Run 4H on *Balanced*. On the Signals tab look at *Fresh* (second pivot
+  within the last 12 bars) and *At the signal* (price still within ~2% of
+  the signal). Those are the entry candidates.
+- *Ran* and *invalidated* are history, not entries.
+- Bullish rows are pullback candidates. Bearish rows on names that Step 1
+  flagged as extended are fade candidates.
+- Then run 1D for context (*Fresh* there means within 3 bars).
+- The Symbols box scans only the tickers you type and skips the volume
+  floor, so a thin name can still be checked on demand.
+
+**Step 3 — Watchlist (OI flow): is new money behind it**
+
+- Ranked by 7-day OI change; reads best on a Sunday. Use it to qualify names
+  from Steps 1 and 2, not to find new ones.
+- Extended run: you want `NEW LONGS` + `SPOT-LED`. `CROWDED LONGS` makes a
+  fade stronger.
+- Breakdown: `NEW SHORTS` + `SQUEEZE FUEL` is the warning; a pullback long
+  beats a short there.
+- `HIGH OI/VOL` means violent moves either way. Size down.
+
+**Step 4 — Build the shortlist**
+
+- Three to five names, split into *extended* (wait for a fade signal or a
+  reclaim) and *pullback* (fresh bullish divergence or a held prior-day low).
+- Each name needs a level, a stop and a target before the session: PDH/PDL
+  and the 7-day range from Movers, the stop and 1R/2R/3R from the Scanner.
+- Scores rank, they do not predict. Neither score is a backtested win rate.
+
+**Step 5 — Compare with a mentor's watchlist**
+
+- For each posted name, note which tab surfaced it, and if none did, why:
+  volume-rejected, quiet day, or a real miss. The audit line answers the
+  first one.
+- Volume-rejected is by design. Decide once whether you want thin names.
+- A real miss is a clear structure no scan flagged. If the same kind of miss
+  repeats, the screener needs a new flag, not a lower floor.
+
 ## Disclaimer
 
 Signal scores describe setup quality, not a backtested edge. This is a

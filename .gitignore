@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# runtime state written by the app
+scan_state.json
+movers_state.json
+calendar_state.json
+
+# python
+__pycache__/
+*.pyc
+.venv/

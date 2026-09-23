@@ -89,6 +89,7 @@ complete one is how you end up trusting an empty table.
 from flask import Flask, Response, jsonify, request
 from concurrent.futures import ThreadPoolExecutor
 import ccxt, pandas as pd, numpy as np, json, time, threading, queue, datetime, os
+import re, statistics, urllib.request, urllib.error
 
 app = Flask(__name__)
 
@@ -240,11 +241,58 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
 
+# ── News calendar ──────────────────────────────────────────────────────────────
+# Scheduled macro prints, so a setup is never sized into a CPI or FOMC release
+# by accident. JBlanked (ForexFactory's data behind a free API key) is the
+# primary source; ForexFactory's own weekly JSON is the keyless fallback.
+CAL_STATE_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "calendar_state.json")
+CAL_REFRESH_MIN   = 30    # minutes between ForexFactory fetches (free feed)
+# JBlanked's calendar endpoints are metered: every call costs an account credit.
+# It only supplies the schedule past the ForexFactory week, which barely moves,
+# so it runs on a much slower clock than the feed carrying today's forecasts —
+# 4 credits a day instead of 48.
+CAL_JB_REFRESH_MIN = 360
+CAL_MIN_REFRESH_S = 300   # floor for a manual Refresh, so a click cannot spend credits in a loop
+CAL_DAYS_AHEAD    = 14    # JBlanked range horizon (ForexFactory only serves this week)
+JB_KEY_ENV        = "JBLANKED_API_KEY"   # read from the environment or a .env file
+JB_CAL_URL        = "https://www.jblanked.com/news/api/forex-factory/calendar/range/"
+# JBlanked serves broker time and its `offset` parameter is loosely documented.
+# Whatever it returns, the clock difference is measured against the shared
+# ForexFactory events on every refresh and corrected (merge_calendars); this
+# constant only sets the request so the correction is as small as possible.
+JB_TIME_OFFSET    = 3
+FF_CAL_URL        = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+# "Market movers": the prints that actually move crypto perps. Everything else
+# ForexFactory rates High (RBA speeches, Australian jobs, weekly claims, ...) is
+# hidden by default. Each rule is a currency plus a regex on the event title.
+CAL_MOVERS = [
+    ("USD", r"^(core )?cpi\b"),                     # CPI m/m, Core CPI m/m, CPI y/y
+    ("USD", r"^core pce"),
+    ("USD", r"^(core )?ppi\b"),
+    ("USD", r"^non-farm employment"),
+    ("USD", r"^unemployment rate"),                 # not the weekly Unemployment Claims
+    ("USD", r"^average hourly earnings"),
+    ("USD", r"^federal funds rate"),
+    ("USD", r"^fomc (statement|press conference|meeting minutes|economic projections)"),
+    ("USD", r"^fed chair \w+ (speaks|testifies)"),
+    ("USD", r"^(advance|prelim|final) gdp"),
+    ("USD", r"^(core )?retail sales"),
+    ("USD", r"^ism (manufacturing|services) pmi"),
+    ("JPY", r"^boj policy rate"),
+    ("EUR", r"^main refinancing rate"),
+    ("GBP", r"^official bank rate"),
+]
+_CAL_MOVERS_RE = [(c, re.compile(p, re.I)) for c, p in CAL_MOVERS]
+
 # ── Server state ───────────────────────────────────────────────────────────────
 _state = {"results": [], "ts": None, "meta": {},
           "watch": {"rows": [], "ts": None, "meta": {}}}
 _lock  = threading.Lock()
 _movers_state = {"rows": [], "ts": None, "meta": {}}
+_cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
+              "jb": {"events": [], "ts": None, "attempt": None}}
 
 
 # ── Indicators ─────────────────────────────────────────────────────────────────
@@ -967,6 +1015,385 @@ def load_movers():
         print(f"[movers] load failed: {e}")
 
 
+# ── News calendar ──────────────────────────────────────────────────────────────
+def load_dotenv(path=None):
+    """Minimal KEY=VALUE loader so the API key can live in a gitignored .env
+    without adding python-dotenv. Keys are upper-cased; the real environment
+    wins over the file. Returns how many variables were set."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return 0
+    n = 0
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip().upper()
+        if k.startswith("EXPORT "):
+            k = k[7:].strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if k and k not in os.environ:
+            os.environ[k] = v
+            n += 1
+    return n
+
+
+def jb_api_key():
+    return (os.environ.get(JB_KEY_ENV) or "").strip()
+
+
+def is_mover(currency, title):
+    t = (title or "").strip()
+    return any(c == currency and rx.search(t) for c, rx in _CAL_MOVERS_RE)
+
+
+def _cal_val(v, zero_is_missing=False):
+    """Feed values as display strings: ForexFactory sends '0.3%' (or '' when
+    unknown); JBlanked sends 0.3, and 0 wherever it has no value."""
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if zero_is_missing and v == 0:
+            return ""
+        if float(v).is_integer():
+            return str(int(v))
+    return str(v).strip()
+
+
+def _cal_parse_ts(source, raw):
+    """JBlanked: '2024.02.08 15:30:00', already shifted to GMT by JB_TIME_OFFSET.
+    ForexFactory / stored events: ISO-8601 with an offset or a trailing Z."""
+    if not raw or not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    try:
+        if source == "jblanked":
+            d = datetime.datetime.strptime(raw, "%Y.%m.%d %H:%M:%S")
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        else:
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            d = datetime.datetime.fromisoformat(raw)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _iso_z(d):
+    return d.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalise_events(rows, source):
+    """Both feeds -> one shape: UTC ts, currency, impact, title, forecast,
+    previous, actual, mover. Sorted by time, deduped, unusable rows dropped."""
+    out, seen = [], set()
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        if source == "jblanked":
+            title, cur, imp = r.get("Name"), r.get("Currency"), r.get("Impact")
+            fc, pv, ac = r.get("Forecast"), r.get("Previous"), r.get("Actual")
+            ts = _cal_parse_ts(source, r.get("Date"))
+        else:
+            title, cur, imp = r.get("title"), r.get("country"), r.get("impact")
+            fc, pv, ac = r.get("forecast"), r.get("previous"), r.get("actual")
+            ts = _cal_parse_ts(source, r.get("date"))
+        if ts is None or not title:
+            continue
+        title, cur = str(title).strip(), str(cur or "").strip().upper()
+        key = (ts, cur, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        jb = source == "jblanked"
+        out.append({"ts": _iso_z(ts), "currency": cur,
+                    "impact": str(imp or "").strip() or "None", "title": title,
+                    "forecast": _cal_val(fc, jb), "previous": _cal_val(pv, jb),
+                    "actual": _cal_val(ac, jb), "mover": is_mover(cur, title)})
+    out.sort(key=lambda e: (e["ts"], e["currency"], e["title"]))
+    return out
+
+
+def _pair_events(events, reference, shift_h=0.0):
+    """Match events to reference entries one-to-one on currency + title.
+
+    Closest pairs win first and each side is consumed once, so a title that
+    repeats within a day (FOMC speakers, ECB speakers) pairs up in order
+    instead of every occurrence collapsing onto whichever one happens to be
+    nearest. `shift_h` is subtracted from the event times before measuring, so
+    once the clock offset is known the pairing is done on corrected times.
+    Returns [(event_index, reference_index, delta_hours), ...]."""
+    by_key = {}
+    for j, r in enumerate(reference):
+        by_key.setdefault((r["currency"], r["title"]), []).append(j)
+    ref_ts = [_cal_parse_ts("iso", r["ts"]) for r in reference]
+    cands = []
+    for i, e in enumerate(events):
+        t = _cal_parse_ts("iso", e["ts"]) - datetime.timedelta(hours=shift_h)
+        for j in by_key.get((e["currency"], e["title"]), []):
+            d = (t - ref_ts[j]).total_seconds() / 3600.0
+            if abs(d) <= 24:
+                cands.append((abs(d), i, j, d + shift_h))
+    cands.sort()
+    used_e, used_r, pairs = set(), set(), []
+    for _, i, j, d in cands:
+        if i in used_e or j in used_r:
+            continue
+        used_e.add(i)
+        used_r.add(j)
+        pairs.append((i, j, d))
+    return pairs
+
+
+def calendar_time_check(events, reference):
+    """Median hour difference between events present in both lists. None if
+    nothing overlaps. Anything but ~0 means JBlanked is on a different clock,
+    which merge_calendars then corrects."""
+    deltas = [d for _, _, d in _pair_events(events, reference)]
+    if not deltas:
+        return None
+    return round(statistics.median(deltas), 2)
+
+
+def merge_calendars(ff_events, jb_events):
+    """ForexFactory is authoritative for the week it serves: it keeps every
+    event JBlanked drops (about a third, High-impact ones included), its times
+    carry real UTC offsets and its numbers have units. JBlanked only extends
+    the horizon, shifted by the clock difference measured on the shared
+    events, and contributes the actual value once a print is out.
+    Returns (events, shift_h)."""
+    shift = calendar_time_check(jb_events, ff_events)
+    # Pair again on clock-corrected times: with the offset removed each
+    # occurrence lands on its own counterpart rather than on its neighbour.
+    actual_by_ff = {}
+    used = set()
+    for i, j, _ in _pair_events(jb_events, ff_events, shift or 0.0):
+        used.add(i)
+        actual_by_ff[j] = jb_events[i]["actual"]
+    out = []
+    for j, f in enumerate(ff_events):
+        e = dict(f)
+        if actual_by_ff.get(j) and not e["actual"]:
+            e["actual"] = actual_by_ff[j]
+        out.append(e)
+    delta = datetime.timedelta(hours=shift or 0.0)
+    for i, j in enumerate(jb_events):
+        if i not in used:
+            out.append(dict(j, ts=_iso_z(_cal_parse_ts("iso", j["ts"]) - delta)))
+    out.sort(key=lambda e: (e["ts"], e["currency"], e["title"]))
+    return out, shift
+
+
+def _ff_week_end(events):
+    """ForexFactory's weekly feed always runs Sunday to Saturday, so its
+    coverage reaches that Saturday even when the last event is on Friday."""
+    if not events:
+        return None
+    d = _cal_parse_ts("iso", events[-1]["ts"]).date()
+    return (d + datetime.timedelta(days=(5 - d.weekday()) % 7)).isoformat()
+
+
+def _http_json(url, headers=None, timeout=25):
+    h = {"User-Agent": "Mozilla/5.0 (divergence-screener)", "Accept": "application/json"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _jb_error_text(code, body):
+    """JBlanked answers 401 both for a bad key and for an account out of
+    credits. The distinction matters: one is a setup mistake, the other is a
+    working key that simply cannot fetch until credits are topped up."""
+    msg = ""
+    try:
+        msg = (json.loads(body) or {}).get("message", "")
+    except Exception:
+        msg = (body or "")[:200]
+    if "credit" in msg.lower():
+        return f"HTTP {code}: {msg.strip()}"
+    if code == 401:
+        return f"HTTP 401: key rejected ({msg.strip()})" if msg else "HTTP 401: key rejected"
+    return f"HTTP {code}: {msg.strip()}" if msg else f"HTTP {code}"
+
+
+def fetch_jblanked(key):
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    url = (f"{JB_CAL_URL}?from={today - datetime.timedelta(days=1)}"
+           f"&to={today + datetime.timedelta(days=CAL_DAYS_AHEAD)}&offset={JB_TIME_OFFSET}")
+    try:
+        data = _http_json(url, {"Authorization": "Api-Key " + key,
+                                "Content-Type": "application/json"})
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_jb_error_text(e.code, e.read().decode("utf-8", "replace"))) from None
+    if isinstance(data, dict):
+        if data.get("message") and not data.get("results"):
+            raise RuntimeError(str(data["message"]))
+        data = data.get("results") or data.get("data") or []
+    if not isinstance(data, list):
+        raise RuntimeError("unexpected response shape")
+    return data
+
+
+def fetch_ff():
+    data = _http_json(FF_CAL_URL)
+    if not isinstance(data, list):
+        raise RuntimeError("unexpected response shape")
+    return data
+
+
+def refresh_calendar(force=False):
+    """Pull the calendar when the cache is stale. A failed fetch never blanks
+    the last good list; it lands in meta["error"] and the tab's audit line."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with _lock:
+        attempt = _cal_state["attempt"]
+        if attempt is not None:
+            age = (now - attempt).total_seconds()
+            if age < CAL_MIN_REFRESH_S or (not force and age < CAL_REFRESH_MIN * 60):
+                return
+        _cal_state["attempt"] = now
+
+    key = jb_api_key()
+    errors, ff_events = [], []
+    # ForexFactory is fetched every time: it is free, authoritative for this
+    # week, the clock reference for JBlanked, and the fallback.
+    ff_ok = False
+    try:
+        ff_events = normalise_events(fetch_ff(), "forexfactory")
+        ff_ok = True
+    except Exception as e:
+        errors.append(f"ForexFactory: {e}")
+
+    # JBlanked costs a credit per call, so it keeps its own cache and its own
+    # much longer interval; in between, the last pull still extends the horizon.
+    jb_fresh = False
+    with _lock:
+        jb_cache = _cal_state.setdefault("jb", {"events": [], "ts": None, "attempt": None})
+        jb_events = list(jb_cache["events"])
+        jb_attempt = jb_cache["attempt"]
+    if key:
+        due = (jb_attempt is None or
+               (now - jb_attempt).total_seconds() >= CAL_JB_REFRESH_MIN * 60)
+        if due:
+            with _lock:
+                _cal_state["jb"]["attempt"] = now
+            try:
+                jb_events = normalise_events(fetch_jblanked(key), "jblanked")
+                jb_fresh = True
+                with _lock:
+                    _cal_state["jb"]["events"] = jb_events
+                    _cal_state["jb"]["ts"] = now
+            except Exception as e:
+                errors.append(f"JBlanked: {e}")   # cached events stay in jb_events
+
+    # Nothing new arrived, so there is nothing better to publish than what is
+    # already stored. Rebuilding from the JBlanked cache alone would quietly
+    # drop every ForexFactory event from the last good result.
+    if not ff_ok and not jb_fresh:
+        with _lock:
+            meta = dict(_cal_state["meta"])
+            meta["error"] = "; ".join(errors) if errors else "no data returned"
+            _cal_state["meta"] = meta
+        save_calendar()
+        return
+
+    with _lock:
+        last_shift = (_cal_state["meta"] or {}).get("time_check_h")
+
+    shift, stale_shift = None, False
+    jb_end = (datetime.datetime.now(datetime.timezone.utc).date()
+              + datetime.timedelta(days=CAL_DAYS_AHEAD)).isoformat()
+    if jb_events and ff_events:
+        events, shift = merge_calendars(ff_events, jb_events)
+        source = "jblanked+forexfactory"
+        covered_to = max(jb_end, _ff_week_end(ff_events) or "")
+    elif jb_events:
+        # No ForexFactory means no clock reference this run. JBlanked's raw
+        # times are hours off, so reuse the last measured shift rather than
+        # publishing a countdown that is silently wrong.
+        shift, stale_shift = last_shift, last_shift is not None
+        delta = datetime.timedelta(hours=shift or 0.0)
+        events = sorted((dict(e, ts=_iso_z(_cal_parse_ts("iso", e["ts"]) - delta))
+                         for e in jb_events),
+                        key=lambda e: (e["ts"], e["currency"], e["title"]))
+        source, covered_to = "jblanked", jb_end
+    elif ff_events:
+        events, source = ff_events, "forexfactory"
+        covered_to = _ff_week_end(ff_events)
+    else:
+        events, source, covered_to = [], None, None
+
+    meta = {"source": source, "has_key": bool(key),
+            "error": "; ".join(errors) if errors else None,
+            "time_check_h": shift, "covered_to": covered_to, "fallback": None}
+    if source == "forexfactory":
+        meta["fallback"] = ("No JBlanked key set" if not key
+                            else "JBlanked failed, using the ForexFactory feed")
+    elif source == "jblanked":
+        meta["fallback"] = (
+            f"ForexFactory is down; JBlanked times were corrected by the last "
+            f"measured clock offset ({shift:+g}h)." if stale_shift else
+            "ForexFactory is down, so JBlanked's clock could not be checked "
+            "against anything. Times may be off by hours.")
+    with _lock:
+        if events:
+            _cal_state["events"] = events
+            _cal_state["ts"] = now
+            _cal_state["meta"] = meta
+        else:
+            old = dict(_cal_state["meta"])
+            old["error"] = meta["error"] or "no data returned"
+            _cal_state["meta"] = old
+    save_calendar()
+
+
+def save_calendar():
+    try:
+        with _lock:
+            jb = _cal_state.get("jb") or {}
+            data = {"events": list(_cal_state["events"]),
+                    "ts": _cal_state["ts"].isoformat() if _cal_state["ts"] else None,
+                    "meta": dict(_cal_state["meta"]),
+                    "jb": {"events": list(jb.get("events") or []),
+                           "ts": jb["ts"].isoformat() if jb.get("ts") else None}}
+        with open(CAL_STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[calendar] save failed: {e}")
+
+
+def load_calendar():
+    try:
+        with open(CAL_STATE_FILE) as f:
+            data = json.load(f)
+        ts = data.get("ts")
+        with _lock:
+            _cal_state["events"] = data.get("events", [])
+            _cal_state["ts"] = datetime.datetime.fromisoformat(ts) if ts else None
+            _cal_state["attempt"] = _cal_state["ts"]   # cooldown survives a restart
+            _cal_state["meta"] = data.get("meta", {})
+            jb = data.get("jb") or {}
+            jb_ts = jb.get("ts")
+            # The credit already spent on this pull survives a restart too.
+            _cal_state["jb"] = {"events": jb.get("events", []),
+                                "ts": datetime.datetime.fromisoformat(jb_ts) if jb_ts else None,
+                                "attempt": datetime.datetime.fromisoformat(jb_ts) if jb_ts else None}
+        print(f"[calendar] restored {len(_cal_state['events'])} event(s)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[calendar] load failed: {e}")
+
+
 # ── Rate limiting + fetching ───────────────────────────────────────────────────
 class RateLimiter:
     """Shared token bucket across worker threads.
@@ -1685,6 +2112,16 @@ def mover_signals_route():
                         "ts": s["ts"].isoformat() if s["ts"] else None})
 
 
+@app.route("/calendar")
+def calendar_route():
+    refresh_calendar(force=request.args.get("refresh") == "1")
+    with _lock:
+        return jsonify({"events": list(_cal_state["events"]),
+                        "meta": dict(_cal_state["meta"]),
+                        "ts": _cal_state["ts"].isoformat() if _cal_state["ts"] else None,
+                        "now": _iso_z(datetime.datetime.now(datetime.timezone.utc))})
+
+
 @app.route("/movers")
 def movers_route():
     """Daily movers scan — one SSE stream, ~1 API call per pair.
@@ -2103,6 +2540,50 @@ tbody tr{animation:ri .3s var(--eout) both}
 ::-webkit-scrollbar-thumb:hover{background:var(--tx3)}
 #pg-movers.active{display:block;overflow-y:auto;padding:24px}
 #pg-movers{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
+
+/* ── Calendar ── */
+#pg-calendar.active{display:block;overflow-y:auto;padding:24px}
+#pg-calendar{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
+.cal-next{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:14px 18px;margin-bottom:16px}
+.cal-next.soon{border-color:#4a3500;background:var(--fresh-bg)}
+.cal-next-lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3);width:100%}
+.cal-next-ttl{font-size:16px;font-weight:600;color:var(--tx)}
+.cal-next-in{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--acc)}
+.cal-next.soon .cal-next-in{color:var(--fresh)}
+.cal-next-meta{font-family:var(--mono);font-size:11px;color:var(--tx2)}
+.cal-next-meta b{color:var(--tx);font-weight:600}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:24px}
+.cal-day{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:10px 10px 8px;min-height:104px;cursor:pointer;display:flex;flex-direction:column;gap:6px;transition:border-color .15s,background .15s}
+.cal-day:hover{border-color:var(--bd2)}
+.cal-day.past{opacity:.4}
+.cal-day.today{border-color:var(--acc)}
+.cal-day.soon{background:var(--fresh-bg);border-color:#4a3500}
+.cal-day.sel{background:var(--sf2);box-shadow:inset 0 0 0 1px var(--tx3)}
+.cal-dh{display:flex;justify-content:space-between;align-items:baseline}
+.cal-dow{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3)}
+.cal-dn{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--tx)}
+.cal-day.today .cal-dn{color:var(--acc)}
+.cal-ev{font-size:11px;line-height:1.35;color:var(--tx);background:var(--sf3);border-left:2px solid var(--bd2);border-radius:4px;padding:5px 7px}
+.cal-ev.mv{border-left-color:var(--bear)}
+.cal-ev.done{opacity:.5}
+.cal-ev-t{font-family:var(--mono);font-size:10px;color:var(--tx2);margin-right:5px}
+.cal-ev-c{font-family:var(--mono);font-size:9px;color:var(--tx3);margin-left:4px}
+.cal-quiet{font-size:11px;color:var(--tx3);font-style:italic;margin-top:auto}
+.cal-imp{font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:.08em;padding:2px 6px;border-radius:3px;background:var(--sf3);color:var(--tx2);white-space:nowrap}
+.cal-imp.hi{background:var(--bear-bg);color:var(--bear)}
+.cal-imp.md{background:var(--fresh-bg);color:var(--fresh)}
+.cal-strip{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:10px 16px;margin:0 0 24px;font-size:12px;color:var(--tx2)}
+.cal-strip.soon{border-color:#4a3500;background:var(--fresh-bg)}
+.cal-strip .lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3)}
+.cal-strip b{color:var(--tx);font-weight:600}
+.cal-strip .in{font-family:var(--mono);font-weight:600;color:var(--acc)}
+.cal-strip.soon .in{color:var(--fresh)}
+.cal-strip a{color:var(--tx3);cursor:pointer;margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.cal-strip a:hover{color:var(--tx)}
+.cal-out{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3);text-decoration:none;border-bottom:1px solid transparent;transition:color .15s,border-color .15s;white-space:nowrap}
+.cal-out:hover{color:var(--acc);border-bottom-color:var(--acc)}
+.cal-day-hdr{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:12px}
+.cal-day-hdr .dash-sec-ttl{margin:0}
 .mrank{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;border-radius:5px;background:var(--sf3);border:1px solid var(--bd2);font-family:var(--mono);font-size:10px;font-weight:700;color:var(--tx3)}
 .mrank.top{background:var(--acc);border-color:var(--acc);color:#000}
 .mf-vol{background:#2D1F06;color:#FBBF24;border:1px solid #4a3500}
@@ -2128,6 +2609,7 @@ tbody tr{animation:ri .3s var(--eout) both}
     <button class="nav-btn" data-pg="signals">Signals</button>
     <button class="nav-btn" data-pg="watch">Watchlist</button>
     <button class="nav-btn" data-pg="movers">Movers</button>
+    <button class="nav-btn" data-pg="calendar">Calendar</button>
     <button class="nav-btn" data-pg="routine">Routine</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
@@ -2147,6 +2629,7 @@ tbody tr{animation:ri .3s var(--eout) both}
       <div class="kpi"><div class="kpi-lbl">Pairs analysed</div><div class="kpi-val" id="kpi-scan">-</div><div class="kpi-sub" id="kpi-scan-sub">No scan yet</div></div>
     </div>
     <div id="scan-audit" class="audit"></div>
+    <div class="cal-strip" id="dash-cal" style="display:none"></div>
     <div class="dash-sec">
       <div class="dash-sec-ttl">Freshest setups &mdash; newest pivots, stop intact</div>
       <div class="ready-grid" id="ready-grid"></div>
@@ -2340,6 +2823,42 @@ tbody tr{animation:ri .3s var(--eout) both}
   </div>
 </div>
 
+<div id="pg-calendar" class="page">
+  <div class="sig-hdr">
+    <div><div class="sig-ttl">Calendar &mdash; scheduled market movers</div>
+    <div class="sig-sub">US inflation, jobs, Fed and growth prints, plus the BoJ, ECB and BoE rate decisions. Everything else on the schedule is hidden unless you switch to All high-impact. Times are your local time; hover a chip for UTC.</div></div>
+  </div>
+  <div class="cal-next" id="cal-next"><span class="cal-next-meta">Loading calendar...</span></div>
+  <div class="wbar">
+    <div class="sig-filters" style="margin:0">
+      <button class="sig-ftab active" data-cf="movers" onclick="setCF(this)" title="Only the curated list: CPI, PCE, PPI, the jobs report, FOMC, Powell, GDP, retail sales, ISM, and the BoJ / ECB / BoE rate decisions.">Market movers</button>
+      <button class="sig-ftab" data-cf="high" onclick="setCF(this)" title="Everything ForexFactory rates High impact, all currencies.">All high-impact</button>
+    </div>
+    <button class="rbtn" id="calRefreshBtn" onclick="refreshCalendar()">Refresh</button>
+    <span class="wprog" id="cal-meta"></span>
+    <a class="cal-out" style="margin-left:auto" href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener"
+       title="Open ForexFactory's calendar in a new tab. The feed carries no actual values, so this is where you check what a print came in at.">ForexFactory &#8599;</a>
+  </div>
+  <div id="cal-audit" class="audit" style="margin:0 0 12px"></div>
+  <div class="cal-grid" id="cal-grid"></div>
+  <div class="dash-sec">
+    <div class="cal-day-hdr">
+      <div class="dash-sec-ttl" id="cal-day-ttl">Select a day</div>
+      <a class="cal-out" id="cal-ff-day" href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener"
+         title="Open this day on ForexFactory, where the actual values appear once a print lands.">Open this day on ForexFactory &#8599;</a>
+    </div>
+    <div class="tw" style="overflow:visible">
+      <table id="calT" style="display:none">
+        <thead><tr>
+          <th>Time</th><th>Cur</th><th>Event</th><th>Impact</th><th>Forecast</th><th>Previous</th><th>Actual</th>
+        </tr></thead>
+        <tbody id="calB"></tbody>
+      </table>
+      <div class="no-sig" id="calEmpty">Nothing scheduled.</div>
+    </div>
+  </div>
+</div>
+
 <div id="pg-routine" class="page" style="overflow-y:auto;padding:24px">
   <div class="dash-sec">
     <div class="dash-sec-ttl">Daily routine &mdash; how to use the three scans together</div>
@@ -2357,6 +2876,7 @@ tbody tr{animation:ri .3s var(--eout) both}
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Pick the exchange with the deepest book.</b> Binance carries the most volume on most pairs. Some majors trade thinly on other venues and get volume-rejected there for no chart reason. Each tab has its own exchange dropdown; keep them the same.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One volume floor for everything.</b> The Min 7-day volume box on the Scanner tab applies to all three scans. Default is $70M a week, about $10M a day. Names under that do not exist to the screener. If a coin you expected is missing, check the audit line under the table before assuming there was no setup.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Read the audit line every time.</b> It says how many pairs were scanned, volume-rejected, errored, and whether the run finished. A short list from an unfinished scan is not a quiet market.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Check the Calendar tab.</b> A fresh entry sized into a CPI or FOMC print is a coin flip, not a setup. If the next market mover is inside 24 hours, wait for it or size for it. The Dashboard strip shows the countdown.</div></div>
     </div>
   </div>
 
@@ -2631,6 +3151,7 @@ function showPg(name){
   if(name === 'signals') loadSignals();
   if(name === 'watch') loadWatch();
   if(name === 'movers') loadMovers();
+  if(name === 'calendar') loadCalendar();
 }
 document.querySelectorAll('.nav-btn').forEach(function(b){
   b.addEventListener('click', function(){ showPg(b.dataset.pg); });
@@ -3367,15 +3888,218 @@ function renderWelcome(){
   } catch(e){}
 }
 
+/* ── Calendar ─────────────────────────────────────────────────────────────── */
+var _cal = {events: [], meta: {}, ts: null}, _cf = 'movers', _calSel = null;
+var CAL_DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+var CAL_MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+/* Short names for the grid chips; the full title lives in the tooltip and the day table. */
+var CAL_SHORT = [
+  [/^Non-Farm Employment Change$/i, 'NFP'],
+  [/^Average Hourly Earnings.*$/i, 'Avg Earnings'],
+  [/^Unemployment Rate$/i, 'Unemployment'],
+  [/^Federal Funds Rate$/i, 'Fed Rate'],
+  [/^FOMC Press Conference$/i, 'FOMC Presser'],
+  [/^FOMC Meeting Minutes$/i, 'FOMC Minutes'],
+  [/^FOMC Economic Projections$/i, 'FOMC Projections'],
+  [/^Fed Chair (\w+) (Speaks|Testifies)$/i, '$1 $2'],
+  [/^Core PCE Price Index.*$/i, 'Core PCE'],
+  [/^ISM Manufacturing PMI$/i, 'ISM Mfg'],
+  [/^ISM Services PMI$/i, 'ISM Services'],
+  [/^Main Refinancing Rate$/i, 'ECB Rate'],
+  [/^Official Bank Rate$/i, 'BoE Rate'],
+  [/^BOJ Policy Rate$/i, 'BoJ Rate'],
+  [/^(Advance|Prelim|Final) GDP.*$/i, 'GDP ($1)'],
+  [/^Core Retail Sales.*$/i, 'Core Retail'],
+  [/^Retail Sales.*$/i, 'Retail Sales']
+];
+function calEsc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function calShort(t){
+  for(var i = 0; i < CAL_SHORT.length; i++){ if(CAL_SHORT[i][0].test(t)) return t.replace(CAL_SHORT[i][0], CAL_SHORT[i][1]); }
+  return t.replace(/\s+(m\/m|q\/q|y\/y)$/i, '');
+}
+function calPad(n){ return (n < 10 ? '0' : '') + n; }
+function calHM(d){ return calPad(d.getHours()) + ':' + calPad(d.getMinutes()); }
+function calUTC(d){ return calPad(d.getUTCHours()) + ':' + calPad(d.getUTCMinutes()) + ' UTC'; }
+function calDayKey(d){ return d.getFullYear() + '-' + calPad(d.getMonth() + 1) + '-' + calPad(d.getDate()); }
+function calDayLabel(d){ return CAL_DOW[d.getDay()] + ' ' + d.getDate() + ' ' + CAL_MON[d.getMonth()]; }
+/* ForexFactory's own permalink shape, e.g. calendar?day=sep23.2026. If the
+   param is ever rejected the site just opens on the current calendar, so a
+   miss costs a click rather than a broken link. */
+function calFFUrl(d){
+  return 'https://www.forexfactory.com/calendar?day=' +
+         CAL_MON[d.getMonth()].toLowerCase() + d.getDate() + '.' + d.getFullYear();
+}
+function calUntil(ms){
+  if(ms <= 0) return 'now';
+  var m = Math.round(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+  if(d > 0) return d + 'd ' + h + 'h';
+  if(h > 0) return h + 'h ' + mm + 'm';
+  return mm + 'm';
+}
+function calFiltered(){
+  return _cal.events.filter(function(e){ return _cf === 'movers' ? e.mover : e.impact === 'High'; });
+}
+/* The banner always uses the curated list, whatever the grid filter is. */
+function calNextMover(now){
+  var n = null;
+  _cal.events.forEach(function(e){
+    if(!e.mover) return;
+    var t = new Date(e.ts).getTime();
+    if(t > now && (n === null || t < n.t)) n = {e: e, t: t};
+  });
+  return n;
+}
+function calBanner(now){
+  var n = calNextMover(now);
+  var el = document.getElementById('cal-next'), strip = document.getElementById('dash-cal');
+  if(!n){
+    var msg = _cal.events.length ? 'No market movers on the schedule through ' + (_cal.meta.covered_to ? calDayLabel(new Date(_cal.meta.covered_to + 'T12:00:00Z')) : 'the current horizon') + '.' : 'Calendar not loaded yet.';
+    el.className = 'cal-next';
+    el.innerHTML = '<span class="cal-next-lbl">Next market mover</span><span class="cal-next-meta">' + msg + '</span>';
+    if(strip) strip.style.display = 'none';
+    return;
+  }
+  var sibs = _cal.events.filter(function(e){ return e.mover && e.ts === n.e.ts; });
+  var d = new Date(n.t), soon = (n.t - now) <= 86400000;
+  var names = sibs.map(function(e){ return calShort(e.title); }).join(' + ');
+  var when = calDayLabel(d) + ' ' + calHM(d);
+  var vals = sibs.map(function(e){
+    return '<b>' + calEsc(calShort(e.title)) + '</b> fc ' + (calEsc(e.forecast) || '&mdash;') + ' / prev ' + (calEsc(e.previous) || '&mdash;');
+  }).join(' &nbsp;&middot;&nbsp; ');
+  el.className = 'cal-next' + (soon ? ' soon' : '');
+  el.innerHTML = '<span class="cal-next-lbl">Next market mover</span>' +
+    '<span class="cal-next-ttl">' + calEsc(names) + ' <span style="color:var(--tx3);font-weight:400">' + calEsc(n.e.currency) + '</span></span>' +
+    '<span class="cal-next-in">in ' + calUntil(n.t - now) + '</span>' +
+    '<span class="cal-next-meta" title="' + calUTC(d) + '">' + when + ' &nbsp;&middot;&nbsp; ' + vals + '</span>';
+  if(strip){
+    strip.className = 'cal-strip' + (soon ? ' soon' : '');
+    strip.style.display = 'flex';
+    strip.innerHTML = '<span class="lbl">Next market mover</span><b>' + calEsc(names) + '</b>' +
+      '<span title="' + calUTC(d) + '">' + calEsc(n.e.currency) + ' &middot; ' + when + '</span>' +
+      '<span class="in">in ' + calUntil(n.t - now) + '</span>' +
+      '<a onclick="showPg(\'calendar\')">Calendar &rarr;</a>';
+  }
+}
+function calGrid(now){
+  var g = document.getElementById('cal-grid'); g.innerHTML = '';
+  var byDay = {};
+  calFiltered().forEach(function(e){ var k = calDayKey(new Date(e.ts)); (byDay[k] = byDay[k] || []).push(e); });
+  var start = new Date(now); start.setHours(0, 0, 0, 0);
+  if(_calSel === null) _calSel = calDayKey(start);
+  /* Past the horizon the feeds actually cover, a blank cell means "no data", not "quiet".
+     This is the requested range, not the last event: an empty Saturday inside a published week is genuinely quiet. */
+  var coveredTo = _cal.meta.covered_to || '';
+  for(var i = 0; i < 14; i++){
+    var d = new Date(start.getTime()); d.setDate(start.getDate() + i);
+    var k = calDayKey(d), list = byDay[k] || [];
+    var soon = list.some(function(e){ var t = new Date(e.ts).getTime(); return e.mover && t > now && t - now <= 86400000; });
+    var cell = document.createElement('div');
+    cell.className = 'cal-day' + (i === 0 ? ' today' : '') + (soon ? ' soon' : '') + (k === _calSel ? ' sel' : '');
+    cell.dataset.k = k;
+    var html = '<div class="cal-dh"><span class="cal-dow">' + CAL_DOW[d.getDay()] + '</span>' +
+               '<span class="cal-dn">' + d.getDate() + ((d.getDate() === 1 || i === 0) ? ' ' + CAL_MON[d.getMonth()] : '') + '</span></div>';
+    if(list.length === 0){
+      var nodata = coveredTo && k > coveredTo;
+      html += '<div class="cal-quiet">' + (nodata ? 'no data yet' : 'quiet') + '</div>';
+    } else {
+      var groups = [], last = null;
+      list.forEach(function(e){
+        if(last && last.ts === e.ts){ last.items.push(e); } else { last = {ts: e.ts, items: [e]}; groups.push(last); }
+      });
+      groups.forEach(function(gr){
+        var t = new Date(gr.ts), done = t.getTime() < now, mv = gr.items.some(function(e){ return e.mover; });
+        var names = gr.items.slice(0, 3).map(function(e){ return calEsc(calShort(e.title)); }).join(' + ') +
+                    (gr.items.length > 3 ? ' +' + (gr.items.length - 3) : '');
+        var curs = []; gr.items.forEach(function(e){ if(curs.indexOf(e.currency) < 0) curs.push(e.currency); });
+        html += '<div class="cal-ev' + (mv ? ' mv' : '') + (done ? ' done' : '') + '" title="' +
+                calEsc(gr.items.map(function(e){ return e.title; }).join(', ')) + ' (' + calUTC(t) + ')">' +
+                '<span class="cal-ev-t">' + calHM(t) + '</span>' + names + '<span class="cal-ev-c">' + calEsc(curs.join('/')) + '</span></div>';
+      });
+    }
+    cell.innerHTML = html;
+    cell.addEventListener('click', function(){ _calSel = this.dataset.k; renderCalendar(); });
+    g.appendChild(cell);
+  }
+}
+function calDetail(now){
+  var sel = _calSel, rows = calFiltered().filter(function(e){ return calDayKey(new Date(e.ts)) === sel; });
+  var p = sel.split('-'), d = new Date(+p[0], +p[1] - 1, +p[2]);
+  var ffl = document.getElementById('cal-ff-day');
+  ffl.href = calFFUrl(d);
+  ffl.textContent = 'Open ' + calDayLabel(d) + ' on ForexFactory \u2197';
+  document.getElementById('cal-day-ttl').textContent =
+    calDayLabel(d) + ' \u2014 ' + (rows.length ? rows.length + ' scheduled' : 'nothing scheduled') +
+    (_cf === 'movers' ? ' (market movers)' : ' (all high-impact)');
+  var tb = document.getElementById('calB'); tb.innerHTML = '';
+  document.getElementById('calT').style.display = rows.length ? 'table' : 'none';
+  document.getElementById('calEmpty').style.display = rows.length ? 'none' : '';
+  rows.forEach(function(e){
+    var t = new Date(e.ts), done = t.getTime() < now;
+    var tr = document.createElement('tr'); if(done) tr.style.opacity = '.5';
+    var impCls = e.impact === 'High' ? ' hi' : (e.impact === 'Medium' ? ' md' : '');
+    tr.innerHTML =
+      '<td><span style="font-family:var(--mono)" title="' + calUTC(t) + '">' + calHM(t) + '</span></td>' +
+      '<td><span style="font-family:var(--mono);color:var(--tx2)">' + calEsc(e.currency) + '</span></td>' +
+      '<td><span style="font-weight:600;color:var(--tx)">' + calEsc(e.title) + '</span>' +
+        (e.mover ? ' &nbsp;<span class="cal-imp hi" title="On the curated market-mover list">MOVER</span>' : '') + '</td>' +
+      '<td><span class="cal-imp' + impCls + '">' + calEsc(e.impact) + '</span></td>' +
+      '<td style="font-family:var(--mono)">' + (calEsc(e.forecast) || '&mdash;') + '</td>' +
+      '<td style="font-family:var(--mono)">' + (calEsc(e.previous) || '&mdash;') + '</td>' +
+      '<td style="font-family:var(--mono);color:var(--tx)">' + (calEsc(e.actual) || '&mdash;') + '</td>';
+    tb.appendChild(tr);
+  });
+}
+function calMetaLine(){
+  var m = _cal.meta || {}, bits = [];
+  var SRC = {'jblanked+forexfactory': 'ForexFactory + JBlanked', 'jblanked': 'JBlanked only', 'forexfactory': 'ForexFactory feed'};
+  bits.push(SRC[m.source] || 'no source');
+  if(_cal.ts) bits.push('updated ' + Math.round((Date.now() - new Date(_cal.ts)) / 60000) + ' min ago');
+  if(m.covered_to) bits.push('through ' + calDayLabel(new Date(m.covered_to + 'T12:00:00Z')));
+  document.getElementById('cal-meta').textContent = bits.join(' \u00b7 ');
+  var warn = [], info = [];
+  if(m.fallback) warn.push(m.fallback + ': only the current week is shown. A JBlanked key with credits in .env extends the horizon.');
+  if(/credit/i.test(m.error || '')) warn.push('JBlanked needs credits on the account before it can extend the calendar past this week. ForexFactory covers the current week either way.');
+  if(m.error) warn.push('Last fetch problem: ' + m.error);
+  if(m.time_check_h) info.push('JBlanked clock was ' + (m.time_check_h > 0 ? '+' : '') + m.time_check_h + 'h vs ForexFactory; its events were corrected.');
+  var a = document.getElementById('cal-audit');
+  a.className = 'audit' + (warn.length ? ' warn' : '');
+  a.style.margin = '0 0 12px';
+  a.innerHTML = (warn.length ? '&#9888; ' : '') + warn.concat(info).map(calEsc).join('<br>');
+}
+function renderCalendar(){
+  var now = Date.now();
+  calBanner(now); calGrid(now); calDetail(now); calMetaLine();
+}
+function calApply(d){ _cal = {events: d.events || [], meta: d.meta || {}, ts: d.ts}; renderCalendar(); }
+function loadCalendar(){
+  fetch('/calendar').then(function(r){ return r.json(); }).then(calApply)
+    .catch(function(){ document.getElementById('cal-meta').textContent = 'Failed to load calendar.'; });
+}
+function refreshCalendar(){
+  var b = document.getElementById('calRefreshBtn'); b.disabled = true;
+  fetch('/calendar?refresh=1').then(function(r){ return r.json(); }).then(calApply)
+    .catch(function(){}).then(function(){ b.disabled = false; });
+}
+function setCF(btn){
+  document.querySelectorAll('.sig-ftab[data-cf]').forEach(function(b){ b.classList.remove('active'); });
+  btn.classList.add('active'); _cf = btn.dataset.cf; renderCalendar();
+}
+setInterval(function(){ if(_cal.events.length) calBanner(Date.now()); }, 60000);
+
 document.addEventListener('DOMContentLoaded', function(){
   renderWelcome();
   loadDash();
+  loadCalendar();
+  var pg = (location.hash || '').slice(1);
+  if(pg && document.getElementById('pg-' + pg)) showPg(pg);   /* deep link, e.g. /#calendar */
 });
 </script>
 </body>
 </html>"""
 
 if __name__ == "__main__":
-    load_state()   # restore the last scan so the dashboard isn't amnesiac
-    load_movers()  # ...and the last movers scan
+    load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
+    load_state()      # restore the last scan so the dashboard isn't amnesiac
+    load_movers()     # ...and the last movers scan
+    load_calendar()   # ...and the news calendar
     app.run(debug=False, threaded=True, port=5099)

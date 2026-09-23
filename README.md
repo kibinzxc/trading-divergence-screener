@@ -2,7 +2,8 @@
 
 A self-contained Flask app that scans linear USDT perpetuals on OKX, Binance,
 and Bybit for **regular MACD divergences** (bullish and bearish), plus two
-companion scans — an open-interest flow watchlist and a daily-movers scan.
+companion scans — an open-interest flow watchlist and a daily-movers scan —
+and a news calendar of the scheduled macro prints that move crypto.
 Everything runs from one file: `macd_divergence_screener_v5.py` serves both
 the API and a browser dashboard.
 
@@ -35,6 +36,13 @@ the API and a browser dashboard.
   crowded-long, short squeeze fuel) using funding rate as a leverage signal.
 - **Daily movers** (`/movers`): a cheap, ~1-call-per-pair scan for pairs
   moving significantly off their recent volume/range baseline.
+- **News calendar** (`/calendar`): the scheduled macro prints that actually
+  move crypto perps — US CPI/PCE/PPI, the jobs report, FOMC and Powell, GDP,
+  retail sales, ISM, plus the BoJ/ECB/BoE rate decisions — on a two-week grid
+  with a countdown to the next one. Everything else on the economic calendar
+  is hidden unless you ask for it. Data from ForexFactory's weekly feed,
+  extended beyond the current week by JBlanked (ForexFactory's calendar
+  behind a free API key). See [News calendar](#news-calendar).
 - Multi-threaded scanning (per-thread `ccxt` instance, shared token-bucket
   rate limiter) with `safe` / `normal` / `fast` speed presets per exchange.
 
@@ -47,6 +55,13 @@ the API and a browser dashboard.
 pip install flask ccxt pandas numpy
 ```
 
+Optional: a [JBlanked](https://www.jblanked.com/news/api/docs/) API key to
+extend the news calendar past the current week. Their calendar endpoints are
+metered — each call spends an account credit — so the screener fetches them
+only every 6 hours, about 4 credits a day. Without a key, or with an account
+out of credits, the calendar still works from ForexFactory's free weekly
+feed; that feed is the authoritative source for the current week anyway.
+
 ## Running
 
 ```bash
@@ -56,6 +71,16 @@ python macd_divergence_screener_v5.py
 Serves on `http://localhost:5099`. Open `/` in a browser for the dashboard,
 which drives the scans below via Server-Sent Events and shows live progress,
 results, and any partial/incomplete-scan warnings.
+
+To extend the calendar beyond the current week, put your JBlanked key in a
+`.env` file next to the script (the file is gitignored):
+
+```
+jblanked_api_key=YOUR_KEY
+```
+
+The script reads `.env` itself at startup; no extra package and no shell
+export needed. A real environment variable `JBLANKED_API_KEY` also works.
 
 ## API
 
@@ -73,6 +98,7 @@ without re-scanning.
 | `/movers` | GET (SSE) | Run a daily-movers scan |
 | `/mover_signals` | GET | Last cached `/movers` result |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
+| `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 
 Common query params (all optional, sane defaults apply):
 
@@ -83,6 +109,60 @@ Common query params (all optional, sane defaults apply):
 - `min_weekly_vol` — liquidity floor in USD (default `70000000`)
 - `max_pairs` — cap on pairs scanned (default `400`)
 - `symbols` — comma-separated symbol allowlist (`/scan` only)
+
+## News calendar
+
+The Calendar tab answers one question: is there a scheduled print inside the
+next day or two that can blow through a stop? It is deliberately narrow.
+
+**What counts as a market mover.** A curated list, not the feed's own impact
+rating — ForexFactory marks Australian jobs data and RBA speeches as High,
+and those do nothing to crypto. The default view shows only:
+
+- US inflation: CPI, Core CPI, Core PCE, PPI, Core PPI
+- US jobs report: Non-Farm Employment Change, Unemployment Rate, Average
+  Hourly Earnings
+- Fed: Federal Funds Rate, FOMC Statement / Press Conference / Minutes /
+  Projections, Fed Chair speeches and testimony
+- US growth: Advance / Prelim / Final GDP, Retail Sales, Core Retail Sales,
+  ISM Manufacturing and Services PMI
+- Other central bank rate decisions only: BoJ, ECB, BoE
+
+Weekly jobless claims, JOLTS, consumer confidence, flash PMIs, other Fed
+speakers, every non-US data print and bank holidays are excluded on purpose.
+The *All high-impact* toggle shows everything the feed rates High. The list
+is `CAL_MOVERS` in the script: one currency plus one regex per rule.
+
+**Sources.** ForexFactory's weekly JSON is authoritative for the current
+week: it is free, complete, its times carry real UTC offsets and its numbers
+have units. JBlanked only extends the horizon past that week. Its copy drops
+some events (High-impact ones included), reports `0` where it has no value,
+and runs on a broker clock, so it is aligned to the ForexFactory week rather
+than trusted over it, and it supplies the actual value once a print is out.
+
+The two are fetched on different clocks because they cost different things.
+ForexFactory is free and refreshes every 30 minutes. JBlanked spends an
+account credit per call and only carries next week's schedule, which barely
+changes, so it refreshes every 6 hours and its last pull is cached (on disk,
+so a restart does not re-spend). If it fails, the cached horizon stays and
+the reason is named in the audit line. A 401 from JBlanked is usually an
+account with no credits left rather than a bad key; the audit line says
+which. Both caches live in `calendar_state.json`. The Refresh button
+re-fetches at most once every five minutes.
+
+**Times.** Shown in your browser's local time, with UTC in the tooltip. The
+script measures JBlanked's clock against the shared ForexFactory events on
+every refresh, corrects it, and reports the shift in the audit line. If
+ForexFactory is unreachable there is nothing to measure against, so the last
+known offset is reused and the audit line says so.
+
+**Checking against the source.** The feed carries no actual values, only
+forecast and previous, so the tab links out to ForexFactory in two places:
+the header opens the calendar, and the selected day opens that same day
+there, which is where the number appears once a print lands.
+
+**The Dashboard strip** repeats the next market mover with a countdown and
+turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
 
 ## Daily routine
 
@@ -103,6 +183,9 @@ guide lives in the dashboard under the **Routine** tab.
    the screener.
 4. Read the audit line under every table. A short list from an unfinished
    scan is not a quiet market.
+5. Check the Calendar tab. A fresh entry sized into a CPI or FOMC print is a
+   coin flip, not a setup. If the next market mover is inside 24 hours, wait
+   for it or size for it.
 
 **Step 1 — Movers: what did something unusual yesterday**
 

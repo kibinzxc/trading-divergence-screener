@@ -156,6 +156,11 @@ every refresh, corrects it, and reports the shift in the audit line. If
 ForexFactory is unreachable there is nothing to measure against, so the last
 known offset is reused and the audit line says so.
 
+**Checking against the source.** The feed carries no actual values, only
+forecast and previous, so the tab links out to ForexFactory in two places:
+the header opens the calendar, and the selected day opens that same day
+there, which is where the number appears once a print lands.
+
 **The Dashboard strip** repeats the next market mover with a countdown and
 turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
 

@@ -2580,6 +2580,10 @@ tbody tr{animation:ri .3s var(--eout) both}
 .cal-strip.soon .in{color:var(--fresh)}
 .cal-strip a{color:var(--tx3);cursor:pointer;margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase}
 .cal-strip a:hover{color:var(--tx)}
+.cal-out{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3);text-decoration:none;border-bottom:1px solid transparent;transition:color .15s,border-color .15s;white-space:nowrap}
+.cal-out:hover{color:var(--acc);border-bottom-color:var(--acc)}
+.cal-day-hdr{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:12px}
+.cal-day-hdr .dash-sec-ttl{margin:0}
 .mrank{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;border-radius:5px;background:var(--sf3);border:1px solid var(--bd2);font-family:var(--mono);font-size:10px;font-weight:700;color:var(--tx3)}
 .mrank.top{background:var(--acc);border-color:var(--acc);color:#000}
 .mf-vol{background:#2D1F06;color:#FBBF24;border:1px solid #4a3500}
@@ -2832,11 +2836,17 @@ tbody tr{animation:ri .3s var(--eout) both}
     </div>
     <button class="rbtn" id="calRefreshBtn" onclick="refreshCalendar()">Refresh</button>
     <span class="wprog" id="cal-meta"></span>
+    <a class="cal-out" style="margin-left:auto" href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener"
+       title="Open ForexFactory's calendar in a new tab. The feed carries no actual values, so this is where you check what a print came in at.">ForexFactory &#8599;</a>
   </div>
   <div id="cal-audit" class="audit" style="margin:0 0 12px"></div>
   <div class="cal-grid" id="cal-grid"></div>
   <div class="dash-sec">
-    <div class="dash-sec-ttl" id="cal-day-ttl">Select a day</div>
+    <div class="cal-day-hdr">
+      <div class="dash-sec-ttl" id="cal-day-ttl">Select a day</div>
+      <a class="cal-out" id="cal-ff-day" href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener"
+         title="Open this day on ForexFactory, where the actual values appear once a print lands.">Open this day on ForexFactory &#8599;</a>
+    </div>
     <div class="tw" style="overflow:visible">
       <table id="calT" style="display:none">
         <thead><tr>
@@ -3912,6 +3922,13 @@ function calHM(d){ return calPad(d.getHours()) + ':' + calPad(d.getMinutes()); }
 function calUTC(d){ return calPad(d.getUTCHours()) + ':' + calPad(d.getUTCMinutes()) + ' UTC'; }
 function calDayKey(d){ return d.getFullYear() + '-' + calPad(d.getMonth() + 1) + '-' + calPad(d.getDate()); }
 function calDayLabel(d){ return CAL_DOW[d.getDay()] + ' ' + d.getDate() + ' ' + CAL_MON[d.getMonth()]; }
+/* ForexFactory's own permalink shape, e.g. calendar?day=sep23.2026. If the
+   param is ever rejected the site just opens on the current calendar, so a
+   miss costs a click rather than a broken link. */
+function calFFUrl(d){
+  return 'https://www.forexfactory.com/calendar?day=' +
+         CAL_MON[d.getMonth()].toLowerCase() + d.getDate() + '.' + d.getFullYear();
+}
 function calUntil(ms){
   if(ms <= 0) return 'now';
   var m = Math.round(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
@@ -4007,6 +4024,9 @@ function calGrid(now){
 function calDetail(now){
   var sel = _calSel, rows = calFiltered().filter(function(e){ return calDayKey(new Date(e.ts)) === sel; });
   var p = sel.split('-'), d = new Date(+p[0], +p[1] - 1, +p[2]);
+  var ffl = document.getElementById('cal-ff-day');
+  ffl.href = calFFUrl(d);
+  ffl.textContent = 'Open ' + calDayLabel(d) + ' on ForexFactory \u2197';
   document.getElementById('cal-day-ttl').textContent =
     calDayLabel(d) + ' \u2014 ' + (rows.length ? rows.length + ' scheduled' : 'nothing scheduled') +
     (_cf === 'movers' ? ' (market movers)' : ' (all high-impact)');

@@ -482,6 +482,14 @@ class Route(unittest.TestCase):
         self.assertIn('id="pg-calendar"', html)
         self.assertIn('id="dash-cal"', html)
 
+    def test_calendar_tab_links_out_to_forexfactory(self):
+        """The feed carries no actual values, so checking a print against the
+        source has to be one click away."""
+        html = m.app.test_client().get("/").get_data(as_text=True)
+        self.assertIn("https://www.forexfactory.com/calendar", html)
+        self.assertIn('id="cal-ff-day"', html)      # deep link to the selected day
+        self.assertIn('rel="noopener"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

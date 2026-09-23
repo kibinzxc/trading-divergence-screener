@@ -55,9 +55,12 @@ the API and a browser dashboard.
 pip install flask ccxt pandas numpy
 ```
 
-Optional: a free [JBlanked](https://www.jblanked.com/news/api/docs/) API key
-for the news calendar. Without it the calendar still works from
-ForexFactory's weekly feed, but only for the current week.
+Optional: a [JBlanked](https://www.jblanked.com/news/api/docs/) API key to
+extend the news calendar past the current week. Their calendar endpoints are
+metered — each call spends an account credit — so the screener fetches them
+only every 6 hours, about 4 credits a day. Without a key, or with an account
+out of credits, the calendar still works from ForexFactory's free weekly
+feed; that feed is the authoritative source for the current week anyway.
 
 ## Running
 
@@ -131,17 +134,21 @@ The *All high-impact* toggle shows everything the feed rates High. The list
 is `CAL_MOVERS` in the script: one currency plus one regex per rule.
 
 **Sources.** ForexFactory's weekly JSON is authoritative for the current
-week: it is complete, its times carry real UTC offsets and its numbers have
-units. With a JBlanked key the horizon extends as far as ForexFactory has
-published, usually into the following week. JBlanked's copy drops some
-events (High-impact ones included) and runs on a broker clock, so it is
-aligned to the ForexFactory week and only adds what lies beyond it, plus the
-actual value once a print is out. Without a key, or if JBlanked fails, the
-audit line says so and the tab shows the current week only. Results are
-cached for 30 minutes and persisted to `calendar_state.json`, so a restart
-does not re-fetch. The Refresh button re-fetches at most once every five
-minutes, which is also JBlanked's free-tier limit; a 401 from JBlanked
-usually means that limit, not a bad key.
+week: it is free, complete, its times carry real UTC offsets and its numbers
+have units. JBlanked only extends the horizon past that week. Its copy drops
+some events (High-impact ones included), reports `0` where it has no value,
+and runs on a broker clock, so it is aligned to the ForexFactory week rather
+than trusted over it, and it supplies the actual value once a print is out.
+
+The two are fetched on different clocks because they cost different things.
+ForexFactory is free and refreshes every 30 minutes. JBlanked spends an
+account credit per call and only carries next week's schedule, which barely
+changes, so it refreshes every 6 hours and its last pull is cached (on disk,
+so a restart does not re-spend). If it fails, the cached horizon stays and
+the reason is named in the audit line. A 401 from JBlanked is usually an
+account with no credits left rather than a bad key; the audit line says
+which. Both caches live in `calendar_state.json`. The Refresh button
+re-fetches at most once every five minutes.
 
 **Times.** Shown in your browser's local time, with UTC in the tooltip. The
 script measures JBlanked's clock against the shared ForexFactory events on

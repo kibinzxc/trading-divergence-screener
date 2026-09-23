@@ -247,8 +247,13 @@ MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # primary source; ForexFactory's own weekly JSON is the keyless fallback.
 CAL_STATE_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "calendar_state.json")
-CAL_REFRESH_MIN   = 30    # minutes between upstream fetches
-CAL_MIN_REFRESH_S = 300   # floor for a manual Refresh: JBlanked's free tier allows one call per 5 min
+CAL_REFRESH_MIN   = 30    # minutes between ForexFactory fetches (free feed)
+# JBlanked's calendar endpoints are metered: every call costs an account credit.
+# It only supplies the schedule past the ForexFactory week, which barely moves,
+# so it runs on a much slower clock than the feed carrying today's forecasts —
+# 4 credits a day instead of 48.
+CAL_JB_REFRESH_MIN = 360
+CAL_MIN_REFRESH_S = 300   # floor for a manual Refresh, so a click cannot spend credits in a loop
 CAL_DAYS_AHEAD    = 14    # JBlanked range horizon (ForexFactory only serves this week)
 JB_KEY_ENV        = "JBLANKED_API_KEY"   # read from the environment or a .env file
 JB_CAL_URL        = "https://www.jblanked.com/news/api/forex-factory/calendar/range/"
@@ -286,7 +291,8 @@ _state = {"results": [], "ts": None, "meta": {},
           "watch": {"rows": [], "ts": None, "meta": {}}}
 _lock  = threading.Lock()
 _movers_state = {"rows": [], "ts": None, "meta": {}}
-_cal_state = {"events": [], "ts": None, "attempt": None, "meta": {}}
+_cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
+              "jb": {"events": [], "ts": None, "attempt": None}}
 
 
 # ── Indicators ─────────────────────────────────────────────────────────────────
@@ -1203,6 +1209,22 @@ def _http_json(url, headers=None, timeout=25):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _jb_error_text(code, body):
+    """JBlanked answers 401 both for a bad key and for an account out of
+    credits. The distinction matters: one is a setup mistake, the other is a
+    working key that simply cannot fetch until credits are topped up."""
+    msg = ""
+    try:
+        msg = (json.loads(body) or {}).get("message", "")
+    except Exception:
+        msg = (body or "")[:200]
+    if "credit" in msg.lower():
+        return f"HTTP {code}: {msg.strip()}"
+    if code == 401:
+        return f"HTTP 401: key rejected ({msg.strip()})" if msg else "HTTP 401: key rejected"
+    return f"HTTP {code}: {msg.strip()}" if msg else f"HTTP {code}"
+
+
 def fetch_jblanked(key):
     today = datetime.datetime.now(datetime.timezone.utc).date()
     url = (f"{JB_CAL_URL}?from={today - datetime.timedelta(days=1)}"
@@ -1211,10 +1233,7 @@ def fetch_jblanked(key):
         data = _http_json(url, {"Authorization": "Api-Key " + key,
                                 "Content-Type": "application/json"})
     except urllib.error.HTTPError as e:
-        if e.code == 401:
-            raise RuntimeError("HTTP 401: key rejected, or the free tier's "
-                               "one-call-per-5-minutes limit was hit") from None
-        raise
+        raise RuntimeError(_jb_error_text(e.code, e.read().decode("utf-8", "replace"))) from None
     if isinstance(data, dict):
         if data.get("message") and not data.get("results"):
             raise RuntimeError(str(data["message"]))
@@ -1244,18 +1263,48 @@ def refresh_calendar(force=False):
         _cal_state["attempt"] = now
 
     key = jb_api_key()
-    errors, ff_events, jb_events = [], [], []
-    # ForexFactory is fetched every time: it is authoritative for this week,
-    # the clock reference for JBlanked, and the fallback.
+    errors, ff_events = [], []
+    # ForexFactory is fetched every time: it is free, authoritative for this
+    # week, the clock reference for JBlanked, and the fallback.
+    ff_ok = False
     try:
         ff_events = normalise_events(fetch_ff(), "forexfactory")
+        ff_ok = True
     except Exception as e:
         errors.append(f"ForexFactory: {e}")
+
+    # JBlanked costs a credit per call, so it keeps its own cache and its own
+    # much longer interval; in between, the last pull still extends the horizon.
+    jb_fresh = False
+    with _lock:
+        jb_cache = _cal_state.setdefault("jb", {"events": [], "ts": None, "attempt": None})
+        jb_events = list(jb_cache["events"])
+        jb_attempt = jb_cache["attempt"]
     if key:
-        try:
-            jb_events = normalise_events(fetch_jblanked(key), "jblanked")
-        except Exception as e:
-            errors.append(f"JBlanked: {e}")
+        due = (jb_attempt is None or
+               (now - jb_attempt).total_seconds() >= CAL_JB_REFRESH_MIN * 60)
+        if due:
+            with _lock:
+                _cal_state["jb"]["attempt"] = now
+            try:
+                jb_events = normalise_events(fetch_jblanked(key), "jblanked")
+                jb_fresh = True
+                with _lock:
+                    _cal_state["jb"]["events"] = jb_events
+                    _cal_state["jb"]["ts"] = now
+            except Exception as e:
+                errors.append(f"JBlanked: {e}")   # cached events stay in jb_events
+
+    # Nothing new arrived, so there is nothing better to publish than what is
+    # already stored. Rebuilding from the JBlanked cache alone would quietly
+    # drop every ForexFactory event from the last good result.
+    if not ff_ok and not jb_fresh:
+        with _lock:
+            meta = dict(_cal_state["meta"])
+            meta["error"] = "; ".join(errors) if errors else "no data returned"
+            _cal_state["meta"] = meta
+        save_calendar()
+        return
 
     with _lock:
         last_shift = (_cal_state["meta"] or {}).get("time_check_h")
@@ -1310,9 +1359,12 @@ def refresh_calendar(force=False):
 def save_calendar():
     try:
         with _lock:
+            jb = _cal_state.get("jb") or {}
             data = {"events": list(_cal_state["events"]),
                     "ts": _cal_state["ts"].isoformat() if _cal_state["ts"] else None,
-                    "meta": dict(_cal_state["meta"])}
+                    "meta": dict(_cal_state["meta"]),
+                    "jb": {"events": list(jb.get("events") or []),
+                           "ts": jb["ts"].isoformat() if jb.get("ts") else None}}
         with open(CAL_STATE_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
@@ -1329,6 +1381,12 @@ def load_calendar():
             _cal_state["ts"] = datetime.datetime.fromisoformat(ts) if ts else None
             _cal_state["attempt"] = _cal_state["ts"]   # cooldown survives a restart
             _cal_state["meta"] = data.get("meta", {})
+            jb = data.get("jb") or {}
+            jb_ts = jb.get("ts")
+            # The credit already spent on this pull survives a restart too.
+            _cal_state["jb"] = {"events": jb.get("events", []),
+                                "ts": datetime.datetime.fromisoformat(jb_ts) if jb_ts else None,
+                                "attempt": datetime.datetime.fromisoformat(jb_ts) if jb_ts else None}
         print(f"[calendar] restored {len(_cal_state['events'])} event(s)")
     except FileNotFoundError:
         pass
@@ -3979,7 +4037,8 @@ function calMetaLine(){
   if(m.covered_to) bits.push('through ' + calDayLabel(new Date(m.covered_to + 'T12:00:00Z')));
   document.getElementById('cal-meta').textContent = bits.join(' \u00b7 ');
   var warn = [], info = [];
-  if(m.fallback) warn.push(m.fallback + ': only the current week is shown. A working JBlanked key in .env extends the horizon.');
+  if(m.fallback) warn.push(m.fallback + ': only the current week is shown. A JBlanked key with credits in .env extends the horizon.');
+  if(/credit/i.test(m.error || '')) warn.push('JBlanked needs credits on the account before it can extend the calendar past this week. ForexFactory covers the current week either way.');
   if(m.error) warn.push('Last fetch problem: ' + m.error);
   if(m.time_check_h) info.push('JBlanked clock was ' + (m.time_check_h > 0 ? '+' : '') + m.time_check_h + 'h vs ForexFactory; its events were corrected.');
   var a = document.getElementById('cal-audit');

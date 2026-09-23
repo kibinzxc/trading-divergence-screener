@@ -230,7 +230,8 @@ class Refresh(unittest.TestCase):
     def setUp(self):
         self._orig = (m.CAL_STATE_FILE, m.fetch_jblanked, m.fetch_ff)
         m.CAL_STATE_FILE = os.path.join(tempfile.mkdtemp(), "calendar_state.json")
-        m._cal_state.update({"events": [], "ts": None, "attempt": None, "meta": {}})
+        m._cal_state.update({"events": [], "ts": None, "attempt": None, "meta": {},
+                             "jb": {"events": [], "ts": None, "attempt": None}})
         self.calls = {"jb": 0, "ff": 0}
         os.environ["JBLANKED_API_KEY"] = "k"
 
@@ -283,6 +284,7 @@ class Refresh(unittest.TestCase):
         m.fetch_jblanked = lambda key: [dict(JB_ROW, Name="Core PCE Price Index m/m",
                                              Date="2026.10.01 18:30:00")]
         m._cal_state["attempt"] -= dt.timedelta(seconds=m.CAL_MIN_REFRESH_S + 1)
+        m._cal_state["jb"]["attempt"] -= dt.timedelta(minutes=m.CAL_JB_REFRESH_MIN + 1)
         m.refresh_calendar(force=True)
         s = self._state()
         self.assertEqual(s["meta"]["source"], "jblanked")
@@ -331,6 +333,7 @@ class Refresh(unittest.TestCase):
             raise RuntimeError("down")
         m.fetch_jblanked, m.fetch_ff = boom, boom
         m._cal_state["attempt"] = None          # clear the cooldown
+        m._cal_state["jb"]["attempt"] = None
         m.refresh_calendar(force=True)
         s = self._state()
         self.assertEqual([e["title"] for e in s["events"]], kept)
@@ -345,10 +348,10 @@ class Refresh(unittest.TestCase):
     def test_force_respects_the_minimum_interval_then_refetches(self):
         m.refresh_calendar()
         m.refresh_calendar(force=True)              # too soon after the last attempt
-        self.assertEqual(self.calls["jb"], 1)
+        self.assertEqual(self.calls["ff"], 1)
         m._cal_state["attempt"] -= dt.timedelta(seconds=m.CAL_MIN_REFRESH_S + 1)
         m.refresh_calendar(force=True)
-        self.assertEqual(self.calls["jb"], 2)
+        self.assertEqual(self.calls["ff"], 2)
 
     def test_time_check_flags_a_clock_disagreement(self):
         # JBlanked says 15:30Z, ForexFactory says 12:30Z for the same print.
@@ -367,11 +370,96 @@ class Refresh(unittest.TestCase):
         self.assertIsInstance(m._cal_state["ts"], dt.datetime)
 
 
+class JbCredits(unittest.TestCase):
+    """JBlanked's calendar endpoints cost credits per call, while ForexFactory
+    is free. JBlanked only supplies the schedule beyond the current week, which
+    barely changes, so it is fetched on a much slower cadence than the feed that
+    carries today's forecasts."""
+
+    def setUp(self):
+        self._orig = (m.CAL_STATE_FILE, m.fetch_jblanked, m.fetch_ff)
+        m.CAL_STATE_FILE = os.path.join(tempfile.mkdtemp(), "calendar_state.json")
+        m._cal_state.update({"events": [], "ts": None, "attempt": None, "meta": {},
+                             "jb": {"events": [], "ts": None, "attempt": None}})
+        self.calls = {"jb": 0, "ff": 0}
+        os.environ["JBLANKED_API_KEY"] = "k"
+
+        def jb(key):
+            self.calls["jb"] += 1
+            return [dict(JB_ROW, Name="Non-Farm Employment Change", Date="2026.10.02 12:30:00")]
+
+        def ff():
+            self.calls["ff"] += 1
+            return [FF_ROW]
+
+        m.fetch_jblanked, m.fetch_ff = jb, ff
+
+    def tearDown(self):
+        m.CAL_STATE_FILE, m.fetch_jblanked, m.fetch_ff = self._orig
+        m._cal_state.pop("jb", None)
+        os.environ.pop("JBLANKED_API_KEY", None)
+
+    def _age_ff(self):
+        """Let the cheap feed go stale without ageing the metered one."""
+        m._cal_state["attempt"] -= dt.timedelta(minutes=m.CAL_REFRESH_MIN + 1)
+
+    def test_forexfactory_refreshes_without_spending_a_jblanked_credit(self):
+        m.refresh_calendar()
+        self.assertEqual((self.calls["ff"], self.calls["jb"]), (1, 1))
+        self._age_ff()
+        m.refresh_calendar()
+        self.assertEqual(self.calls["ff"], 2)
+        self.assertEqual(self.calls["jb"], 1, "JBlanked must not be re-fetched while its cache is fresh")
+
+    def test_cached_jblanked_events_still_extend_the_horizon(self):
+        m.refresh_calendar()
+        self._age_ff()
+        m.refresh_calendar()
+        titles = [e["title"] for e in m._cal_state["events"]]
+        self.assertIn("Non-Farm Employment Change", titles)
+        self.assertIn("CPI m/m", titles)
+
+    def test_jblanked_is_refetched_once_its_own_interval_passes(self):
+        m.refresh_calendar()
+        self._age_ff()
+        m._cal_state["jb"]["attempt"] -= dt.timedelta(minutes=m.CAL_JB_REFRESH_MIN + 1)
+        m.refresh_calendar()
+        self.assertEqual(self.calls["jb"], 2)
+
+    def test_a_failed_jblanked_fetch_keeps_the_cached_horizon(self):
+        m.refresh_calendar()
+
+        def boom(key):
+            raise RuntimeError("HTTP 401: no credits")
+        m.fetch_jblanked = boom
+        self._age_ff()
+        m._cal_state["jb"]["attempt"] -= dt.timedelta(minutes=m.CAL_JB_REFRESH_MIN + 1)
+        m.refresh_calendar()
+        titles = [e["title"] for e in m._cal_state["events"]]
+        self.assertIn("Non-Farm Employment Change", titles)
+        self.assertIn("credits", m._cal_state["meta"]["error"])
+
+    def test_jblanked_cache_round_trips_through_disk(self):
+        m.refresh_calendar()
+        m._cal_state.update({"events": [], "ts": None, "attempt": None, "meta": {},
+                             "jb": {"events": [], "ts": None, "attempt": None}})
+        m.load_calendar()
+        self.assertEqual([e["title"] for e in m._cal_state["jb"]["events"]],
+                         ["Non-Farm Employment Change"])
+
+    def test_credit_exhaustion_is_reported_as_such_not_as_a_bad_key(self):
+        msg = m._jb_error_text(401, '{"message":"This endpoint requires credits, '
+                                    'and you currently do not have any."}')
+        self.assertIn("credit", msg.lower())
+        self.assertNotIn("rate", msg.lower())
+
+
 class Route(unittest.TestCase):
     def setUp(self):
         self._orig = (m.CAL_STATE_FILE, m.fetch_jblanked, m.fetch_ff)
         m.CAL_STATE_FILE = os.path.join(tempfile.mkdtemp(), "calendar_state.json")
-        m._cal_state.update({"events": [], "ts": None, "attempt": None, "meta": {}})
+        m._cal_state.update({"events": [], "ts": None, "attempt": None, "meta": {},
+                             "jb": {"events": [], "ts": None, "attempt": None}})
         os.environ.pop("JBLANKED_API_KEY", None)
         m.fetch_ff = lambda: [FF_ROW]
         m.fetch_jblanked = lambda key: []

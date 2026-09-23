@@ -1116,23 +1116,42 @@ def normalise_events(rows, source):
     return out
 
 
-def calendar_time_check(events, reference):
-    """Median hour difference between events present in both lists (same
-    currency + title, nearest occurrence within a day). None if no overlap.
-    Anything but ~0 means JB_TIME_OFFSET is wrong."""
-    ref = {}
-    for e in reference:
-        ref.setdefault((e["currency"], e["title"]), []).append(_cal_parse_ts("iso", e["ts"]))
-    deltas = []
-    for e in events:
-        cands = ref.get((e["currency"], e["title"]))
-        if not cands:
+def _pair_events(events, reference, shift_h=0.0):
+    """Match events to reference entries one-to-one on currency + title.
+
+    Closest pairs win first and each side is consumed once, so a title that
+    repeats within a day (FOMC speakers, ECB speakers) pairs up in order
+    instead of every occurrence collapsing onto whichever one happens to be
+    nearest. `shift_h` is subtracted from the event times before measuring, so
+    once the clock offset is known the pairing is done on corrected times.
+    Returns [(event_index, reference_index, delta_hours), ...]."""
+    by_key = {}
+    for j, r in enumerate(reference):
+        by_key.setdefault((r["currency"], r["title"]), []).append(j)
+    ref_ts = [_cal_parse_ts("iso", r["ts"]) for r in reference]
+    cands = []
+    for i, e in enumerate(events):
+        t = _cal_parse_ts("iso", e["ts"]) - datetime.timedelta(hours=shift_h)
+        for j in by_key.get((e["currency"], e["title"]), []):
+            d = (t - ref_ts[j]).total_seconds() / 3600.0
+            if abs(d) <= 24:
+                cands.append((abs(d), i, j, d + shift_h))
+    cands.sort()
+    used_e, used_r, pairs = set(), set(), []
+    for _, i, j, d in cands:
+        if i in used_e or j in used_r:
             continue
-        t = _cal_parse_ts("iso", e["ts"])
-        nearest = min(cands, key=lambda c: abs((c - t).total_seconds()))
-        d = (t - nearest).total_seconds() / 3600.0
-        if abs(d) <= 24:
-            deltas.append(d)
+        used_e.add(i)
+        used_r.add(j)
+        pairs.append((i, j, d))
+    return pairs
+
+
+def calendar_time_check(events, reference):
+    """Median hour difference between events present in both lists. None if
+    nothing overlaps. Anything but ~0 means JBlanked is on a different clock,
+    which merge_calendars then corrects."""
+    deltas = [d for _, _, d in _pair_events(events, reference)]
     if not deltas:
         return None
     return round(statistics.median(deltas), 2)
@@ -1146,20 +1165,18 @@ def merge_calendars(ff_events, jb_events):
     events, and contributes the actual value once a print is out.
     Returns (events, shift_h)."""
     shift = calendar_time_check(jb_events, ff_events)
-    by_key = {}
-    for i, e in enumerate(jb_events):
-        by_key.setdefault((e["currency"], e["title"]), []).append((i, _cal_parse_ts("iso", e["ts"])))
-    used, out = set(), []
-    for f in ff_events:
+    # Pair again on clock-corrected times: with the offset removed each
+    # occurrence lands on its own counterpart rather than on its neighbour.
+    actual_by_ff = {}
+    used = set()
+    for i, j, _ in _pair_events(jb_events, ff_events, shift or 0.0):
+        used.add(i)
+        actual_by_ff[j] = jb_events[i]["actual"]
+    out = []
+    for j, f in enumerate(ff_events):
         e = dict(f)
-        cands = by_key.get((f["currency"], f["title"]))
-        if cands:
-            t = _cal_parse_ts("iso", f["ts"])
-            i, jt = min(cands, key=lambda c: abs((c[1] - t).total_seconds()))
-            if i not in used and abs((jt - t).total_seconds()) <= 24 * 3600:
-                used.add(i)
-                if jb_events[i]["actual"] and not e["actual"]:
-                    e["actual"] = jb_events[i]["actual"]
+        if actual_by_ff.get(j) and not e["actual"]:
+            e["actual"] = actual_by_ff[j]
         out.append(e)
     delta = datetime.timedelta(hours=shift or 0.0)
     for i, j in enumerate(jb_events):
@@ -1167,6 +1184,15 @@ def merge_calendars(ff_events, jb_events):
             out.append(dict(j, ts=_iso_z(_cal_parse_ts("iso", j["ts"]) - delta)))
     out.sort(key=lambda e: (e["ts"], e["currency"], e["title"]))
     return out, shift
+
+
+def _ff_week_end(events):
+    """ForexFactory's weekly feed always runs Sunday to Saturday, so its
+    coverage reaches that Saturday even when the last event is on Friday."""
+    if not events:
+        return None
+    d = _cal_parse_ts("iso", events[-1]["ts"]).date()
+    return (d + datetime.timedelta(days=(5 - d.weekday()) % 7)).isoformat()
 
 
 def _http_json(url, headers=None, timeout=25):
@@ -1231,23 +1257,44 @@ def refresh_calendar(force=False):
         except Exception as e:
             errors.append(f"JBlanked: {e}")
 
-    shift = None
+    with _lock:
+        last_shift = (_cal_state["meta"] or {}).get("time_check_h")
+
+    shift, stale_shift = None, False
+    jb_end = (datetime.datetime.now(datetime.timezone.utc).date()
+              + datetime.timedelta(days=CAL_DAYS_AHEAD)).isoformat()
     if jb_events and ff_events:
         events, shift = merge_calendars(ff_events, jb_events)
         source = "jblanked+forexfactory"
+        covered_to = max(jb_end, _ff_week_end(ff_events) or "")
     elif jb_events:
-        events, source = jb_events, "jblanked"
+        # No ForexFactory means no clock reference this run. JBlanked's raw
+        # times are hours off, so reuse the last measured shift rather than
+        # publishing a countdown that is silently wrong.
+        shift, stale_shift = last_shift, last_shift is not None
+        delta = datetime.timedelta(hours=shift or 0.0)
+        events = sorted((dict(e, ts=_iso_z(_cal_parse_ts("iso", e["ts"]) - delta))
+                         for e in jb_events),
+                        key=lambda e: (e["ts"], e["currency"], e["title"]))
+        source, covered_to = "jblanked", jb_end
     elif ff_events:
         events, source = ff_events, "forexfactory"
+        covered_to = _ff_week_end(ff_events)
     else:
-        events, source = [], None
+        events, source, covered_to = [], None, None
 
     meta = {"source": source, "has_key": bool(key),
             "error": "; ".join(errors) if errors else None,
-            "time_check_h": shift, "fallback": None}
+            "time_check_h": shift, "covered_to": covered_to, "fallback": None}
     if source == "forexfactory":
         meta["fallback"] = ("No JBlanked key set" if not key
                             else "JBlanked failed, using the ForexFactory feed")
+    elif source == "jblanked":
+        meta["fallback"] = (
+            f"ForexFactory is down; JBlanked times were corrected by the last "
+            f"measured clock offset ({shift:+g}h)." if stale_shift else
+            "ForexFactory is down, so JBlanked's clock could not be checked "
+            "against anything. Times may be off by hours.")
     with _lock:
         if events:
             _cal_state["events"] = events
@@ -3831,7 +3878,7 @@ function calBanner(now){
   var n = calNextMover(now);
   var el = document.getElementById('cal-next'), strip = document.getElementById('dash-cal');
   if(!n){
-    var msg = _cal.events.length ? 'No market movers on the schedule through ' + calDayLabel(new Date(_cal.events[_cal.events.length - 1].ts)) + '.' : 'Calendar not loaded yet.';
+    var msg = _cal.events.length ? 'No market movers on the schedule through ' + (_cal.meta.covered_to ? calDayLabel(new Date(_cal.meta.covered_to + 'T12:00:00Z')) : 'the current horizon') + '.' : 'Calendar not loaded yet.';
     el.className = 'cal-next';
     el.innerHTML = '<span class="cal-next-lbl">Next market mover</span><span class="cal-next-meta">' + msg + '</span>';
     if(strip) strip.style.display = 'none';
@@ -3864,8 +3911,9 @@ function calGrid(now){
   calFiltered().forEach(function(e){ var k = calDayKey(new Date(e.ts)); (byDay[k] = byDay[k] || []).push(e); });
   var start = new Date(now); start.setHours(0, 0, 0, 0);
   if(_calSel === null) _calSel = calDayKey(start);
-  /* Past the last day either feed has published, a blank cell means "no data", not "quiet". Computed on all events, not the filtered ones. */
-  var lastDay = _cal.events.length ? calDayKey(new Date(_cal.events[_cal.events.length - 1].ts)) : '';
+  /* Past the horizon the feeds actually cover, a blank cell means "no data", not "quiet".
+     This is the requested range, not the last event: an empty Saturday inside a published week is genuinely quiet. */
+  var coveredTo = _cal.meta.covered_to || '';
   for(var i = 0; i < 14; i++){
     var d = new Date(start.getTime()); d.setDate(start.getDate() + i);
     var k = calDayKey(d), list = byDay[k] || [];
@@ -3876,7 +3924,7 @@ function calGrid(now){
     var html = '<div class="cal-dh"><span class="cal-dow">' + CAL_DOW[d.getDay()] + '</span>' +
                '<span class="cal-dn">' + d.getDate() + ((d.getDate() === 1 || i === 0) ? ' ' + CAL_MON[d.getMonth()] : '') + '</span></div>';
     if(list.length === 0){
-      var nodata = lastDay && k > lastDay;
+      var nodata = coveredTo && k > coveredTo;
       html += '<div class="cal-quiet">' + (nodata ? 'no data yet' : 'quiet') + '</div>';
     } else {
       var groups = [], last = null;
@@ -3928,7 +3976,7 @@ function calMetaLine(){
   var SRC = {'jblanked+forexfactory': 'ForexFactory + JBlanked', 'jblanked': 'JBlanked only', 'forexfactory': 'ForexFactory feed'};
   bits.push(SRC[m.source] || 'no source');
   if(_cal.ts) bits.push('updated ' + Math.round((Date.now() - new Date(_cal.ts)) / 60000) + ' min ago');
-  if(_cal.events.length) bits.push('through ' + calDayLabel(new Date(_cal.events[_cal.events.length - 1].ts)));
+  if(m.covered_to) bits.push('through ' + calDayLabel(new Date(m.covered_to + 'T12:00:00Z')));
   document.getElementById('cal-meta').textContent = bits.join(' \u00b7 ');
   var warn = [], info = [];
   if(m.fallback) warn.push(m.fallback + ': only the current week is shown. A working JBlanked key in .env extends the horizon.');

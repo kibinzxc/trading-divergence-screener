@@ -172,6 +172,29 @@ class Merge(unittest.TestCase):
         self.assertIsNone(shift)
         self.assertEqual([e["ts"] for e in out], ["2026-09-23T12:30:00Z", "2026-10-02T12:30:00Z"])
 
+    def test_repeated_title_is_not_duplicated_when_occurrences_are_close(self):
+        """Two same-titled events a couple of hours apart (FOMC speakers, Buba
+        speakers) must pair one-to-one, not collapse onto the nearest and leave
+        the other to reappear as a JBlanked-only event."""
+        ff = [self._ff("2026-09-24T13:00:00Z", title="FOMC Member Williams Speaks", mover=False),
+              self._ff("2026-09-24T17:00:00Z", title="FOMC Member Williams Speaks", mover=False)]
+        jb = [self._jb("2026-09-24T19:00:00Z", title="FOMC Member Williams Speaks", mover=False, actual="A"),
+              self._jb("2026-09-24T23:00:00Z", title="FOMC Member Williams Speaks", mover=False, actual="B")]
+        out, shift = m.merge_calendars(ff, jb)
+        self.assertEqual(shift, 6.0)
+        self.assertEqual([e["ts"] for e in out],
+                         ["2026-09-24T13:00:00Z", "2026-09-24T17:00:00Z"])
+        self.assertEqual([e["actual"] for e in out], ["A", "B"])
+
+    def test_repeated_title_does_not_skew_the_measured_shift(self):
+        """Nearest-neighbour matching lets the earlier JBlanked event pair with
+        the later ForexFactory one, which drags the median off the true offset."""
+        ff = [self._ff("2026-09-24T13:00:00Z", title="ECB President Lagarde Speaks", mover=False),
+              self._ff("2026-09-24T17:00:00Z", title="ECB President Lagarde Speaks", mover=False)]
+        jb = [self._jb("2026-09-24T16:00:00Z", title="ECB President Lagarde Speaks", mover=False),
+              self._jb("2026-09-24T20:00:00Z", title="ECB President Lagarde Speaks", mover=False)]
+        self.assertEqual(m.calendar_time_check(jb, ff), 3.0)
+
     def test_result_is_sorted_after_shifting(self):
         out, _ = m.merge_calendars(
             [self._ff("2026-09-24T12:30:00Z")],
@@ -245,6 +268,42 @@ class Refresh(unittest.TestCase):
         self.assertEqual(s["meta"]["source"], "jblanked")
         self.assertEqual([e["title"] for e in s["events"]], ["Core CPI m/m"])
         self.assertIn("ff down", s["meta"]["error"])
+
+    def test_jblanked_alone_still_applies_the_last_known_clock_correction(self):
+        """Losing ForexFactory must not silently serve raw broker-clock times:
+        the previously measured shift is reused and reported."""
+        m.fetch_jblanked = lambda key: [dict(JB_ROW, Name="CPI m/m", Date="2026.09.24 18:30:00")]
+        m.fetch_ff = lambda: [dict(FF_ROW, title="CPI m/m", date="2026-09-24T08:30:00-04:00")]
+        m.refresh_calendar()
+        self.assertEqual(self._state()["meta"]["time_check_h"], 6.0)
+
+        def boom():
+            raise RuntimeError("ff down")
+        m.fetch_ff = boom
+        m.fetch_jblanked = lambda key: [dict(JB_ROW, Name="Core PCE Price Index m/m",
+                                             Date="2026.10.01 18:30:00")]
+        m._cal_state["attempt"] -= dt.timedelta(seconds=m.CAL_MIN_REFRESH_S + 1)
+        m.refresh_calendar(force=True)
+        s = self._state()
+        self.assertEqual(s["meta"]["source"], "jblanked")
+        self.assertEqual([e["ts"] for e in s["events"]], ["2026-10-01T12:30:00Z"])
+        self.assertEqual(s["meta"]["time_check_h"], 6.0)
+        self.assertIn("clock", (s["meta"]["fallback"] or "").lower())
+
+    def test_coverage_end_is_the_requested_horizon_not_the_last_event(self):
+        """An empty Saturday inside the published week is quiet, not unknown, so
+        the horizon must come from the range asked for."""
+        m.refresh_calendar()
+        s = self._state()
+        last_event_day = max(e["ts"][:10] for e in s["events"])
+        self.assertGreater(s["meta"]["covered_to"], last_event_day)
+
+    def test_forexfactory_only_coverage_reaches_the_end_of_its_week(self):
+        os.environ.pop("JBLANKED_API_KEY")
+        # A Wednesday event; ForexFactory's feed always runs Sunday to Saturday.
+        m.fetch_ff = lambda: [dict(FF_ROW, date="2026-09-23T08:30:00-04:00")]
+        m.refresh_calendar()
+        self.assertEqual(self._state()["meta"]["covered_to"], "2026-09-26")
 
     def test_falls_back_to_forexfactory_without_a_key(self):
         os.environ.pop("JBLANKED_API_KEY")

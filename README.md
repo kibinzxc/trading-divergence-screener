@@ -145,7 +145,9 @@ usually means that limit, not a bad key.
 
 **Times.** Shown in your browser's local time, with UTC in the tooltip. The
 script measures JBlanked's clock against the shared ForexFactory events on
-every refresh, corrects it, and reports the shift in the audit line.
+every refresh, corrects it, and reports the shift in the audit line. If
+ForexFactory is unreachable there is nothing to measure against, so the last
+known offset is reused and the audit line says so.
 
 **The Dashboard strip** repeats the next market mover with a countdown and
 turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.

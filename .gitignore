@@ -5,6 +5,7 @@
 scan_state.json
 movers_state.json
 calendar_state.json
+mentor_picks.json
 
 # python
 __pycache__/

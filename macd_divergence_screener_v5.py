@@ -234,6 +234,15 @@ MOVER_VOL_MULT    = 2.0
 MOVER_RANGE_MULT  = 1.5
 MOVER_EDGE_PCT    = 2.0     # within this % of a 7-day boundary = "at the edge"
 
+# Thin band (opt-in, /movers?thin=1). Pairs between this and the volume floor
+# are measured too, but listed separately and held to a stricter test: volume
+# spike AND range expansion together. On a $3M/day perp one whale order is a
+# "7x volume day" on its own; needing the range to expand with it is what
+# separates real participation from a single fill. The costs that justify the
+# main floor (spread, slippage through stops, wicks that clear stops and snap
+# back) do not go away — the band is labelled so size can come down with it.
+MOVER_THIN_MIN_WEEKLY_VOL = 20_000_000   # ≈ $3M/day
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "scan_state.json")
 # Own file on purpose: a movers scan must never be able to clobber the
@@ -946,12 +955,15 @@ def analyse_mover(df, live_price):
     }
 
 
-def classify_mover(m):
+def classify_mover(m, thin=False):
     """(qualifies, flags, score) for one analysed pair.
 
     The score ranks how UNUSUAL the day was and how close price sits to a
     decision level. It carries NO direction and is NOT a win rate — the same
     caveat as setup_score, for the same reason: nothing here was backtested.
+
+    thin=True is the stricter test for the low-liquidity band: volume spike
+    AND range expansion, where a liquid pair needs any one trigger.
     """
     vm  = m.get("vol_mult") or 0.0
     rm  = m.get("range_mult") or 0.0
@@ -974,8 +986,11 @@ def classify_mover(m):
     elif lo_d is not None and lo_d <= MOVER_EDGE_PCT:
         flags.append("AT RANGE LOW")
 
-    qualifies = (vm >= MOVER_VOL_MULT or rm >= MOVER_RANGE_MULT
-                 or chg >= MOVER_MIN_CHG_PCT)
+    if thin:
+        qualifies = vm >= MOVER_VOL_MULT and rm >= MOVER_RANGE_MULT
+    else:
+        qualifies = (vm >= MOVER_VOL_MULT or rm >= MOVER_RANGE_MULT
+                     or chg >= MOVER_MIN_CHG_PCT)
 
     # Distance to the NEARER 7-day boundary. Already through one → 0 → full marks.
     edge = min([d for d in (hi_d, lo_d) if d is not None] or [99.0])
@@ -1013,6 +1028,213 @@ def load_movers():
         pass
     except Exception as e:
         print(f"[movers] load failed: {e}")
+
+
+# ── Mentor log ─────────────────────────────────────────────────────────────────
+# The posted daily watchlist (a poster of USDT perps in TradingView notation,
+# e.g. ICPUSDT.P), tracked forward. Most of its names trade under the volume
+# floor, and the question this answers is whether those thin picks move enough
+# to pay for the extra cost of trading them — measured, not taken on faith.
+#
+# The poster carries no direction, so nothing here scores a pick as a win or
+# loss. It records how far price travelled each way over the next
+# MENTOR_HOLD_D completed daily bars, and how that compares with the coin's own
+# ATR20 (did it move MORE than usual, i.e. was the pick timed, or is it just a
+# volatile coin). Entry is the open of the poster day's daily bar — 00:00 UTC,
+# about two hours before the post goes up — so the first bar includes those
+# two hours.
+MENTOR_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "mentor_picks.json")
+MENTOR_HOLD_D = 2
+MENTOR_DEFAULT_EXCHANGE = "binance"   # lists the most of these names
+_mentor_state = {"posts": []}
+
+
+def parse_ticker(raw, bases):
+    """'ICPUSDT.P' → 'ICP', matched against the venue's perp bases. None if
+    nothing matches. Handles the poster cutting a long name short
+    ('VELODROMEU' → VELODROME) by trying shorter cuts of the USDT suffix, but
+    only after the raw text itself, so a base that happens to end in U wins.
+    """
+    t = re.sub(r"\.P$", "", str(raw).strip().upper()).split("/")[0]   # MON/USDT:USDT
+    t = re.sub(r"[^A-Z0-9]", "", t)
+    if not t:
+        return None
+    cands = []
+    if t.endswith("USDT"):
+        cands.append(t[:-4])
+    cands.append(t)
+    for suf in ("USD", "US", "U"):
+        if t.endswith(suf):
+            cands.append(t[:-len(suf)])
+    for c in cands:
+        if c and c in bases:
+            return c
+    return None
+
+
+def liquidity_tier(wk_vol):
+    if wk_vol is None:
+        return None
+    if wk_vol >= DEFAULT_MIN_WEEKLY_VOL:
+        return "liquid"
+    if wk_vol >= MOVER_THIN_MIN_WEEKLY_VOL:
+        return "thin"
+    return "micro"
+
+
+def mentor_outcome(df, post_date, contract_size=1.0):
+    """Forward outcome of one pick from COMPLETED daily bars.
+
+    Liquidity is measured on the 7 bars BEFORE the post, so a pick that pumped
+    on the day is still tiered by what it was when it was picked. Notional is
+    volume × contract size × close, which holds for linear USDT perps whether
+    the venue reports volume in coins (contract size 1) or contracts.
+    """
+    if df is None or df.empty:
+        return {"status": "no_data"}
+    days = df.index.date
+    before = df[days < post_date]
+    fwd = df[days >= post_date].iloc[:MENTOR_HOLD_D]
+    out = {"status": "pending"}
+
+    if len(before) >= 7:
+        last7 = before.iloc[-7:]
+        wk = float((last7["volume"] * contract_size * last7["close"]).sum())
+        out["wk_vol"] = round(wk, 2)
+        out["tier"] = liquidity_tier(wk)
+    atr = None
+    if len(before) >= 21:
+        h, l, c = (before[k].values.astype(float) for k in ("high", "low", "close"))
+        tr = np.maximum(h[1:] - l[1:],
+                        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+        atr = float(tr[-20:].mean())
+
+    if fwd.empty:
+        return out
+    entry = float(fwd["open"].iloc[0])
+    if entry <= 0:
+        return {"status": "no_data"}
+    hi, lo = float(fwd["high"].max()), float(fwd["low"].min())
+    closes = fwd["close"].values.astype(float)
+    out.update({
+        "entry":     px(entry),
+        "bars":      int(len(fwd)),
+        "chg_24h":   round((closes[0] / entry - 1) * 100, 2),
+        "chg_48h":   round((closes[1] / entry - 1) * 100, 2) if len(closes) > 1 else None,
+        "max_up":    round((hi / entry - 1) * 100, 2),
+        "max_dn":    round((lo / entry - 1) * 100, 2),
+        "range_atr": round((hi - lo) / atr, 2) if atr else None,
+        "status":    "final" if len(fwd) >= MENTOR_HOLD_D else "partial",
+    })
+    return out
+
+
+def mentor_summary(posts):
+    """Per liquidity tier, medians over FINAL picks only — a half-open window
+    mixed in would understate every move. BTC is the market reference, kept
+    out of the tiers."""
+    groups = {}
+    for p in posts:
+        for base, r in (p.get("results") or {}).items():
+            if r.get("status") != "final" or not r.get("tier"):
+                continue
+            key = "btc" if base == "BTC" else r["tier"]
+            groups.setdefault(key, []).append(r)
+
+    def med(vals):
+        vals = [v for v in vals if v is not None]
+        return round(statistics.median(vals), 2) if vals else None
+
+    out = {}
+    for tier, rs in groups.items():
+        out[tier] = {
+            "n":           len(rs),
+            "abs_chg_48h": med([abs(r["chg_48h"]) for r in rs if r.get("chg_48h") is not None]),
+            "max_up":      med([r.get("max_up") for r in rs]),
+            "max_dn":      med([r.get("max_dn") for r in rs]),
+            "range_pct":   med([r["max_up"] - r["max_dn"] for r in rs
+                                if r.get("max_up") is not None and r.get("max_dn") is not None]),
+            "range_atr":   med([r.get("range_atr") for r in rs]),
+        }
+    return out
+
+
+def save_mentor():
+    try:
+        with _lock:
+            data = json.loads(json.dumps(_mentor_state))
+        with open(MENTOR_FILE, "w") as f:
+            json.dump(data, f, indent=1)
+    except Exception as e:
+        print(f"[mentor] save failed: {e}")
+
+
+def load_mentor():
+    try:
+        with open(MENTOR_FILE) as f:
+            data = json.load(f)
+        with _lock:
+            _mentor_state["posts"] = data.get("posts", [])
+        print(f"[mentor] restored {len(_mentor_state['posts'])} logged post(s)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[mentor] load failed: {e}")
+
+
+def refresh_mentor_results():
+    """Fill in every pick whose window is not final yet. Final results are
+    frozen and never re-fetched, so the cost is only the open windows."""
+    with _lock:
+        posts = json.loads(json.dumps(_mentor_state["posts"]))
+
+    def open_post(p):
+        res = p.get("results") or {}
+        return any(res.get(b, {}).get("status") not in ("final", "not_listed")
+                   for b in p["tickers"] + ["BTC"])
+
+    todo = [p for p in posts if open_post(p)]
+    errors, by_ex = [], {}
+    for p in todo:
+        by_ex.setdefault(p.get("exchange") or MENTOR_DEFAULT_EXCHANGE, []).append(p)
+    for exid, plist in by_ex.items():
+        try:
+            ex = make_exchange(exid)
+            mkts = ex.load_markets()
+        except Exception as e:
+            errors.append(f"{exid}: {e}")
+            continue
+        limiter = RateLimiter(SPEED["normal"]["rps"].get(exid, 8))
+        for p in plist:
+            d = datetime.date.fromisoformat(p["date"])
+            day0 = datetime.datetime(d.year, d.month, d.day, tzinfo=datetime.timezone.utc)
+            since = int(day0.timestamp() * 1000) - 30 * 86400000
+            res = p.setdefault("results", {})
+            for base in p["tickers"] + ["BTC"]:   # BTC: what the market did meanwhile
+                if res.get(base, {}).get("status") in ("final", "not_listed"):
+                    continue
+                sym = f"{base}/USDT:USDT"
+                if sym not in mkts:
+                    res[base] = {"status": "not_listed"}
+                    continue
+                raw = fetch_ohlcv(ex, limiter, sym, "1d", limit=45, since=since)
+                if not raw:
+                    errors.append(f"{base} {p['date']}: fetch failed")
+                    continue
+                df = drop_forming_candle(_to_df(raw), 1440)
+                res[base] = mentor_outcome(df, d, float(mkts[sym].get("contractSize") or 1.0))
+
+    # Write back only into posts that were not edited while we were fetching.
+    fresh = {p["date"]: p for p in todo}
+    with _lock:
+        for p in _mentor_state["posts"]:
+            f = fresh.get(p["date"])
+            if f and f["tickers"] == p["tickers"] and f.get("exchange") == p.get("exchange"):
+                p["results"] = f.get("results", {})
+    if todo:
+        save_mentor()
+    return errors
 
 
 # ── News calendar ──────────────────────────────────────────────────────────────
@@ -1595,6 +1817,8 @@ def index():
         "__MOVER_VOL__":   format(MOVER_VOL_MULT, "g"),
         "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
         "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
+        "__MOVER_THIN_M__": str(int(MOVER_THIN_MIN_WEEKLY_VOL / 1e6)),
+        "__MENTOR_HOLD__": str(MENTOR_HOLD_D),
         "__OI_LB__":       str(OI_LOOKBACK_D),
         "__OI_MIN__":      format(OI_MIN_CHANGE_PCT, "g"),
         "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
@@ -2122,6 +2346,67 @@ def calendar_route():
                         "now": _iso_z(datetime.datetime.now(datetime.timezone.utc))})
 
 
+@app.route("/mentor", methods=["GET", "POST"])
+def mentor_route():
+    """GET: every logged post with its forward results (open windows are
+    fetched, final ones are frozen) plus the per-tier summary.
+    POST {date, tickers, exchange?}: log or replace the post for that date.
+    POST {date, delete: true}: remove it."""
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        try:
+            d = datetime.date.fromisoformat(str(body.get("date", "")).strip())
+        except ValueError:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+        if body.get("delete"):
+            with _lock:
+                _mentor_state["posts"] = [p for p in _mentor_state["posts"]
+                                          if p["date"] != d.isoformat()]
+            save_mentor()
+            return jsonify({"ok": True})
+
+        exid = body.get("exchange") or MENTOR_DEFAULT_EXCHANGE
+        raw = body.get("tickers") or ""
+        items = raw if isinstance(raw, list) else re.split(r"[\s,;]+", str(raw))
+        items = [t for t in items if str(t).strip()]
+        if not items:
+            return jsonify({"error": "no tickers given"}), 400
+        try:
+            mkts = make_exchange(exid).load_markets()
+        except Exception as e:
+            return jsonify({"error": f"load_markets failed: {e}"}), 502
+        bases = {s.split("/")[0] for s in mkts
+                 if s.endswith("/USDT:USDT") and mkts[s].get("active")}
+        tickers, unmatched = [], []
+        for t in items:
+            b = parse_ticker(t, bases)
+            if b and b not in tickers:
+                tickers.append(b)
+            elif not b:
+                unmatched.append(str(t))
+        if not tickers:
+            return jsonify({"error": f"none of those are USDT perps on {exid.upper()}",
+                            "unmatched": unmatched}), 400
+        post = {"date": d.isoformat(), "exchange": exid, "tickers": tickers,
+                "raw": [str(t) for t in items], "results": {},
+                "added": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        with _lock:
+            _mentor_state["posts"] = [p for p in _mentor_state["posts"]
+                                      if p["date"] != post["date"]] + [post]
+        save_mentor()
+        return jsonify({"ok": True, "tickers": tickers, "unmatched": unmatched})
+
+    errors = refresh_mentor_results()
+    with _lock:
+        posts = sorted(json.loads(json.dumps(_mentor_state["posts"])),
+                       key=lambda p: p["date"], reverse=True)
+    return jsonify({
+        "posts": posts, "summary": mentor_summary(posts), "errors": errors,
+        "hold_d": MENTOR_HOLD_D,
+        "tiers": {"liquid": DEFAULT_MIN_WEEKLY_VOL, "thin": MOVER_THIN_MIN_WEEKLY_VOL},
+    })
+
+
 @app.route("/movers")
 def movers_route():
     """Daily movers scan — one SSE stream, ~1 API call per pair.
@@ -2135,6 +2420,10 @@ def movers_route():
     speed     = request.args.get("speed", "normal")
     min_vol   = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
     max_pairs = int(request.args.get("max_pairs", DEFAULT_MAX_PAIRS))
+    thin      = request.args.get("thin") == "1"
+    # Never above the main floor: lowering the floor below $20M already lets
+    # those pairs in as ordinary rows, and the band is then simply empty.
+    thin_floor = min(MOVER_THIN_MIN_WEEKLY_VOL, min_vol)
     if speed not in SPEED:
         speed = "normal"
 
@@ -2169,7 +2458,9 @@ def movers_route():
             v = usd_volume(tickers.get(s))
             if v:
                 vol24[s] = v
-        pre_floor = (min_vol / 7.0) * PREGATE_SLACK
+        pre_floor = ((thin_floor if thin else min_vol) / 7.0) * PREGATE_SLACK
+        # Sorted most-liquid first, so the max_pairs cap can only ever cut
+        # into the thin end of the list, never the main one.
         pairs = sorted([s for s in vol24 if vol24[s] >= pre_floor],
                        key=lambda s: vol24[s], reverse=True)[:max_pairs]
         yield sse("log", {"msg": f"{len(pairs)} candidates - measuring "
@@ -2191,7 +2482,7 @@ def movers_route():
 
         q = queue.Queue()
         counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0,
-                   "quiet": 0, "errors": 0}
+                   "quiet": 0, "errors": 0, "thin_analysed": 0, "thin_quiet": 0}
         clock = threading.Lock()
 
         def scan_pair(sym):
@@ -2216,10 +2507,13 @@ def movers_route():
                     return
 
                 wk_vol = weekly_usd_volume(df, vol24.get(sym), 1440)
+                tier = "core"
                 if wk_vol is None or wk_vol < min_vol:
-                    with clock:
-                        counter["vol_reject"] += 1
-                    return
+                    if not (thin and wk_vol is not None and wk_vol >= thin_floor):
+                        with clock:
+                            counter["vol_reject"] += 1
+                        return
+                    tier = "thin"
 
                 m = analyse_mover(df, live_price)
                 if m is None:
@@ -2228,12 +2522,12 @@ def movers_route():
                     return
 
                 with clock:
-                    counter["analysed"] += 1
+                    counter["thin_analysed" if tier == "thin" else "analysed"] += 1
 
-                qualifies, flags, score = classify_mover(m)
+                qualifies, flags, score = classify_mover(m, thin=(tier == "thin"))
                 if not qualifies:
                     with clock:
-                        counter["quiet"] += 1
+                        counter["thin_quiet" if tier == "thin" else "quiet"] += 1
                     return
 
                 m.update({
@@ -2241,6 +2535,8 @@ def movers_route():
                     "direction": "UP" if m["chg_1d_pct"] >= 0 else "DOWN",
                     "flags": flags, "score": score,
                     "weekly_volume": round(wk_vol, 2),
+                    "daily_volume": round(wk_vol / 7.0, 2),
+                    "tier": tier,
                     "current_price": px(live_price),
                 })
                 q.put(("result", m))
@@ -2276,6 +2572,9 @@ def movers_route():
                     "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
                     "quiet": c["quiet"], "errors": c["errors"],
                     "tradfi_excluded": skipped_tradfi,
+                    "thin": thin, "thin_floor": thin_floor if thin else None,
+                    "thin_analysed": c["thin_analysed"],
+                    "thin_quiet": c["thin_quiet"],
                     "complete": done.is_set() and q.empty()}
             with _lock:
                 _movers_state["rows"] = rows
@@ -2541,6 +2840,23 @@ tbody tr{animation:ri .3s var(--eout) both}
 #pg-movers.active{display:block;overflow-y:auto;padding:24px}
 #pg-movers{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
 
+.mv-thin{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--tx2);cursor:pointer;user-select:none}
+.mv-thin input{accent-color:var(--fresh)}
+.mv-sep td{background:var(--fresh-bg);color:var(--fresh);font-family:var(--mono);font-size:10px;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid #4a3500}
+.thin-badge{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500;white-space:nowrap}
+
+/* ── Mentor log ── */
+#pg-mentor.active{display:block;overflow-y:auto;padding:24px}
+#pg-mentor{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
+#pg-mentor input[type=date]{width:150px;background:var(--sf2);border:1px solid var(--bd2);color:var(--tx);font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:5px;color-scheme:dark}
+#mtTickers{flex:1;min-width:240px;width:auto}
+.mt-post{margin:22px 0 0}
+.mt-post-hdr{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.mt-del{margin-left:auto;background:none;border:1px solid var(--bd2);color:var(--tx3);font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;cursor:pointer}
+.mt-del:hover{color:var(--bear);border-color:var(--bear)}
+.mt-tier{font-family:var(--mono);font-size:10px;font-weight:600}
+.mt-tier.liquid{color:var(--bull)}.mt-tier.thin{color:var(--fresh)}.mt-tier.micro{color:var(--bear)}.mt-tier.btc{color:var(--tx2)}
+
 /* ── Calendar ── */
 #pg-calendar.active{display:block;overflow-y:auto;padding:24px}
 #pg-calendar{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
@@ -2610,6 +2926,7 @@ tbody tr{animation:ri .3s var(--eout) both}
     <button class="nav-btn" data-pg="watch">Watchlist</button>
     <button class="nav-btn" data-pg="movers">Movers</button>
     <button class="nav-btn" data-pg="calendar">Calendar</button>
+    <button class="nav-btn" data-pg="mentor">Mentor log</button>
     <button class="nav-btn" data-pg="routine">Routine</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
@@ -2794,6 +3111,7 @@ tbody tr{animation:ri .3s var(--eout) both}
   <div class="wbar">
     <select id="mvExchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
     <button class="rbtn" id="mvRunBtn" onclick="startMovers()">Scan Movers</button>
+    <label class="mv-thin" title="Also measure coins trading $__MOVER_THIN_M__M a week up to the volume floor. They are listed in their own section and need a volume spike AND range expansion together, since on a thin coin one big order is a volume spike by itself. Expect worse fills, slippage through stops, and wicks that clear stops and snap back: size down."><input type="checkbox" id="mvThin" onchange="mvThinPref()"> Include thin coins ($__MOVER_THIN_M__M+/wk)</label>
     <span class="wprog" id="mvProg"></span>
   </div>
   <div class="sig-filters">
@@ -2821,6 +3139,37 @@ tbody tr{animation:ri .3s var(--eout) both}
     </table>
     <div class="no-sig" id="mvEmpty">No movers scan yet &mdash; hit Scan Movers.</div>
   </div>
+</div>
+
+<div id="pg-mentor" class="page">
+  <div class="sig-hdr">
+    <div><div class="sig-ttl">Mentor log &mdash; does the posted watchlist actually move?</div>
+    <div class="sig-sub">Paste each day's poster as it comes out. Every pick is followed for the next __MENTOR_HOLD__ completed daily bars from that day's open (00:00 UTC, about 2h before the post), and grouped by how liquid it was in the week before it was picked. The poster gives no direction, so nothing here is a win or a loss &mdash; it measures how far price travelled, and whether that was more than the coin usually moves.</div></div>
+  </div>
+  <div class="wbar">
+    <input type="date" id="mtDate" title="The day the poster went up (PHT)">
+    <select id="mtExchange" title="Where to measure. Binance lists the most of these names."><option value="binance">Binance</option><option value="bybit">Bybit</option><option value="okx">OKX</option></select>
+    <input type="text" id="mtTickers" placeholder="ICPUSDT.P, MONUSDT.P, ZKUSDT.P ...">
+    <button class="rbtn" onclick="saveMentor()">Log post</button>
+    <span class="wprog" id="mtProg"></span>
+  </div>
+  <div class="dash-sec-ttl">By liquidity tier &mdash; completed windows only</div>
+  <div id="mt-note" class="audit" style="margin:0 0 10px"></div>
+  <div class="tw" style="overflow:visible">
+    <table id="mtSum" style="display:none">
+      <thead><tr>
+        <th>Tier</th><th>Picks</th>
+        <th title="Median of the absolute close-to-open move after __MENTOR_HOLD__ days. Direction ignored.">|Move| at close</th>
+        <th title="Median of the highest high vs the entry open, inside the window.">Best up</th>
+        <th title="Median of the lowest low vs the entry open, inside the window.">Worst down</th>
+        <th title="Median of (best up - worst down): how much room there was to trade.">Range</th>
+        <th title="Median of the window's high-low range divided by the coin's ATR20 before the pick. Above 1 means the pick moved more than that coin normally does, which is the part that says the timing had something to it. Below 1 means it was a quieter-than-usual stretch.">Range vs ATR20</th>
+      </tr></thead>
+      <tbody id="mtSumB"></tbody>
+    </table>
+    <div class="no-sig" id="mtEmpty">Nothing logged yet &mdash; paste today's poster above.</div>
+  </div>
+  <div id="mtPosts"></div>
 </div>
 
 <div id="pg-calendar" class="page">
@@ -3152,6 +3501,7 @@ function showPg(name){
   if(name === 'watch') loadWatch();
   if(name === 'movers') loadMovers();
   if(name === 'calendar') loadCalendar();
+  if(name === 'mentor') loadMentor();
 }
 document.querySelectorAll('.nav-btn').forEach(function(b){
   b.addEventListener('click', function(){ showPg(b.dataset.pg); });
@@ -3288,7 +3638,7 @@ var WQ = {
 };
 var WFLAG = {'SPOT-LED':'wf-spot','CROWDED LONGS':'wf-crowd','SQUEEZE FUEL':'wf-squeeze','HIGH OI/VOL':'wf-hioi'};
 
-var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__,
+var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__, thinM:__MOVER_THIN_M__,
           oiVol:__OI_VOL__, fundSpot:__FUND_SPOT__, fundCrowd:__FUND_CROWD__, fundSqueeze:__FUND_SQUEEZE__};
 var TIP = {
   'NEW LONGS':       'Price up + OI up: new money opening longs. A real trend if funding is not rich.',
@@ -3469,18 +3819,49 @@ function moversAudit(m){
   if(m.no_data)         bits.push(m.no_data + ' had too little daily history');
   if(m.errors)          bits.push(m.errors + ' errored');
   if(m.tradfi_excluded) bits.push(m.tradfi_excluded + ' stock/ETF/commodity perp(s) excluded by design');
+  if(m.thin) bits.push((m.thin_analysed || 0) + ' thin pair(s) measured, ' + (m.thin_quiet || 0) +
+                       ' without volume spike + range expansion together');
   var txt = bits.join(' · ');
   if(m.complete === false){
     return '<div class="audit warn">&#9888; This movers scan did not finish &mdash; re-run before trusting it.<br>' + txt + '</div>';
   }
   return txt;
 }
+function mvRow(r, i, thin){
+  var flags = (r.flags || []).map(function(f){
+    return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
+  }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
+  var up  = r.chg_1d_pct >= 0;
+  var big = Math.abs(r.chg_1d_pct || 0) >= TH.chg;
+  var badge = thin ? '<div><span class="thin-badge" title="Below the volume floor. Thin book: expect worse fills and slippage through stops. Size down.">THIN &middot; ' +
+                     fmtVol(r.daily_volume) + '/day</span></div>' : '';
+  var tr = document.createElement('tr');
+  tr.className = up ? 'rb' : 'rr';
+  tr.innerHTML =
+    '<td><span class="mrank' + (!thin && i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
+    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div>' + badge + '</td>' +
+    '<td>' + qcell(r.score) + '</td>' +
+    '<td><span style="font-family:var(--mono);font-weight:600;color:' + (big ? 'var(--fresh)' : up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
+      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">today ' + fmtPct(r.chg_live_pct) + '</div></td>' +
+    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= TH.vol ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
+    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= TH.rng ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
+    '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
+      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:3px">' + r.pos_in_range + '% of range</div></td>' +
+    '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + ' &nbsp;<small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
+      '<div class="mlv"><small>7D</small> ' + fmtPx(r.r_lo) + ' &ndash; ' + fmtPx(r.r_hi) + '</div></td>' +
+    '<td>' + flags + '</td>';
+  return tr;
+}
+/* Thin rows never share a ranking with the main list: a $3M/day coin with a
+   whale print would otherwise top it on score alone. Top 4 is main-list only. */
 function renderMovers(){
   var rows = _mrows.slice().sort(function(a, b){ return b.score - a.score; })
                    .filter(function(r){ return mMatches(r, _mf); });
-  if(_mf === 'top') rows = rows.slice(0, 4);
+  var core = rows.filter(function(r){ return r.tier !== 'thin'; });
+  var thin = _mf === 'top' ? [] : rows.filter(function(r){ return r.tier === 'thin'; });
+  if(_mf === 'top') core = core.slice(0, 4);
   var tb = document.getElementById('mvB'); tb.innerHTML = '';
-  if(rows.length === 0){
+  if(core.length + thin.length === 0){
     document.getElementById('mvT').style.display = 'none';
     var e = document.getElementById('mvEmpty');
     e.style.display = '';
@@ -3489,29 +3870,18 @@ function renderMovers(){
   }
   document.getElementById('mvEmpty').style.display = 'none';
   document.getElementById('mvT').style.display = 'table';
-  rows.forEach(function(r, i){
-    var flags = (r.flags || []).map(function(f){
-      return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
-    }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
-    var up  = r.chg_1d_pct >= 0;
-    var big = Math.abs(r.chg_1d_pct || 0) >= TH.chg;
-    var tr = document.createElement('tr');
-    tr.className = up ? 'rb' : 'rr';
-    tr.innerHTML =
-      '<td><span class="mrank' + (i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
-      '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div></td>' +
-      '<td>' + qcell(r.score) + '</td>' +
-      '<td><span style="font-family:var(--mono);font-weight:600;color:' + (big ? 'var(--fresh)' : up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
-        '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">today ' + fmtPct(r.chg_live_pct) + '</div></td>' +
-      '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= TH.vol ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
-      '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= TH.rng ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
-      '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
-        '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:3px">' + r.pos_in_range + '% of range</div></td>' +
-      '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + ' &nbsp;<small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
-        '<div class="mlv"><small>7D</small> ' + fmtPx(r.r_lo) + ' &ndash; ' + fmtPx(r.r_hi) + '</div></td>' +
-      '<td>' + flags + '</td>';
-    tb.appendChild(tr);
-  });
+  core.forEach(function(r, i){ tb.appendChild(mvRow(r, i, false)); });
+  if(thin.length){
+    var sep = document.createElement('tr');
+    sep.className = 'mv-sep';
+    sep.innerHTML = '<td colspan="9">&#9888; LOW LIQUIDITY &mdash; $' + TH.thinM + 'M/week up to the floor &middot; ' +
+      'listed only on volume spike AND range expansion together &middot; thin book, wider fills, size down</td>';
+    tb.appendChild(sep);
+    thin.forEach(function(r, i){ tb.appendChild(mvRow(r, i, true)); });
+  }
+}
+function mvThinPref(){
+  try { localStorage.setItem('mvThin', document.getElementById('mvThin').checked ? '1' : '0'); } catch(x){}
 }
 function loadMovers(){
   fetch('/mover_signals').then(function(r){ return r.json(); }).then(function(d){
@@ -3525,6 +3895,9 @@ function loadMovers(){
         '-day baseline · scanned ' + ma + ' min ago';
       if(m.exchange) document.getElementById('mvExchange').value = m.exchange;
     }
+    var pref = null;
+    try { pref = localStorage.getItem('mvThin'); } catch(x){}
+    document.getElementById('mvThin').checked = pref !== null ? pref === '1' : !!m.thin;
     document.getElementById('mv-audit').innerHTML = moversAudit(m);
     renderMovers();
   }).catch(function(){});
@@ -3543,8 +3916,9 @@ function startMovers(){
   var mtot = 0, prog = document.getElementById('mvProg');
   prog.textContent = 'Loading markets...';
 
+  var thin = document.getElementById('mvThin').checked ? '1' : '0';
   mes = new EventSource('/movers?exchange=' + ex + '&min_weekly_vol=' + vol +
-                        '&speed=' + spd + '&max_pairs=' + mp);
+                        '&speed=' + spd + '&max_pairs=' + mp + '&thin=' + thin);
   mes.addEventListener('log', function(e){ prog.textContent = JSON.parse(e.data).msg; });
   mes.addEventListener('total', function(e){ mtot = JSON.parse(e.data).total; });
   mes.addEventListener('progress', function(e){
@@ -3888,6 +4262,108 @@ function renderWelcome(){
   } catch(e){}
 }
 
+/* ── Mentor log ───────────────────────────────────────────────────────────── */
+var MT_TIER = {liquid:'Liquid', thin:'Thin', micro:'Micro', btc:'BTC (market)'};
+var MT_TIER_TIP = {
+  liquid: 'Traded at least $__DEFAULT_VOL_M__M in the 7 days before the pick: clears the scanner floor.',
+  thin:   '$__MOVER_THIN_M__M to $__DEFAULT_VOL_M__M in the 7 days before the pick: the Movers thin band.',
+  micro:  'Under $__MOVER_THIN_M__M in the 7 days before the pick: below anything the scanner looks at.',
+  btc:    'BTC over the same windows: what the whole market did meanwhile.'};
+function mtTier(t){
+  return t ? '<span class="mt-tier ' + t + '" title="' + (MT_TIER_TIP[t] || '') + '">' + (MT_TIER[t] || t) + '</span>' : '&mdash;';
+}
+function mtPct(v){
+  if(v === null || v === undefined) return '&mdash;';
+  return '<span style="font-family:var(--mono);color:' + (v >= 0 ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(v) + '</span>';
+}
+function mtNum(v, suf){
+  return (v === null || v === undefined) ? '&mdash;' : '<span style="font-family:var(--mono)">' + v + (suf || '') + '</span>';
+}
+function mtToday(){ return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); }   /* PHT */
+function renderMentor(d){
+  var sum = d.summary || {}, order = ['liquid', 'thin', 'micro', 'btc'];
+  var tb = document.getElementById('mtSumB'); tb.innerHTML = '';
+  var n = 0;
+  order.forEach(function(t){
+    var g = sum[t]; if(!g) return;
+    if(t !== 'btc') n += g.n;
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + mtTier(t) + '</td><td>' + mtNum(g.n) + '</td><td>' + mtNum(g.abs_chg_48h, '%') + '</td>' +
+      '<td>' + mtPct(g.max_up) + '</td><td>' + mtPct(g.max_dn) + '</td><td>' + mtNum(g.range_pct, '%') + '</td>' +
+      '<td>' + mtNum(g.range_atr, 'x') + '</td>';
+    tb.appendChild(tr);
+  });
+  var posts = d.posts || [];
+  document.getElementById('mtSum').style.display = tb.children.length ? 'table' : 'none';
+  var empty = document.getElementById('mtEmpty');
+  empty.style.display = tb.children.length ? 'none' : '';
+  empty.textContent = posts.length ? 'No completed windows yet - each pick needs ' + d.hold_d + ' full daily bars.'
+                                   : 'Nothing logged yet - paste today\'s poster above.';
+  var note = [];
+  if(n && n < 60) note.push(n + ' completed pick(s). Read nothing into the tiers until there are a few weeks of posts: one market-wide dump moves every row at once.');
+  if((d.errors || []).length) note.push('Could not refresh: ' + d.errors.map(calEsc).join(' · '));
+  document.getElementById('mt-note').innerHTML = note.join('<br>');
+
+  var box = document.getElementById('mtPosts'); box.innerHTML = '';
+  posts.forEach(function(p){
+    var res = p.results || {};
+    var rows = p.tickers.concat(['BTC']).map(function(b){
+      var r = res[b] || {status: 'pending'};
+      var st = {final:'done', partial:'1 of ' + d.hold_d + ' days', pending:'waiting for the first bar',
+                not_listed:'not listed on ' + (p.exchange || '').toUpperCase(), no_data:'no data'}[r.status] || r.status;
+      return '<tr' + (b === 'BTC' ? ' style="opacity:.7"' : '') + '><td><span class="pb-pair">' + calEsc(b) + '</span></td>' +
+        '<td>' + mtTier(b === 'BTC' ? 'btc' : r.tier) + '</td>' +
+        '<td>' + (r.wk_vol != null ? fmtVol(r.wk_vol) : '&mdash;') + '</td>' +
+        '<td>' + mtPct(r.chg_24h) + '</td><td>' + mtPct(r.chg_48h) + '</td>' +
+        '<td>' + mtPct(r.max_up) + '</td><td>' + mtPct(r.max_dn) + '</td>' +
+        '<td>' + mtNum(r.range_atr, 'x') + '</td>' +
+        '<td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">' + st + '</td></tr>';
+    }).join('');
+    var div = document.createElement('div');
+    div.className = 'mt-post';
+    div.innerHTML = '<div class="mt-post-hdr"><div class="dash-sec-ttl" style="margin:0">' + calEsc(p.date) + ' &middot; ' +
+        calEsc((p.exchange || '').toUpperCase()) + ' &middot; ' + p.tickers.length + ' picks</div>' +
+        '<button class="mt-del" data-date="' + calEsc(p.date) + '" onclick="deleteMentor(this.dataset.date)">Delete</button></div>' +
+      '<table><thead><tr><th>Coin</th><th>Tier</th><th title="Traded value in the 7 days before the pick">7d vol before</th>' +
+      '<th title="Close of the poster day vs its open">Day 1</th><th title="Close of day 2 vs the poster-day open">Day 2</th>' +
+      '<th>Best up</th><th>Worst down</th><th>Range vs ATR20</th><th>Window</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    box.appendChild(div);
+  });
+}
+function loadMentor(done_msg){
+  var prog = document.getElementById('mtProg');
+  if(!document.getElementById('mtDate').value) document.getElementById('mtDate').value = mtToday();
+  prog.textContent = 'Updating open windows...';
+  fetch('/mentor').then(function(r){ return r.json(); }).then(function(d){
+    prog.textContent = done_msg || '';
+    renderMentor(d);
+  }).catch(function(){ prog.textContent = 'Failed to load the mentor log.'; });
+}
+function saveMentor(){
+  var prog = document.getElementById('mtProg');
+  var body = {date: document.getElementById('mtDate').value,
+              exchange: document.getElementById('mtExchange').value,
+              tickers: document.getElementById('mtTickers').value};
+  if(!body.tickers.trim()){ prog.textContent = 'Paste the tickers first.'; return; }
+  prog.textContent = 'Saving...';
+  fetch('/mentor', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+    .then(function(r){ return r.json(); }).then(function(d){
+      if(d.error){
+        prog.textContent = d.error + (d.unmatched && d.unmatched.length ? ' (' + d.unmatched.join(', ') + ')' : '');
+        return;
+      }
+      document.getElementById('mtTickers').value = '';
+      var msg = 'Logged ' + d.tickers.length + ': ' + d.tickers.join(', ');
+      if(d.unmatched.length) msg += ' · not found: ' + d.unmatched.join(', ');
+      loadMentor(msg);
+    }).catch(function(){ prog.textContent = 'Save failed.'; });
+}
+function deleteMentor(date){
+  if(!confirm('Delete the logged post for ' + date + '?')) return;
+  fetch('/mentor', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({date: date, delete: true})}).then(function(){ loadMentor(); });
+}
+
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 var _cal = {events: [], meta: {}, ts: null}, _cf = 'movers', _calSel = null;
 var CAL_DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -4101,5 +4577,6 @@ if __name__ == "__main__":
     load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
     load_state()      # restore the last scan so the dashboard isn't amnesiac
     load_movers()     # ...and the last movers scan
+    load_mentor()     # ...and the logged mentor watchlists
     load_calendar()   # ...and the news calendar
     app.run(debug=False, threaded=True, port=5099)

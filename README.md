@@ -35,7 +35,19 @@ the API and a browser dashboard.
   price-change scan that classifies pairs into quadrants (e.g. spot-led,
   crowded-long, short squeeze fuel) using funding rate as a leverage signal.
 - **Daily movers** (`/movers`): a cheap, ~1-call-per-pair scan for pairs
-  moving significantly off their recent volume/range baseline.
+  moving significantly off their recent volume/range baseline. An opt-in
+  **thin band** (`thin=1`, the *Include thin coins* toggle) also measures
+  pairs from $20M/week up to the floor. They are listed in their own
+  section with a daily dollar volume badge, and only when volume spike *and*
+  range expansion fire together: on a thin coin one big order is a volume
+  spike by itself, and the slippage and stop-hunting costs that justify the
+  floor still apply.
+- **Mentor log** (`/mentor`): paste a posted daily watchlist (TradingView
+  notation like `ICPUSDT.P` is fine) and each pick is followed for the next
+  2 completed daily bars. Results are grouped by how liquid the coin was in
+  the week before the pick (liquid / thin / micro), next to BTC over the same
+  window, so whether low-volume picks move enough to pay for their cost is
+  measured instead of assumed. Saved in `mentor_picks.json` (gitignored).
 - **News calendar** (`/calendar`): the scheduled macro prints that actually
   move crypto perps — US CPI/PCE/PPI, the jobs report, FOMC and Powell, GDP,
   retail sales, ISM, plus the BoJ/ECB/BoE rate decisions — on a two-week grid
@@ -97,6 +109,7 @@ without re-scanning.
 | `/watch_signals` | GET | Last cached `/watchlist` result |
 | `/movers` | GET (SSE) | Run a daily-movers scan |
 | `/mover_signals` | GET | Last cached `/movers` result |
+| `/mentor` | GET / POST | Logged watchlists with forward results; POST `{date, tickers, exchange}` logs one, `{date, delete: true}` removes it |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
 | `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 
@@ -109,6 +122,7 @@ Common query params (all optional, sane defaults apply):
 - `min_weekly_vol` — liquidity floor in USD (default `70000000`)
 - `max_pairs` — cap on pairs scanned (default `400`)
 - `symbols` — comma-separated symbol allowlist (`/scan` only)
+- `thin` — `1` adds the low-liquidity band to `/movers`
 
 ## News calendar
 

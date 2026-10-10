@@ -1030,213 +1030,6 @@ def load_movers():
         print(f"[movers] load failed: {e}")
 
 
-# ── Mentor log ─────────────────────────────────────────────────────────────────
-# The posted daily watchlist (a poster of USDT perps in TradingView notation,
-# e.g. ICPUSDT.P), tracked forward. Most of its names trade under the volume
-# floor, and the question this answers is whether those thin picks move enough
-# to pay for the extra cost of trading them — measured, not taken on faith.
-#
-# The poster carries no direction, so nothing here scores a pick as a win or
-# loss. It records how far price travelled each way over the next
-# MENTOR_HOLD_D completed daily bars, and how that compares with the coin's own
-# ATR20 (did it move MORE than usual, i.e. was the pick timed, or is it just a
-# volatile coin). Entry is the open of the poster day's daily bar — 00:00 UTC,
-# about two hours before the post goes up — so the first bar includes those
-# two hours.
-MENTOR_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "mentor_picks.json")
-MENTOR_HOLD_D = 2
-MENTOR_DEFAULT_EXCHANGE = "binance"   # lists the most of these names
-_mentor_state = {"posts": []}
-
-
-def parse_ticker(raw, bases):
-    """'ICPUSDT.P' → 'ICP', matched against the venue's perp bases. None if
-    nothing matches. Handles the poster cutting a long name short
-    ('VELODROMEU' → VELODROME) by trying shorter cuts of the USDT suffix, but
-    only after the raw text itself, so a base that happens to end in U wins.
-    """
-    t = re.sub(r"\.P$", "", str(raw).strip().upper()).split("/")[0]   # MON/USDT:USDT
-    t = re.sub(r"[^A-Z0-9]", "", t)
-    if not t:
-        return None
-    cands = []
-    if t.endswith("USDT"):
-        cands.append(t[:-4])
-    cands.append(t)
-    for suf in ("USD", "US", "U"):
-        if t.endswith(suf):
-            cands.append(t[:-len(suf)])
-    for c in cands:
-        if c and c in bases:
-            return c
-    return None
-
-
-def liquidity_tier(wk_vol):
-    if wk_vol is None:
-        return None
-    if wk_vol >= DEFAULT_MIN_WEEKLY_VOL:
-        return "liquid"
-    if wk_vol >= MOVER_THIN_MIN_WEEKLY_VOL:
-        return "thin"
-    return "micro"
-
-
-def mentor_outcome(df, post_date, contract_size=1.0):
-    """Forward outcome of one pick from COMPLETED daily bars.
-
-    Liquidity is measured on the 7 bars BEFORE the post, so a pick that pumped
-    on the day is still tiered by what it was when it was picked. Notional is
-    volume × contract size × close, which holds for linear USDT perps whether
-    the venue reports volume in coins (contract size 1) or contracts.
-    """
-    if df is None or df.empty:
-        return {"status": "no_data"}
-    days = df.index.date
-    before = df[days < post_date]
-    fwd = df[days >= post_date].iloc[:MENTOR_HOLD_D]
-    out = {"status": "pending"}
-
-    if len(before) >= 7:
-        last7 = before.iloc[-7:]
-        wk = float((last7["volume"] * contract_size * last7["close"]).sum())
-        out["wk_vol"] = round(wk, 2)
-        out["tier"] = liquidity_tier(wk)
-    atr = None
-    if len(before) >= 21:
-        h, l, c = (before[k].values.astype(float) for k in ("high", "low", "close"))
-        tr = np.maximum(h[1:] - l[1:],
-                        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-        atr = float(tr[-20:].mean())
-
-    if fwd.empty:
-        return out
-    entry = float(fwd["open"].iloc[0])
-    if entry <= 0:
-        return {"status": "no_data"}
-    hi, lo = float(fwd["high"].max()), float(fwd["low"].min())
-    closes = fwd["close"].values.astype(float)
-    out.update({
-        "entry":     px(entry),
-        "bars":      int(len(fwd)),
-        "chg_24h":   round((closes[0] / entry - 1) * 100, 2),
-        "chg_48h":   round((closes[1] / entry - 1) * 100, 2) if len(closes) > 1 else None,
-        "max_up":    round((hi / entry - 1) * 100, 2),
-        "max_dn":    round((lo / entry - 1) * 100, 2),
-        "range_atr": round((hi - lo) / atr, 2) if atr else None,
-        "status":    "final" if len(fwd) >= MENTOR_HOLD_D else "partial",
-    })
-    return out
-
-
-def mentor_summary(posts):
-    """Per liquidity tier, medians over FINAL picks only — a half-open window
-    mixed in would understate every move. BTC is the market reference, kept
-    out of the tiers."""
-    groups = {}
-    for p in posts:
-        for base, r in (p.get("results") or {}).items():
-            if r.get("status") != "final" or not r.get("tier"):
-                continue
-            key = "btc" if base == "BTC" else r["tier"]
-            groups.setdefault(key, []).append(r)
-
-    def med(vals):
-        vals = [v for v in vals if v is not None]
-        return round(statistics.median(vals), 2) if vals else None
-
-    out = {}
-    for tier, rs in groups.items():
-        out[tier] = {
-            "n":           len(rs),
-            "abs_chg_48h": med([abs(r["chg_48h"]) for r in rs if r.get("chg_48h") is not None]),
-            "max_up":      med([r.get("max_up") for r in rs]),
-            "max_dn":      med([r.get("max_dn") for r in rs]),
-            "range_pct":   med([r["max_up"] - r["max_dn"] for r in rs
-                                if r.get("max_up") is not None and r.get("max_dn") is not None]),
-            "range_atr":   med([r.get("range_atr") for r in rs]),
-        }
-    return out
-
-
-def save_mentor():
-    try:
-        with _lock:
-            data = json.loads(json.dumps(_mentor_state))
-        with open(MENTOR_FILE, "w") as f:
-            json.dump(data, f, indent=1)
-    except Exception as e:
-        print(f"[mentor] save failed: {e}")
-
-
-def load_mentor():
-    try:
-        with open(MENTOR_FILE) as f:
-            data = json.load(f)
-        with _lock:
-            _mentor_state["posts"] = data.get("posts", [])
-        print(f"[mentor] restored {len(_mentor_state['posts'])} logged post(s)")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[mentor] load failed: {e}")
-
-
-def refresh_mentor_results():
-    """Fill in every pick whose window is not final yet. Final results are
-    frozen and never re-fetched, so the cost is only the open windows."""
-    with _lock:
-        posts = json.loads(json.dumps(_mentor_state["posts"]))
-
-    def open_post(p):
-        res = p.get("results") or {}
-        return any(res.get(b, {}).get("status") not in ("final", "not_listed")
-                   for b in p["tickers"] + ["BTC"])
-
-    todo = [p for p in posts if open_post(p)]
-    errors, by_ex = [], {}
-    for p in todo:
-        by_ex.setdefault(p.get("exchange") or MENTOR_DEFAULT_EXCHANGE, []).append(p)
-    for exid, plist in by_ex.items():
-        try:
-            ex = make_exchange(exid)
-            mkts = ex.load_markets()
-        except Exception as e:
-            errors.append(f"{exid}: {e}")
-            continue
-        limiter = RateLimiter(SPEED["normal"]["rps"].get(exid, 8))
-        for p in plist:
-            d = datetime.date.fromisoformat(p["date"])
-            day0 = datetime.datetime(d.year, d.month, d.day, tzinfo=datetime.timezone.utc)
-            since = int(day0.timestamp() * 1000) - 30 * 86400000
-            res = p.setdefault("results", {})
-            for base in p["tickers"] + ["BTC"]:   # BTC: what the market did meanwhile
-                if res.get(base, {}).get("status") in ("final", "not_listed"):
-                    continue
-                sym = f"{base}/USDT:USDT"
-                if sym not in mkts:
-                    res[base] = {"status": "not_listed"}
-                    continue
-                raw = fetch_ohlcv(ex, limiter, sym, "1d", limit=45, since=since)
-                if not raw:
-                    errors.append(f"{base} {p['date']}: fetch failed")
-                    continue
-                df = drop_forming_candle(_to_df(raw), 1440)
-                res[base] = mentor_outcome(df, d, float(mkts[sym].get("contractSize") or 1.0))
-
-    # Write back only into posts that were not edited while we were fetching.
-    fresh = {p["date"]: p for p in todo}
-    with _lock:
-        for p in _mentor_state["posts"]:
-            f = fresh.get(p["date"])
-            if f and f["tickers"] == p["tickers"] and f.get("exchange") == p.get("exchange"):
-                p["results"] = f.get("results", {})
-    if todo:
-        save_mentor()
-    return errors
-
-
 # ── News calendar ──────────────────────────────────────────────────────────────
 def load_dotenv(path=None):
     """Minimal KEY=VALUE loader so the API key can live in a gitignored .env
@@ -1818,7 +1611,6 @@ def index():
         "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
         "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
         "__MOVER_THIN_M__": str(int(MOVER_THIN_MIN_WEEKLY_VOL / 1e6)),
-        "__MENTOR_HOLD__": str(MENTOR_HOLD_D),
         "__OI_LB__":       str(OI_LOOKBACK_D),
         "__OI_MIN__":      format(OI_MIN_CHANGE_PCT, "g"),
         "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
@@ -2346,67 +2138,6 @@ def calendar_route():
                         "now": _iso_z(datetime.datetime.now(datetime.timezone.utc))})
 
 
-@app.route("/mentor", methods=["GET", "POST"])
-def mentor_route():
-    """GET: every logged post with its forward results (open windows are
-    fetched, final ones are frozen) plus the per-tier summary.
-    POST {date, tickers, exchange?}: log or replace the post for that date.
-    POST {date, delete: true}: remove it."""
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        try:
-            d = datetime.date.fromisoformat(str(body.get("date", "")).strip())
-        except ValueError:
-            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
-        if body.get("delete"):
-            with _lock:
-                _mentor_state["posts"] = [p for p in _mentor_state["posts"]
-                                          if p["date"] != d.isoformat()]
-            save_mentor()
-            return jsonify({"ok": True})
-
-        exid = body.get("exchange") or MENTOR_DEFAULT_EXCHANGE
-        raw = body.get("tickers") or ""
-        items = raw if isinstance(raw, list) else re.split(r"[\s,;]+", str(raw))
-        items = [t for t in items if str(t).strip()]
-        if not items:
-            return jsonify({"error": "no tickers given"}), 400
-        try:
-            mkts = make_exchange(exid).load_markets()
-        except Exception as e:
-            return jsonify({"error": f"load_markets failed: {e}"}), 502
-        bases = {s.split("/")[0] for s in mkts
-                 if s.endswith("/USDT:USDT") and mkts[s].get("active")}
-        tickers, unmatched = [], []
-        for t in items:
-            b = parse_ticker(t, bases)
-            if b and b not in tickers:
-                tickers.append(b)
-            elif not b:
-                unmatched.append(str(t))
-        if not tickers:
-            return jsonify({"error": f"none of those are USDT perps on {exid.upper()}",
-                            "unmatched": unmatched}), 400
-        post = {"date": d.isoformat(), "exchange": exid, "tickers": tickers,
-                "raw": [str(t) for t in items], "results": {},
-                "added": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-        with _lock:
-            _mentor_state["posts"] = [p for p in _mentor_state["posts"]
-                                      if p["date"] != post["date"]] + [post]
-        save_mentor()
-        return jsonify({"ok": True, "tickers": tickers, "unmatched": unmatched})
-
-    errors = refresh_mentor_results()
-    with _lock:
-        posts = sorted(json.loads(json.dumps(_mentor_state["posts"])),
-                       key=lambda p: p["date"], reverse=True)
-    return jsonify({
-        "posts": posts, "summary": mentor_summary(posts), "errors": errors,
-        "hold_d": MENTOR_HOLD_D,
-        "tiers": {"liquid": DEFAULT_MIN_WEEKLY_VOL, "thin": MOVER_THIN_MIN_WEEKLY_VOL},
-    })
-
-
 @app.route("/movers")
 def movers_route():
     """Daily movers scan — one SSE stream, ~1 API call per pair.
@@ -2629,15 +2360,15 @@ HTML = r"""<!DOCTYPE html>
   --ease:cubic-bezier(.22,.68,0,1.2);--eout:cubic-bezier(0,.55,.45,1);
 }
 html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:14px;line-height:1.5}
-.shell{display:grid;grid-template-rows:48px 1fr;height:100vh;overflow:hidden}
+.shell{display:grid;grid-template-rows:48px 1fr;grid-template-columns:minmax(0,1fr);height:100vh;overflow:hidden}
 .topbar{display:flex;align-items:center;background:var(--sf);border-bottom:1px solid var(--bd);z-index:20}
 .t-logo{font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.12em;color:var(--acc);padding:0 18px;flex-shrink:0}
 .t-div{width:1px;height:16px;background:var(--bd2)}
-.nav{display:flex;height:48px;padding:0 8px}
-.nav-btn{height:100%;padding:0 18px;font-size:12px;font-weight:500;color:var(--tx3);cursor:pointer;border:none;border-bottom:2px solid transparent;background:none;transition:color .15s,border-color .15s;letter-spacing:.04em}
+.nav{display:flex;height:48px;padding:0 8px;min-width:0;overflow-x:auto;scrollbar-width:none}
+.nav-btn{height:100%;padding:0 18px;font-size:12px;font-weight:500;color:var(--tx3);cursor:pointer;border:none;border-bottom:2px solid transparent;background:none;transition:color .15s,border-color .15s;letter-spacing:.04em;flex-shrink:0;white-space:nowrap}
 .nav-btn:hover{color:var(--tx2)}
 .nav-btn.active{color:var(--tx);border-bottom-color:var(--acc)}
-.t-right{margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:18px}
+.t-right{margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:18px;flex-shrink:0}
 .sdot{width:6px;height:6px;border-radius:50%;background:var(--tx3);transition:background .4s,box-shadow .4s}
 .sdot.live{background:var(--bull);box-shadow:0 0 8px var(--acc);animation:blink 2s ease-in-out infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
@@ -2778,7 +2509,7 @@ tbody tr{animation:ri .3s var(--eout) both}
 .dash-sec-ttl{font-size:10px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3);margin-bottom:12px}
 .ready-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .sig-card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
-.sc-timing{padding:8px 14px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.04em}
+.sc-timing{padding:8px 14px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.04em;flex-shrink:0;white-space:nowrap}
 .sc-body{padding:14px}
 .sc-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
 .sc-pair{font-family:var(--mono);font-size:16px;font-weight:600;color:var(--tx)}
@@ -2816,6 +2547,66 @@ tbody tr{animation:ri .3s var(--eout) both}
 .lp-cap-bull{fill:var(--bull)}
 .lp-cap-bear{fill:var(--bear)}
 .rules{max-width:760px}
+
+/* ── Routine flow ── */
+.rt-hdr{display:flex;align-items:flex-start;gap:16px;margin-bottom:22px}
+.rt-hdr .sig-sub{max-width:640px;line-height:1.6;margin-top:4px}
+.rt-play{margin-left:auto;flex-shrink:0;display:flex;align-items:center;gap:6px;background:var(--sf2);border:1px solid var(--bd2);color:var(--tx);font-family:var(--mono);font-size:11px;padding:8px 16px;border-radius:6px;cursor:pointer;transition:border-color .2s,background .2s}
+.rt-play:hover{border-color:var(--acc)}
+.rt-play.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.rt-flow{display:flex;align-items:stretch}
+.rt-node{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:6px;text-align:left;background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:14px 14px 12px;cursor:pointer;color:var(--tx2);font-family:var(--sans);
+  opacity:0;transform:translateY(8px);animation:rtIn .45s ease forwards;animation-delay:var(--d);transition:border-color .3s,background .3s,box-shadow .3s}
+.rt-node:hover{border-color:var(--bd2)}
+.rt-dot{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:600;background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2);transition:all .3s}
+.rt-name{font-size:13px;font-weight:600;color:var(--tx)}
+.rt-q{font-size:11px;line-height:1.45;color:var(--tx3)}
+.rt-meta{margin-top:auto;padding-top:4px;display:flex;flex-direction:column;gap:2px;font-family:var(--mono);font-size:9px;color:var(--tx3)}
+.rt-cnt{color:var(--tx2)}
+.rt-node.done .rt-dot{background:var(--bull-bg);color:var(--bull);border-color:#1a4020}
+.rt-node.on{border-color:var(--acc);background:var(--sf2);box-shadow:0 0 0 3px rgba(240,96,138,.12)}
+.rt-node.on .rt-dot{background:var(--acc);color:#fff;border-color:var(--acc);animation:rtBeat 1.8s ease-in-out infinite}
+.rt-node.on .rt-q{color:var(--tx2)}
+.rt-link{flex:0 0 26px;align-self:center;position:relative;height:2px;background:var(--bd2);border-radius:2px}
+.rt-fill{position:absolute;inset:0;width:0;background:var(--bull);border-radius:2px;transition:width .5s ease}
+.rt-link.done .rt-fill{width:100%}
+.rt-pulse{position:absolute;top:50%;left:0;width:6px;height:6px;margin-top:-3px;border-radius:50%;background:var(--acc);box-shadow:0 0 8px var(--acc);opacity:0}
+.rt-link.into .rt-pulse{animation:rtFlowDot 1.4s linear infinite}
+.rt-bar{height:2px;background:var(--bd);border-radius:2px;margin:14px 0 18px;overflow:hidden}
+.rt-bar i{display:block;height:100%;width:0;background:var(--acc)}
+.rt-bar i.run{animation:rtTimer linear forwards}
+.rt-panel{display:none;background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:18px 20px;max-width:820px}
+.rt-panel.on{display:block;animation:rtPanel .35s ease}
+.rt-ph{display:flex;align-items:flex-start;gap:12px;margin-bottom:12px}
+.rt-step{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+.rt-pt{font-size:15px;font-weight:600;color:var(--tx);margin-top:3px}
+.rt-open{margin-left:auto;flex-shrink:0;background:none;border:1px solid var(--bd2);color:var(--tx2);font-family:var(--mono);font-size:10px;padding:6px 12px;border-radius:5px;cursor:pointer}
+.rt-open:hover{color:var(--tx);border-color:var(--acc)}
+.rt-leave{display:flex;gap:10px;align-items:baseline;font-size:12px;color:var(--tx);background:var(--bull-bg);border:1px solid #1a4020;border-radius:6px;padding:8px 12px;margin-bottom:6px}
+.rt-leave span{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--bull);flex-shrink:0}
+.rt-nav{display:flex;justify-content:space-between;margin-top:14px}
+.rt-nav button{background:none;border:none;color:var(--tx3);font-family:var(--mono);font-size:11px;cursor:pointer;padding:4px 0}
+.rt-nav button:hover{color:var(--tx)}
+.rt-nav button:disabled{visibility:hidden}
+@keyframes rtIn{to{opacity:1;transform:none}}
+@keyframes rtBeat{0%,100%{box-shadow:0 0 0 0 rgba(240,96,138,.45)}50%{box-shadow:0 0 0 6px rgba(240,96,138,0)}}
+@keyframes rtFlowDot{0%{left:0;opacity:0}15%{opacity:1}85%{opacity:1}100%{left:calc(100% - 6px);opacity:0}}
+@keyframes rtTimer{from{width:0}to{width:100%}}
+@keyframes rtPanel{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@media (max-width:860px){
+  .rt-flow{flex-direction:column}
+  .rt-link{flex:0 0 18px;width:2px;height:auto;margin-left:26px;align-self:flex-start}
+  .rt-link.done .rt-fill{width:100%;height:100%}
+  .rt-fill{width:100%;height:0;transition:height .5s ease}
+  .rt-link.into .rt-pulse{animation-name:rtFlowDotV}
+  .rt-hdr{flex-wrap:wrap}
+}
+@keyframes rtFlowDotV{0%{top:0;left:-2px;opacity:0}15%{opacity:1}85%{opacity:1}100%{top:100%;left:-2px;opacity:0}}
+@media (prefers-reduced-motion:reduce){
+  .rt-node{animation:none;opacity:1;transform:none}
+  .rt-node.on .rt-dot,.rt-link.into .rt-pulse,.rt-panel.on{animation:none}
+  .rt-fill{transition:none}
+}
 .rule{display:flex;gap:12px;padding:11px 0;border-bottom:1px solid var(--bd)}
 .rule:last-child{border-bottom:none}
 .rule-n{font-family:var(--mono);font-size:10px;color:var(--acc);flex-shrink:0;width:22px;padding-top:2px}
@@ -2844,18 +2635,6 @@ tbody tr{animation:ri .3s var(--eout) both}
 .mv-thin input{accent-color:var(--fresh)}
 .mv-sep td{background:var(--fresh-bg);color:var(--fresh);font-family:var(--mono);font-size:10px;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid #4a3500}
 .thin-badge{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500;white-space:nowrap}
-
-/* ── Mentor log ── */
-#pg-mentor.active{display:block;overflow-y:auto;padding:24px}
-#pg-mentor{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
-#pg-mentor input[type=date]{width:150px;background:var(--sf2);border:1px solid var(--bd2);color:var(--tx);font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:5px;color-scheme:dark}
-#mtTickers{flex:1;min-width:240px;width:auto}
-.mt-post{margin:22px 0 0}
-.mt-post-hdr{display:flex;align-items:center;gap:12px;margin-bottom:8px}
-.mt-del{margin-left:auto;background:none;border:1px solid var(--bd2);color:var(--tx3);font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;cursor:pointer}
-.mt-del:hover{color:var(--bear);border-color:var(--bear)}
-.mt-tier{font-family:var(--mono);font-size:10px;font-weight:600}
-.mt-tier.liquid{color:var(--bull)}.mt-tier.thin{color:var(--fresh)}.mt-tier.micro{color:var(--bear)}.mt-tier.btc{color:var(--tx2)}
 
 /* ── Calendar ── */
 #pg-calendar.active{display:block;overflow-y:auto;padding:24px}
@@ -2926,7 +2705,6 @@ tbody tr{animation:ri .3s var(--eout) both}
     <button class="nav-btn" data-pg="watch">Watchlist</button>
     <button class="nav-btn" data-pg="movers">Movers</button>
     <button class="nav-btn" data-pg="calendar">Calendar</button>
-    <button class="nav-btn" data-pg="mentor">Mentor log</button>
     <button class="nav-btn" data-pg="routine">Routine</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
@@ -3141,37 +2919,6 @@ tbody tr{animation:ri .3s var(--eout) both}
   </div>
 </div>
 
-<div id="pg-mentor" class="page">
-  <div class="sig-hdr">
-    <div><div class="sig-ttl">Mentor log &mdash; does the posted watchlist actually move?</div>
-    <div class="sig-sub">Paste each day's poster as it comes out. Every pick is followed for the next __MENTOR_HOLD__ completed daily bars from that day's open (00:00 UTC, about 2h before the post), and grouped by how liquid it was in the week before it was picked. The poster gives no direction, so nothing here is a win or a loss &mdash; it measures how far price travelled, and whether that was more than the coin usually moves.</div></div>
-  </div>
-  <div class="wbar">
-    <input type="date" id="mtDate" title="The day the poster went up (PHT)">
-    <select id="mtExchange" title="Where to measure. Binance lists the most of these names."><option value="binance">Binance</option><option value="bybit">Bybit</option><option value="okx">OKX</option></select>
-    <input type="text" id="mtTickers" placeholder="ICPUSDT.P, MONUSDT.P, ZKUSDT.P ...">
-    <button class="rbtn" onclick="saveMentor()">Log post</button>
-    <span class="wprog" id="mtProg"></span>
-  </div>
-  <div class="dash-sec-ttl">By liquidity tier &mdash; completed windows only</div>
-  <div id="mt-note" class="audit" style="margin:0 0 10px"></div>
-  <div class="tw" style="overflow:visible">
-    <table id="mtSum" style="display:none">
-      <thead><tr>
-        <th>Tier</th><th>Picks</th>
-        <th title="Median of the absolute close-to-open move after __MENTOR_HOLD__ days. Direction ignored.">|Move| at close</th>
-        <th title="Median of the highest high vs the entry open, inside the window.">Best up</th>
-        <th title="Median of the lowest low vs the entry open, inside the window.">Worst down</th>
-        <th title="Median of (best up - worst down): how much room there was to trade.">Range</th>
-        <th title="Median of the window's high-low range divided by the coin's ATR20 before the pick. Above 1 means the pick moved more than that coin normally does, which is the part that says the timing had something to it. Below 1 means it was a quieter-than-usual stretch.">Range vs ATR20</th>
-      </tr></thead>
-      <tbody id="mtSumB"></tbody>
-    </table>
-    <div class="no-sig" id="mtEmpty">Nothing logged yet &mdash; paste today's poster above.</div>
-  </div>
-  <div id="mtPosts"></div>
-</div>
-
 <div id="pg-calendar" class="page">
   <div class="sig-hdr">
     <div><div class="sig-ttl">Calendar &mdash; scheduled market movers</div>
@@ -3209,85 +2956,18 @@ tbody tr{animation:ri .3s var(--eout) both}
 </div>
 
 <div id="pg-routine" class="page" style="overflow-y:auto;padding:24px">
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Daily routine &mdash; how to use the three scans together</div>
-    <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75;margin-bottom:18px">
-      Movers finds what moved, the Scanner finds where momentum disagrees with price, and the Watchlist
-      says whether new money is behind it. Run them in that order, once a day, after the daily candle has
-      closed. About fifteen minutes.
-    </div>
+  <div class="rt-hdr">
+    <div><div class="sig-ttl">Daily routine</div>
+    <div class="sig-sub">Once a day after the daily close, left to right, about fifteen minutes. Each step narrows the list the next one works on. Click a step, or press play.</div></div>
+    <button class="rt-play" id="rtPlay" onclick="rtToggle()"><span id="rtPlayIco">&#9654;</span> <span id="rtPlayTxt">Play</span></button>
   </div>
+  <div class="rt-flow" id="rtFlow"><button class="rt-node" data-i="0" onclick="rtGo(0, true)" style="--d:0ms"><span class="rt-dot">0</span><span class="rt-name">Prep</span><span class="rt-q">Is it time, and is anything scheduled?</span><span class="rt-meta"><span>2 min</span><span class="rt-cnt">08:00&ndash;10:00 PHT</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="1" onclick="rtGo(1, true)" style="--d:90ms"><span class="rt-dot">1</span><span class="rt-name">Movers</span><span class="rt-q">What did something unusual yesterday?</span><span class="rt-meta"><span>3 min</span><span class="rt-cnt">~400 pairs &rarr; ~40&ndash;80</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="2" onclick="rtGo(2, true)" style="--d:180ms"><span class="rt-dot">2</span><span class="rt-name">Scanner</span><span class="rt-q">Where does momentum disagree with price?</span><span class="rt-meta"><span>5 min</span><span class="rt-cnt">&rarr; a handful of setups</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="3" onclick="rtGo(3, true)" style="--d:270ms"><span class="rt-dot">3</span><span class="rt-name">Watchlist</span><span class="rt-q">Is new money behind it?</span><span class="rt-meta"><span>2 min</span><span class="rt-cnt">same names, qualified</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="4" onclick="rtGo(4, true)" style="--d:360ms"><span class="rt-dot">4</span><span class="rt-name">Shortlist</span><span class="rt-q">What will I actually trade today?</span><span class="rt-meta"><span>2 min</span><span class="rt-cnt">3&ndash;5 names</span></span></button></div>
+  <div class="rt-bar" aria-hidden="true"><i id="rtTimer"></i></div>
+  <div class="rt-detail"><div class="rt-panel" data-i="0"><div class="rt-ph"><div><div class="rt-step">Step 0 of 4</div><div class="rt-pt">Prep &mdash; Is it time, and is anything scheduled?</div></div><button class="rt-open" onclick="showPg('calendar')">Open Calendar &rarr;</button></div><div class="rt-leave"><span>You leave with</span>the right time, one exchange, and a clear calendar window</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run after the daily close.</b> Perp daily candles close at 00:00 UTC, which is 08:00 Manila. Every scan reads the last <b>completed</b> daily bar, so a run at 07:00 Manila still describes the day before yesterday. Aim for 08:00 to 10:00 Manila.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Pick the exchange with the deepest book.</b> Binance carries the most volume on most pairs. Some majors trade thinly on other venues and get volume-rejected there for no chart reason. Each tab has its own exchange dropdown; keep them the same.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One volume floor for everything.</b> The Min 7-day volume box on the Scanner tab applies to all three scans. Default is $70M a week, about $10M a day. If a coin you expected is missing, check the audit line under the table before assuming there was no setup.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Read the audit line every time.</b> It says how many pairs were scanned, volume-rejected, errored, and whether the run finished. A short list from an unfinished scan is not a quiet market.</div></div><div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Check the Calendar tab.</b> A fresh entry sized into a CPI or FOMC print is a coin flip, not a setup. If the next market mover is inside 24 hours, wait for it or size for it. The Dashboard strip shows the countdown.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="1"><div class="rt-ph"><div><div class="rt-step">Step 1 of 4</div><div class="rt-pt">Movers &mdash; What did something unusual yesterday?</div></div><button class="rt-open" onclick="showPg('movers')">Open Movers &rarr;</button></div><div class="rt-leave"><span>You leave with</span>extended runs, breakdowns, and the levels they sit against</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Scan Movers, keep the All filter, read by score.</b> Top 4 is a shortcut, not the list. The score ranks how unusual the day was and how close price sits to a 7-day boundary. It has no direction.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Extended runs are the rows flagged ABOVE 7D HIGH or AT RANGE HIGH with a big 1-day change.</b> These names have already run for days. Treat them as fade-or-wait candidates, not chases, until the Scanner shows a bearish divergence or price gives back the prior-day low.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Breakdowns are the mirror.</b> BELOW 7D LOW or AT RANGE LOW with a big negative day. Same logic, other side.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Levels come with the row.</b> PDH and PDL are yesterday's high and low, the 7D range is the box price is in, and the position bar shows where in that box it sits now. Write the level down; that is the part a watchlist poster leaves out.</div></div><div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Thin coins are opt-in.</b> Tick Include thin coins to see $20M&ndash;$70M/week names in their own section. They only show on a volume spike and a wide day together. Worse fills, stops that slip: size down or skip.</div></div><div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Known blind spot.</b> A coin that had a quiet day is dropped even if it is sitting in a clean consolidation after a breakout. Movers will not show you the pullback. The Scanner does.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="2"><div class="rt-ph"><div><div class="rt-step">Step 2 of 4</div><div class="rt-pt">Scanner &mdash; Where does momentum disagree with price?</div></div><button class="rt-open" onclick="showPg('scan')">Open Scanner &rarr;</button></div><div class="rt-leave"><span>You leave with</span>pullback longs and fade candidates, each with a stop and 1R / 2R / 3R</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run 4H on Balanced.</b> Loose finds more and most of it is junk. Strict adds the zero-line rule and misses real setups. Balanced is the default for a reason.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>On the Signals tab, look at Fresh first, then At the signal.</b> Fresh means the second pivot formed within the last 12 bars, two days on 4H. At the signal means price is still within about 2% of where the divergence completed. Those two filters are your entry candidates.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Ran and invalidated are history.</b> Ran means the move already happened. Invalidated means price traded through the stop. Neither is an entry.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Bullish rows are your pullback candidates.</b> A regular bullish divergence on 4H during a dip is the structural version of a first pullback after the impulse, usually a few days before it gets posted.</div></div><div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Bearish rows on extended names are your fade candidates.</b> A name at its range high in Movers with a fresh bearish divergence here is the only version of shorting the run this screener will vouch for.</div></div><div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Then 1D for context.</b> Fresh on 1D means within 3 bars. A 4H setup that agrees with a 1D one is worth more than either alone.</div></div><div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Symbols override for a specific name.</b> Type tickers into the Symbols box to scan only those. The volume floor is skipped for an override.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="3"><div class="rt-ph"><div><div class="rt-step">Step 3 of 4</div><div class="rt-pt">Watchlist &mdash; Is new money behind it?</div></div><button class="rt-open" onclick="showPg('watch')">Open Watchlist &rarr;</button></div><div class="rt-leave"><span>You leave with</span>each name tagged spot-led, crowded, or squeeze fuel</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Qualify names here, do not hunt for them.</b> This tab is ranked by 7-day open-interest change and reads best on a Sunday. Use it to check the names you already have.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>For an extended run you want NEW LONGS with SPOT-LED.</b> Price up, OI up, funding near zero: the run is being bought in spot. CROWDED LONGS is the same picture with latecomer leverage paying rich funding. A fade gets stronger with CROWDED, weaker with SPOT-LED.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>For a breakdown, NEW SHORTS with SQUEEZE FUEL is the warning.</b> Shorts crowded and paying deeply negative funding can be squeezed. A pullback long into that is a better trade than a short.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL means nobody can leave quietly.</b> Expect violent moves either way. Size down.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="4"><div class="rt-ph"><div><div class="rt-step">Step 4 of 4</div><div class="rt-pt">Shortlist &mdash; What will I actually trade today?</div></div></div><div class="rt-leave"><span>You leave with</span>a level, a stop and a target for every name, before the session starts</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Three to five names, no more.</b> Two buckets. <b>Extended</b>: wait for a fade signal or a reclaim. <b>Pullback</b>: a fresh bullish divergence or a hold of the prior-day low.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Each name gets a level, a stop and a target.</b> From Movers: PDH, PDL, the 7D range. From the Scanner: the stop price and the 1R, 2R, 3R levels. If you cannot fill those in, the name is not a setup, it is a ticker.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Scores rank, they do not predict.</b> Both scores describe structure. Neither is a backtested win rate. A 90 is a clean picture, not a promise.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div></div>
 
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Before you run anything</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run after the daily close.</b> Perp daily candles close at 00:00 UTC, which is 08:00 Manila. Every scan reads the last <b>completed</b> daily bar, so a run at 07:00 Manila still describes the day before yesterday. Aim for 08:00 to 10:00 Manila.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Pick the exchange with the deepest book.</b> Binance carries the most volume on most pairs. Some majors trade thinly on other venues and get volume-rejected there for no chart reason. Each tab has its own exchange dropdown; keep them the same.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One volume floor for everything.</b> The Min 7-day volume box on the Scanner tab applies to all three scans. Default is $70M a week, about $10M a day. Names under that do not exist to the screener. If a coin you expected is missing, check the audit line under the table before assuming there was no setup.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Read the audit line every time.</b> It says how many pairs were scanned, volume-rejected, errored, and whether the run finished. A short list from an unfinished scan is not a quiet market.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Check the Calendar tab.</b> A fresh entry sized into a CPI or FOMC print is a coin flip, not a setup. If the next market mover is inside 24 hours, wait for it or size for it. The Dashboard strip shows the countdown.</div></div>
-    </div>
-  </div>
-
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Step 1 &mdash; Movers: what did something unusual yesterday</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Scan Movers, keep the All filter, read by score.</b> Top 4 is a shortcut, not the list. The score ranks how unusual the day was and how close price sits to a 7-day boundary. It has no direction.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Extended runs are the rows flagged ABOVE 7D HIGH or AT RANGE HIGH with a big 1-day change.</b> The At range high filter isolates them. These names have already run for days. Treat them as fade-or-wait candidates, not chases, until the Scanner shows a bearish divergence or price gives back the prior-day low.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Breakdowns are the mirror.</b> BELOW 7D LOW or AT RANGE LOW with a big negative day. Same logic, other side.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Levels come with the row.</b> PDH and PDL are yesterday's high and low, the 7D range is the box price is in, and the position bar shows where in that box it sits now. Write the level down; that is the part a watchlist poster leaves out.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Known blind spot.</b> A coin that had a quiet day is dropped even if it is sitting in a clean consolidation after a breakout. Movers will not show you the pullback. Step 2 does.</div></div>
-    </div>
-  </div>
-
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Step 2 &mdash; Scanner on 4H: where momentum disagrees with price</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run 4H on Balanced.</b> Loose finds more and most of it is junk. Strict adds the zero-line rule and misses real setups. Balanced is the default for a reason.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>On the Signals tab, look at Fresh first, then At the signal.</b> Fresh means the second pivot formed within the last 12 bars, two days on 4H. At the signal means price is still within about 2% of where the divergence completed. Those two filters are your entry candidates.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Ran and invalidated are history.</b> Ran means the move already happened and the targets shown are re-anchored to spot. Invalidated means price traded through the stop. Neither is an entry. They are useful only for checking what the scanner saw before a coin appeared on someone's list.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Bullish rows are your pullback candidates.</b> A regular bullish divergence on 4H during a dip is the structural version of a first pullback after the impulse. This is where the pullback names show up, usually a few days before they get posted.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Bearish rows on extended names are your fade candidates.</b> Cross-check against Step 1: a name at its range high with a fresh bearish divergence is the only version of shorting the run that this screener will vouch for.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Then 1D for context.</b> Same reading, bigger picture. Fresh on 1D means within 3 bars. A 4H setup that agrees with a 1D one is worth more than either alone.</div></div>
-      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Symbols override for a specific name.</b> Type tickers into the Symbols box to scan only those. The volume floor is skipped for an override, so a thin name you are curious about still gets analysed.</div></div>
-    </div>
-  </div>
-
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Step 3 &mdash; Watchlist (OI flow): is new money behind it</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Qualify names here, do not hunt for them.</b> This tab is ranked by 7-day open-interest change and reads best on a Sunday. Use it to check the names you already have from Steps 1 and 2.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>For an extended run you want NEW LONGS with SPOT-LED.</b> Price up, OI up, funding near zero: the run is being bought in spot while shorts fight it. CROWDED LONGS is the same picture with latecomer leverage paying rich funding. A fade gets stronger with CROWDED, weaker with SPOT-LED.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>For a breakdown, NEW SHORTS with SQUEEZE FUEL is the warning.</b> Shorts crowded and paying deeply negative funding can be squeezed. A pullback long into that is a better trade than a short.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL means nobody can leave quietly.</b> Expect violent moves either way. Size down.</div></div>
-    </div>
-  </div>
-
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Step 4 &mdash; Build the shortlist</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Three to five names, no more.</b> Split them into two buckets. <b>Extended</b>: wait for a fade signal or a reclaim. <b>Pullback</b>: a fresh bullish divergence or a hold of the prior-day low.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Each name gets a level, a stop and a target before the session starts.</b> From Movers: PDH, PDL, the 7D range. From the Scanner: the stop price and the 1R, 2R, 3R levels. If you cannot fill those in, the name is not a setup, it is a ticker.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Scores rank, they do not predict.</b> Both scores describe structure. Neither is a backtested win rate. A 90 is a clean picture, not a promise.</div></div>
-    </div>
-  </div>
-
-  <div class="dash-sec">
-    <div class="dash-sec-ttl">Step 5 &mdash; Compare with the mentor's poster</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Two minutes a day.</b> For each name on the poster, note which tab surfaced it, and if none did, why: volume-rejected, quiet day, or a real miss. The audit line answers the first one.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Volume-rejected is not a miss.</b> A name that trades under the floor is excluded by design. Decide once whether you want thin names, and if so lower the floor with your eyes open: thin book, wide spreads, funding-driven drift.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>A real miss is a name with a clear structure that no scan flagged.</b> Those are the ones to write down. If the same kind of miss repeats, the screener needs a new flag, not a lower floor.</div></div>
-    </div>
-  </div>
-
-  <div class="dash-sec">
+  <div class="dash-sec" style="margin-top:30px">
     <div class="dash-sec-ttl">If something looks wrong</div>
-    <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Partial scan warning.</b> The tab was closed mid-run or the exchange rate-limited it. Re-run at the Safe speed before trusting the table.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>A ticker says NOT LISTED.</b> The exchange you chose does not carry that perp. Try another exchange.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Nothing fresh anywhere.</b> Normal in a one-way market: regular divergences need a trend extreme to argue with. Movers still works on those days.</div></div>
-    </div>
+    <div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Partial scan warning.</b> The tab was closed mid-run or the exchange rate-limited it. Re-run at the Safe speed before trusting the table.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>A ticker says NOT LISTED.</b> The exchange you chose does not carry that perp. Try another exchange.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Nothing fresh anywhere.</b> Normal in a one-way market: regular divergences need a trend extreme to argue with. Movers still works on those days.</div></div></div>
   </div>
 </div>
 
@@ -3501,7 +3181,7 @@ function showPg(name){
   if(name === 'watch') loadWatch();
   if(name === 'movers') loadMovers();
   if(name === 'calendar') loadCalendar();
-  if(name === 'mentor') loadMentor();
+  if(name !== 'routine') rtStop();
 }
 document.querySelectorAll('.nav-btn').forEach(function(b){
   b.addEventListener('click', function(){ showPg(b.dataset.pg); });
@@ -4262,107 +3942,57 @@ function renderWelcome(){
   } catch(e){}
 }
 
-/* ── Mentor log ───────────────────────────────────────────────────────────── */
-var MT_TIER = {liquid:'Liquid', thin:'Thin', micro:'Micro', btc:'BTC (market)'};
-var MT_TIER_TIP = {
-  liquid: 'Traded at least $__DEFAULT_VOL_M__M in the 7 days before the pick: clears the scanner floor.',
-  thin:   '$__MOVER_THIN_M__M to $__DEFAULT_VOL_M__M in the 7 days before the pick: the Movers thin band.',
-  micro:  'Under $__MOVER_THIN_M__M in the 7 days before the pick: below anything the scanner looks at.',
-  btc:    'BTC over the same windows: what the whole market did meanwhile.'};
-function mtTier(t){
-  return t ? '<span class="mt-tier ' + t + '" title="' + (MT_TIER_TIP[t] || '') + '">' + (MT_TIER[t] || t) + '</span>' : '&mdash;';
-}
-function mtPct(v){
-  if(v === null || v === undefined) return '&mdash;';
-  return '<span style="font-family:var(--mono);color:' + (v >= 0 ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(v) + '</span>';
-}
-function mtNum(v, suf){
-  return (v === null || v === undefined) ? '&mdash;' : '<span style="font-family:var(--mono)">' + v + (suf || '') + '</span>';
-}
-function mtToday(){ return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); }   /* PHT */
-function renderMentor(d){
-  var sum = d.summary || {}, order = ['liquid', 'thin', 'micro', 'btc'];
-  var tb = document.getElementById('mtSumB'); tb.innerHTML = '';
-  var n = 0;
-  order.forEach(function(t){
-    var g = sum[t]; if(!g) return;
-    if(t !== 'btc') n += g.n;
-    var tr = document.createElement('tr');
-    tr.innerHTML = '<td>' + mtTier(t) + '</td><td>' + mtNum(g.n) + '</td><td>' + mtNum(g.abs_chg_48h, '%') + '</td>' +
-      '<td>' + mtPct(g.max_up) + '</td><td>' + mtPct(g.max_dn) + '</td><td>' + mtNum(g.range_pct, '%') + '</td>' +
-      '<td>' + mtNum(g.range_atr, 'x') + '</td>';
-    tb.appendChild(tr);
+/* ── Routine flow ─────────────────────────────────────────────────────────── */
+var rtCur = 0, rtTimer = null, RT_STEP_MS = 6000;
+function rtGo(i, manual){
+  var nodes = document.querySelectorAll('.rt-node'), links = document.querySelectorAll('.rt-link');
+  if(i < 0 || i >= nodes.length) return;
+  if(manual) rtStop();
+  rtCur = i;
+  nodes.forEach(function(n, k){ n.classList.toggle('on', k === i); n.classList.toggle('done', k < i); });
+  links.forEach(function(l, k){ l.classList.toggle('done', k < i); l.classList.toggle('into', k === i - 1); });
+  document.querySelectorAll('.rt-panel').forEach(function(p, k){
+    p.classList.toggle('on', k === i);
+    if(k === i){
+      p.querySelector('.rt-prev').disabled = i === 0;
+      p.querySelector('.rt-next').disabled = i === nodes.length - 1;
+    }
   });
-  var posts = d.posts || [];
-  document.getElementById('mtSum').style.display = tb.children.length ? 'table' : 'none';
-  var empty = document.getElementById('mtEmpty');
-  empty.style.display = tb.children.length ? 'none' : '';
-  empty.textContent = posts.length ? 'No completed windows yet - each pick needs ' + d.hold_d + ' full daily bars.'
-                                   : 'Nothing logged yet - paste today\'s poster above.';
-  var note = [];
-  if(n && n < 60) note.push(n + ' completed pick(s). Read nothing into the tiers until there are a few weeks of posts: one market-wide dump moves every row at once.');
-  if((d.errors || []).length) note.push('Could not refresh: ' + d.errors.map(calEsc).join(' · '));
-  document.getElementById('mt-note').innerHTML = note.join('<br>');
-
-  var box = document.getElementById('mtPosts'); box.innerHTML = '';
-  posts.forEach(function(p){
-    var res = p.results || {};
-    var rows = p.tickers.concat(['BTC']).map(function(b){
-      var r = res[b] || {status: 'pending'};
-      var st = {final:'done', partial:'1 of ' + d.hold_d + ' days', pending:'waiting for the first bar',
-                not_listed:'not listed on ' + (p.exchange || '').toUpperCase(), no_data:'no data'}[r.status] || r.status;
-      return '<tr' + (b === 'BTC' ? ' style="opacity:.7"' : '') + '><td><span class="pb-pair">' + calEsc(b) + '</span></td>' +
-        '<td>' + mtTier(b === 'BTC' ? 'btc' : r.tier) + '</td>' +
-        '<td>' + (r.wk_vol != null ? fmtVol(r.wk_vol) : '&mdash;') + '</td>' +
-        '<td>' + mtPct(r.chg_24h) + '</td><td>' + mtPct(r.chg_48h) + '</td>' +
-        '<td>' + mtPct(r.max_up) + '</td><td>' + mtPct(r.max_dn) + '</td>' +
-        '<td>' + mtNum(r.range_atr, 'x') + '</td>' +
-        '<td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">' + st + '</td></tr>';
-    }).join('');
-    var div = document.createElement('div');
-    div.className = 'mt-post';
-    div.innerHTML = '<div class="mt-post-hdr"><div class="dash-sec-ttl" style="margin:0">' + calEsc(p.date) + ' &middot; ' +
-        calEsc((p.exchange || '').toUpperCase()) + ' &middot; ' + p.tickers.length + ' picks</div>' +
-        '<button class="mt-del" data-date="' + calEsc(p.date) + '" onclick="deleteMentor(this.dataset.date)">Delete</button></div>' +
-      '<table><thead><tr><th>Coin</th><th>Tier</th><th title="Traded value in the 7 days before the pick">7d vol before</th>' +
-      '<th title="Close of the poster day vs its open">Day 1</th><th title="Close of day 2 vs the poster-day open">Day 2</th>' +
-      '<th>Best up</th><th>Worst down</th><th>Range vs ATR20</th><th>Window</th></tr></thead><tbody>' + rows + '</tbody></table>';
-    box.appendChild(div);
-  });
+  if(rtTimer) rtBar();
 }
-function loadMentor(done_msg){
-  var prog = document.getElementById('mtProg');
-  if(!document.getElementById('mtDate').value) document.getElementById('mtDate').value = mtToday();
-  prog.textContent = 'Updating open windows...';
-  fetch('/mentor').then(function(r){ return r.json(); }).then(function(d){
-    prog.textContent = done_msg || '';
-    renderMentor(d);
-  }).catch(function(){ prog.textContent = 'Failed to load the mentor log.'; });
+function rtBar(){
+  var b = document.getElementById('rtTimer');
+  b.classList.remove('run'); void b.offsetWidth;   /* restart the CSS animation */
+  b.style.animationDuration = RT_STEP_MS + 'ms';
+  b.classList.add('run');
 }
-function saveMentor(){
-  var prog = document.getElementById('mtProg');
-  var body = {date: document.getElementById('mtDate').value,
-              exchange: document.getElementById('mtExchange').value,
-              tickers: document.getElementById('mtTickers').value};
-  if(!body.tickers.trim()){ prog.textContent = 'Paste the tickers first.'; return; }
-  prog.textContent = 'Saving...';
-  fetch('/mentor', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
-    .then(function(r){ return r.json(); }).then(function(d){
-      if(d.error){
-        prog.textContent = d.error + (d.unmatched && d.unmatched.length ? ' (' + d.unmatched.join(', ') + ')' : '');
-        return;
-      }
-      document.getElementById('mtTickers').value = '';
-      var msg = 'Logged ' + d.tickers.length + ': ' + d.tickers.join(', ');
-      if(d.unmatched.length) msg += ' · not found: ' + d.unmatched.join(', ');
-      loadMentor(msg);
-    }).catch(function(){ prog.textContent = 'Save failed.'; });
+function rtToggle(){ if(rtTimer) rtStop(); else rtStart(); }
+function rtStart(){
+  var last = document.querySelectorAll('.rt-node').length - 1;
+  if(rtCur >= last) rtGo(0);
+  document.getElementById('rtPlay').classList.add('on');
+  document.getElementById('rtPlayIco').innerHTML = '&#10074;&#10074;';
+  document.getElementById('rtPlayTxt').textContent = 'Pause';
+  rtTimer = setInterval(function(){
+    if(rtCur >= last){ rtStop(); return; }
+    rtGo(rtCur + 1);
+  }, RT_STEP_MS);
+  rtBar();
 }
-function deleteMentor(date){
-  if(!confirm('Delete the logged post for ' + date + '?')) return;
-  fetch('/mentor', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({date: date, delete: true})}).then(function(){ loadMentor(); });
+function rtStop(){
+  if(rtTimer){ clearInterval(rtTimer); rtTimer = null; }
+  var b = document.getElementById('rtPlay'); if(!b) return;
+  b.classList.remove('on');
+  document.getElementById('rtPlayIco').innerHTML = '&#9654;';
+  document.getElementById('rtPlayTxt').textContent = 'Play';
+  document.getElementById('rtTimer').classList.remove('run');
 }
+document.addEventListener('keydown', function(e){
+  if(!document.getElementById('pg-routine').classList.contains('active')) return;
+  if(/INPUT|TEXTAREA|SELECT/.test((e.target || {}).tagName || '')) return;
+  if(e.key === 'ArrowRight') rtGo(rtCur + 1, true);
+  if(e.key === 'ArrowLeft')  rtGo(rtCur - 1, true);
+});
 
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 var _cal = {events: [], meta: {}, ts: null}, _cf = 'movers', _calSel = null;
@@ -4564,6 +4194,7 @@ setInterval(function(){ if(_cal.events.length) calBanner(Date.now()); }, 60000);
 
 document.addEventListener('DOMContentLoaded', function(){
   renderWelcome();
+  rtGo(0);
   loadDash();
   loadCalendar();
   var pg = (location.hash || '').slice(1);
@@ -4577,6 +4208,5 @@ if __name__ == "__main__":
     load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
     load_state()      # restore the last scan so the dashboard isn't amnesiac
     load_movers()     # ...and the last movers scan
-    load_mentor()     # ...and the logged mentor watchlists
     load_calendar()   # ...and the news calendar
     app.run(debug=False, threaded=True, port=5099)

@@ -42,12 +42,6 @@ the API and a browser dashboard.
   range expansion fire together: on a thin coin one big order is a volume
   spike by itself, and the slippage and stop-hunting costs that justify the
   floor still apply.
-- **Mentor log** (`/mentor`): paste a posted daily watchlist (TradingView
-  notation like `ICPUSDT.P` is fine) and each pick is followed for the next
-  2 completed daily bars. Results are grouped by how liquid the coin was in
-  the week before the pick (liquid / thin / micro), next to BTC over the same
-  window, so whether low-volume picks move enough to pay for their cost is
-  measured instead of assumed. Saved in `mentor_picks.json` (gitignored).
 - **News calendar** (`/calendar`): the scheduled macro prints that actually
   move crypto perps — US CPI/PCE/PPI, the jobs report, FOMC and Powell, GDP,
   retail sales, ISM, plus the BoJ/ECB/BoE rate decisions — on a two-week grid
@@ -109,7 +103,6 @@ without re-scanning.
 | `/watch_signals` | GET | Last cached `/watchlist` result |
 | `/movers` | GET (SSE) | Run a daily-movers scan |
 | `/mover_signals` | GET | Last cached `/movers` result |
-| `/mentor` | GET / POST | Logged watchlists with forward results; POST `{date, tickers, exchange}` logs one, `{date, delete: true}` removes it |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
 | `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 
@@ -183,7 +176,10 @@ turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
 The three scans answer three different questions. Movers finds what moved,
 the Scanner finds where momentum disagrees with price, and the Watchlist says
 whether new money is behind it. Run them in that order once a day. The same
-guide lives in the dashboard under the **Routine** tab.
+guide lives in the dashboard under the **Routine** tab, drawn as a step-by-step
+flow (Prep, Movers, Scanner, Watchlist, Shortlist) that shows how far each
+step narrows the list. Click a step for its rules, or press Play to walk
+through them.
 
 **Before you run anything**
 
@@ -240,15 +236,6 @@ guide lives in the dashboard under the **Routine** tab.
 - Each name needs a level, a stop and a target before the session: PDH/PDL
   and the 7-day range from Movers, the stop and 1R/2R/3R from the Scanner.
 - Scores rank, they do not predict. Neither score is a backtested win rate.
-
-**Step 5 — Compare with a mentor's watchlist**
-
-- For each posted name, note which tab surfaced it, and if none did, why:
-  volume-rejected, quiet day, or a real miss. The audit line answers the
-  first one.
-- Volume-rejected is by design. Decide once whether you want thin names.
-- A real miss is a clear structure no scan flagged. If the same kind of miss
-  repeats, the screener needs a new flag, not a lower floor.
 
 ## Disclaimer
 

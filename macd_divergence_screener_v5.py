@@ -165,6 +165,18 @@ STRICTNESS = {
 
 ALLOWED_EXCHANGES = {"okx", "binance", "bybit"}
 DEFAULT_TYPE      = {"okx": "swap", "binance": "future", "bybit": "swap"}
+# exchange=all: Binance is the primary venue (you trade there); a coin it does not
+# list is scanned on whichever of OKX / Bybit trades it more. Tags name venues in
+# VENUE_ORDER.
+PRIMARY_VENUE = "binance"
+VENUE_ORDER   = ("okx", "bybit", "binance")
+
+# Thin-coin filters (skipped under a symbol override, like the volume gate).
+# Unknown data (no bid/ask, no OI) never filters.
+MAX_SPREAD_PCT = 0.10            # top-of-book spread at scan time
+ATR_PCT_RANGE  = (0.6, 8.0)      # 4H ATR as % of price: below is too dead for 1R, above too wild
+MIN_HISTORY    = 300             # completed bars a timeframe needs (the 200 EMA has settled)
+MIN_OI_USD     = 5_000_000       # open interest of a pair with a signal
 STABLE_BASES      = {"USDC","BUSD","TUSD","USDP","DAI","FDUSD","USDD","USDE",
                      "EUR","USD1","PYUSD","XAUT","PAXG","EURC","USDG"}
 
@@ -1067,6 +1079,63 @@ def oi_point_usd(pt, fallback_price):
     return None
 
 
+def spread_too_wide(ticker):
+    """Top-of-book spread above MAX_SPREAD_PCT of mid. Missing bid/ask: False."""
+    try:
+        bid, ask = float(ticker["bid"]), float(ticker["ask"])
+    except (TypeError, KeyError, ValueError):
+        return False
+    if not (bid > 0 and ask > 0):
+        return False
+    return (ask - bid) / ((ask + bid) / 2) * 100 > MAX_SPREAD_PCT
+
+
+def atr_pct_out_of_range(atr, close):
+    """4H ATR as % of price outside ATR_PCT_RANGE. Unknown (not > 0): False."""
+    if not (atr > 0 and close > 0):
+        return False
+    pct = atr / close * 100
+    return not ATR_PCT_RANGE[0] <= pct <= ATR_PCT_RANGE[1]
+
+
+def oi_too_thin(hist, price):
+    """Latest point of an OI history below MIN_OI_USD. Unknown: False."""
+    pts = [p for p in (hist or []) if p.get("timestamp")]
+    usd = oi_point_usd(max(pts, key=lambda p: p["timestamp"]), price) if pts else None
+    return usd is not None and usd < MIN_OI_USD
+
+
+def coin_venues(perps, vols, primary):
+    """Which venue each coin is scanned on.
+
+    perps: {venue: [symbol]}; vols: {(venue, symbol): 24h USD volume or None}.
+    Returns ({base: {venue: symbol}} for every venue listing the coin, and
+    [(venue, symbol)], one per coin: the primary venue when it lists the coin,
+    else whichever other venue has the larger 24h volume (OKX on a tie).
+    shortcut: coins match by base name only (1000PEPE on one venue and PEPE on
+    another count as two coins); add an alias map if that matters.
+    """
+    listed = {}
+    for v, syms in perps.items():
+        for s in syms:
+            listed.setdefault(s.split("/")[0], {})[v] = s
+    pick = []
+    for by in listed.values():
+        v = primary if primary in by else max(
+            (x for x in VENUE_ORDER if x in by), key=lambda x: vols.get((x, by[x])) or 0)
+        pick.append((v, by[v]))
+    return listed, pick
+
+
+def venue_tags(exid, confirmed):
+    """Row tags of the all-exchanges scan: NOT ON BINANCE for a coin scanned
+    elsewhere, ALSO ON ... naming the venues whose detection confirmed it."""
+    tags = [] if exid == PRIMARY_VENUE else [f"NOT ON {PRIMARY_VENUE.upper()}"]
+    if confirmed:
+        tags.append("ALSO ON " + ", ".join(v.upper() for v in VENUE_ORDER if v in confirmed))
+    return tags
+
+
 def fetch_oi_history(ex, limiter, sym, limit, tf="1d", tries=3):
     """Daily OI history with the same backoff discipline as fetch_ohlcv."""
     for attempt in range(tries):
@@ -1791,6 +1860,14 @@ def usdt_perps(mkts):
             and s.split("/")[0] not in STABLE_BASES and not is_tradfi(mkts[s])]
 
 
+def load_venue(exid):
+    """Markets, active USDT perps and bulk tickers for one exchange. Raises when
+    the exchange id is not allowed or markets / tickers fail to load."""
+    ex = make_exchange(exid)
+    mkts = ex.load_markets()
+    return {"ex": ex, "mkts": mkts, "perps": usdt_perps(mkts), "tickers": ex.fetch_tickers()}
+
+
 def fetch_btc(ex, limiter):
     """BTC 4H RSI 14, close and 200 EMA on completed bars, for the BTC state.
     None when unavailable."""
@@ -1885,6 +1962,28 @@ def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, ma
     return list(rows.values())
 
 
+def detections(df, forming_df, rules, sides=("bullish", "bearish")):
+    """Every detector hit on the completed frame, plus a hit whose signal bar is
+    the still-open candle of the forming frame, as (frame, forming, hit)."""
+    for src, forming in ((forming_df, True), (df, False)):
+        if src is None:
+            continue
+        for side in sides:
+            for d in detect_wave_divergence(src, side, rules):
+                if not forming or d["signal_bar"] == len(src) - 1:
+                    yield src, forming, d
+
+
+def venue_confirms(sig, df, forming_df, rules):
+    """True when another venue's frames show a signal on the same side whose
+    signal bar is within one bar of `sig`'s (the same detection the scan runs)."""
+    if df is None or len(df) < 80:
+        return False
+    bar_ms = TF_CFG[sig["tf"]]["minutes"] * 60_000
+    return any(abs(int(src.index[d["signal_bar"]].timestamp() * 1000) - sig["signal_ms"]) <= bar_ms
+               for src, _, d in detections(df, forming_df, rules, (sig["side"],)))
+
+
 def signals_for_tf(df, tf, rules, live_price, sym, wk_vol, forming_df=None):
     """Finished signals for one pair on one timeframe.
 
@@ -1899,17 +1998,11 @@ def signals_for_tf(df, tf, rules, live_price, sym, wk_vol, forming_df=None):
     if df is None or len(df) < 80:
         return []
     cfg, found = TF_CFG[tf], []
-    for src, forming in ((forming_df, True), (df, False)):
-        if src is None:
-            continue
-        for side in ("bullish", "bearish"):
-            for d in detect_wave_divergence(src, side, rules):
-                if forming and d["signal_bar"] != len(src) - 1:
-                    continue
-                sig = _mk(src, d, cfg, forming)
-                sig.update(evaluate_status(src, sig, live_price))
-                sig["_df"] = src
-                found.append(sig)
+    for src, forming, d in detections(df, forming_df, rules):
+        sig = _mk(src, d, cfg, forming)
+        sig.update(evaluate_status(src, sig, live_price))
+        sig["_df"] = src
+        found.append(sig)
     out = []
     for sig in dedupe(found):
         sig.pop("_b")
@@ -2185,26 +2278,29 @@ def universe_route():
     """How big the tradable universe is at a given weekly-volume floor, without
     running a scan. One bulk ticker call — cheap enough to poke at while
     choosing a floor."""
-    exid = request.args.get("exchange", "okx")
+    exid = request.args.get("exchange", "all")
     floor = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
-    try:
-        ex = make_exchange(exid)
-        mkts = ex.load_markets()
-        tickers = ex.fetch_tickers()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    V = {}
+    for v in ([PRIMARY_VENUE, "okx", "bybit"] if exid == "all" else [exid]):
+        try:
+            V[v] = load_venue(v)
+        except Exception as e:
+            if not V:      # the primary venue is required
+                return jsonify({"error": str(e)}), 500
 
+    vols = {(v, s): usd_volume(V[v]["tickers"].get(s)) for v in V for s in V[v]["perps"]}
     rows = []
-    for sym in usdt_perps(mkts):
-        base = sym.split("/")[0]
-        v = usd_volume(tickers.get(sym))
-        if v:
-            rows.append({"base": base, "sym": sym, "wk": v * 7.0})
+    for v, sym in coin_venues({v: d["perps"] for v, d in V.items()}, vols,
+                              PRIMARY_VENUE if exid == "all" else exid)[1]:
+        if vols[(v, sym)]:
+            rows.append({"base": sym.split("/")[0], "sym": sym, "venue": v,
+                         "wk": vols[(v, sym)] * 7.0})
 
     rows.sort(key=lambda r: r["wk"], reverse=True)
     passed = [r for r in rows if r["wk"] >= floor]
     return jsonify({
         "exchange": exid,
+        "venues": list(V),
         "total_perps": len(rows),
         "passing": len(passed),
         "floor": floor,
@@ -2216,7 +2312,7 @@ def universe_route():
 
 @app.route("/scan")
 def scan_route():
-    exid       = request.args.get("exchange", "okx")
+    exid       = request.args.get("exchange", "all")
     strictness = request.args.get("strictness", "balanced")
     speed      = request.args.get("speed", "normal")
     min_vol    = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
@@ -2229,31 +2325,39 @@ def scan_route():
         speed = "normal"
 
     rules = STRICTNESS[strictness]
+    merged = exid == "all"
+    primary = PRIMARY_VENUE if merged else exid
 
     def generate():
-        try:
-            main_ex = make_exchange(exid)
-        except ValueError as e:
-            yield sse("error", {"msg": str(e)}); return
-
-        yield sse("log", {"msg": "Loading markets..."})
-        try:
-            mkts = main_ex.load_markets()
-        except Exception as e:
-            yield sse("error", {"msg": f"load_markets failed: {e}"}); return
-
-        perps = usdt_perps(mkts)
-        yield sse("log", {"msg": f"{len(perps)} active linear USDT perps on {exid.upper()}"})
-
-        yield sse("log", {"msg": "Fetching 24h volumes (one bulk call)..."})
-        try:
-            tickers = main_ex.fetch_tickers()
-        except Exception as e:
-            yield sse("error", {"msg": f"volume fetch failed: {e}"}); return
-
-        funding = fetch_funding_map(main_ex)
-        if not funding:
-            yield sse("log", {"msg": "No bulk funding data — OI-flow health flags will be blank"})
+        spd = SPEED[speed]
+        # Each venue: markets, bulk tickers, funding and its own rate limiter.
+        V = {}
+        for v in ([PRIMARY_VENUE, "okx", "bybit"] if merged else [exid]):
+            yield sse("log", {"msg": f"Loading markets and 24h volumes on {v.upper()}..."})
+            try:
+                V[v] = d = load_venue(v)
+            except Exception as e:
+                if v == primary:
+                    yield sse("error", {"msg": f"{v.upper()} markets / volumes failed: {e}"}); return
+                yield sse("log", {"msg": f"{v.upper()} unavailable, scanning without it: {e}"})
+                continue
+            if not any(t.get("bid") for t in d["tickers"].values()) and d["ex"].has.get("fetchBidsAsks"):
+                # Binance futures tickers carry no top of book: one more bulk call
+                # for the spread filter. A failure only leaves the spread unknown.
+                try:
+                    for s, b in d["ex"].fetch_bids_asks().items():
+                        if s in d["tickers"]:
+                            d["tickers"][s].update(bid=b.get("bid"), ask=b.get("ask"))
+                except Exception:
+                    pass
+            d["funding"] = fetch_funding_map(d["ex"])
+            d["limiter"] = RateLimiter(spd["rps"].get(v, 8))
+            yield sse("log", {"msg": f"{len(d['perps'])} active linear USDT perps on {v.upper()}"})
+            if not d["funding"]:
+                yield sse("log", {"msg": f"No bulk funding data on {v.upper()} — "
+                                         "OI-flow health flags will be blank there"})
+        main_ex = V[primary]["ex"]
+        venues_txt = "/".join(v.upper() for v in V)
 
         # Nearest USD blocker (for the entry verdict) and nearest other mover
         # (a row tag). A calendar failure must not stop a scan; the verdict
@@ -2274,36 +2378,44 @@ def scan_route():
         # a coin can trade most of its week in one day: a listing that did
         # $190M five days ago and $2M since has a genuinely large 7-day volume
         # and would be thrown away by a tight 24h proxy.
-        vol24 = {}
-        for s in perps:
-            v = usd_volume(tickers.get(s))
-            if v:
-                vol24[s] = v
-        no_ticker = len(perps) - len(vol24)
+        # Work items are (venue, symbol): one per coin, on the venue coin_venues picks.
+        vol24 = {(v, s): usd_volume(V[v]["tickers"].get(s)) for v in V for s in V[v]["perps"]}
+        listed, perps = coin_venues({v: d["perps"] for v, d in V.items()}, vol24, primary)
+        if merged:
+            off = sum(1 for v, _ in perps if v != PRIMARY_VENUE)
+            yield sse("log", {"msg": f"{len(perps)} coins across {venues_txt} · {off} not on "
+                                     f"{PRIMARY_VENUE.upper()}, scanned on OKX / Bybit"})
+        no_ticker = sum(1 for p in perps if not vol24[p])
         if no_ticker:
             yield sse("log", {"msg": f"{no_ticker} perp(s) report no usable 24h volume — not scanned"})
 
         pre_floor = (min_vol / 7.0) * PREGATE_SLACK
-        pairs = [s for s in vol24 if vol24[s] >= pre_floor]
-        pairs.sort(key=lambda s: vol24[s], reverse=True)
+        pairs = [p for p in perps if vol24[p] and vol24[p] >= pre_floor]
+        pairs.sort(key=lambda p: vol24[p], reverse=True)
+        spread_reject = 0
 
         if only_syms:
             wanted = {s.split("/")[0].split(":")[0] for s in only_syms}
-            pairs = [s for s in perps if s.split("/")[0] in wanted]
-            found = {s.split("/")[0] for s in pairs}
+            pairs = [p for p in perps if p[1].split("/")[0] in wanted]
+            found = {p[1].split("/")[0] for p in pairs}
             missing = sorted(wanted - found)
             msg = f"Symbol override: scanning {len(pairs)} pair(s)"
             if missing:
                 # Silently ignoring a typo'd or delisted ticker is the worst
                 # outcome here — the user reads an empty table as "no setup".
-                msg += f" · NOT LISTED on {exid.upper()}: {', '.join(missing)}"
+                msg += f" · NOT LISTED on {venues_txt}: {', '.join(missing)}"
             yield sse("log", {"msg": msg})
             if not pairs:
                 yield sse("error", {"msg": f"None of those symbols are listed as USDT perps "
-                                           f"on {exid.upper()}: {', '.join(sorted(wanted))}"})
+                                           f"on {venues_txt}: {', '.join(sorted(wanted))}"})
                 return
         else:
-            dropped = len(vol24) - len(pairs)
+            dropped = sum(1 for p in perps if vol24[p]) - len(pairs)
+            kept = [p for p in pairs if not spread_too_wide(V[p[0]]["tickers"].get(p[1]))]
+            spread_reject, pairs = len(pairs) - len(kept), kept
+            if spread_reject:
+                yield sse("log", {"msg": f"{spread_reject} pair(s) skipped: spread wider than "
+                                         f"{MAX_SPREAD_PCT:g}%"})
             if len(pairs) > max_pairs:
                 yield sse("log", {"msg": f"{len(pairs)} pairs cleared the pre-filter — "
                                          f"capping at the {max_pairs} most liquid by 24h volume"})
@@ -2311,37 +2423,61 @@ def scan_route():
             yield sse("log", {"msg": f"{len(pairs)} candidates · {dropped} too illiquid to be worth "
                                      f"fetching · 7-day volume checked per pair next"})
 
-        spd = SPEED[speed]
-        limiter = RateLimiter(spd["rps"].get(exid, 8))
-        btc = fetch_btc(main_ex, limiter)
+        btc = fetch_btc(main_ex, V[primary]["limiter"])
         if btc is None:
             yield sse("log", {"msg": "BTC 4H candles unavailable: every setup is tagged COUNTER TREND "
                                      "and scored without the BTC component (PARTIAL DATA)"})
         _charts.clear()
         workers = spd["workers"]
+        by_venue = " · ".join(f"{v.upper()} {sum(1 for p in pairs if p[0] == v)}" for v in V)
         yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on 4H + 1H · "
-                                 f"{strictness} · {workers} workers"})
+                                 f"{strictness} · {workers} workers" +
+                                 (f" ({by_venue})" if merged else "")})
         yield sse("total", {"total": len(pairs)})
 
         tls = threading.local()
 
-        def worker_ex():
-            ex = getattr(tls, "ex", None)
-            if ex is None:
-                ex = make_exchange(exid, rate_limit=False)
-                ex.set_markets(mkts)          # reuse markets — no extra API call
-                tls.ex = ex
-            return ex
+        def worker_ex(v):
+            # one ccxt instance per thread per venue (the sync throttle is not thread-safe)
+            exs = tls.__dict__.setdefault("exs", {})
+            if v not in exs:
+                exs[v] = make_exchange(v, rate_limit=False)
+                exs[v].set_markets(V[v]["mkts"])     # reuse markets — no extra API call
+            return exs[v]
 
         q = queue.Queue()
         counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0,
-                   "no_1h": 0}
+                   "no_1h": 0, "atr_reject": 0, "short_history": 0, "oi_reject": 0}
         clock = threading.Lock()
+        hist_min = 80 if only_syms else MIN_HISTORY
 
-        def scan_pair(sym):
+        def confirm(v, base, rows):
+            """Venues (other than v) where the same side fires within one bar of
+            each row's primary signal. A venue that fails to fetch confirms nothing."""
+            ok = {id(r): [] for r in rows}
+            for o, osym in listed[base].items():
+                if o == v:
+                    continue
+                for tf in {r["primary_tf"] for r in rows}:
+                    try:
+                        raw = fetch_df_deep(worker_ex(o), V[o]["limiter"], osym, tf, TF_CFG[tf]["bars"])
+                        if raw is None or len(raw) < 80:
+                            continue
+                        df = drop_forming_candle(raw, TF_CFG[tf]["minutes"])
+                        fdf, df = forming_df(raw, df), with_indicators(df)
+                        for r in rows:
+                            if r["primary_tf"] == tf and venue_confirms(r["signals"][tf], df, fdf, rules):
+                                ok[id(r)].append(o)
+                    except Exception:
+                        continue
+            return ok
+
+        def scan_pair(item):
+            v, sym = item
             base = sym.split("/")[0]
+            limiter, funding = V[v]["limiter"], V[v]["funding"]
             try:
-                ex = worker_ex()
+                ex = worker_ex(v)
                 raw = fetch_df_deep(ex, limiter, sym, "4h", TF_CFG["4h"]["bars"])
                 if raw is None or len(raw) < 80:
                     with clock:
@@ -2360,7 +2496,7 @@ def scan_route():
 
                 # The volume gate runs on 4H alone, so a pair that fails it
                 # never costs a 1H fetch.
-                wk_vol = weekly_usd_volume(df4, vol24.get(sym), TF_CFG["4h"]["minutes"])
+                wk_vol = weekly_usd_volume(df4, vol24.get(item), TF_CFG["4h"]["minutes"])
                 if not only_syms and (wk_vol is None or wk_vol < min_vol):
                     with clock:
                         counter["vol_reject"] += 1
@@ -2371,6 +2507,11 @@ def scan_route():
                 if len(df4) < 80:
                     with clock:
                         counter["no_data"] += 1
+                    return
+                if not only_syms and atr_pct_out_of_range(float(df4["atr"].iloc[-1]),
+                                                          float(df4["close"].iloc[-1])):
+                    with clock:
+                        counter["atr_reject"] += 1
                     return
 
                 df1 = f1 = None
@@ -2385,16 +2526,31 @@ def scan_route():
                     with clock:
                         counter["no_1h"] += 1
 
+                # History: a timeframe under hist_min completed bars is not analysed
+                # (its frame still serves as the other timeframe's HTF / trigger).
+                usable = [d for d in (df4, df1) if d is not None and len(d) >= 80]
+                deep = [d for d in usable if len(d) >= hist_min]
+                if len(deep) < len(usable):
+                    with clock:
+                        counter["short_history"] += len(usable) - len(deep)
+                if not deep:
+                    return
                 with clock:
                     counter["analysed"] += 1
 
-                sigs = (signals_for_tf(df4, "4h", rules, live_price, sym, wk_vol, f4) +
-                        signals_for_tf(df1, "1h", rules, live_price, sym, wk_vol, f1))
+                sigs = (signals_for_tf(df4 if len(df4) >= hist_min else None, "4h", rules,
+                                       live_price, sym, wk_vol, f4) +
+                        signals_for_tf(df1 if df1 is not None and len(df1) >= hist_min else None,
+                                       "1h", rules, live_price, sym, wk_vol, f1))
                 if not sigs:
                     return
                 # Everything below is fetched only for pairs worth a row.
                 mover, flow, cerr, d1, oi_d = pair_context(ex, limiter, sym, live_price,
                                                            funding.get(sym), wk_vol)
+                if not only_syms and oi_too_thin(oi_d, live_price):
+                    with clock:
+                        counter["oi_reject"] += 1
+                    return
                 d1 = with_indicators(d1) if d1 is not None else None
                 oi_h = df15 = None
                 if any(s["fresh"] for s in sigs):       # stale signals answer No whatever the grade
@@ -2405,7 +2561,11 @@ def scan_route():
                 grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, funding.get(sym), btc)
                 for s in sigs:
                     _charts[f"{sym}|{s['side']}|{s['tf']}"] = (s.pop("_df"), s.pop("_d"), dict(s))
-                for row in build_rows(sigs, mover, flow, cerr, blocker, macro):
+                rows = build_rows(sigs, mover, flow, cerr, blocker, macro)
+                ok = confirm(v, base, rows) if merged else {}
+                for row in rows:
+                    row["exchange"] = v
+                    row["venue_tags"] = venue_tags(v, ok[id(row)]) if merged else []
                     q.put(("result", row))
             except Exception as e:
                 with clock:
@@ -2444,6 +2604,9 @@ def scan_route():
                     "dispatched": len(pairs), "scanned": c["analysed"],
                     "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
                     "errors": c["errors"], "no_1h": c["no_1h"], "no_ticker": no_ticker,
+                    "venues": list(V), "spread_rejected": spread_reject,
+                    "atr_rejected": c["atr_reject"], "short_history": c["short_history"],
+                    "oi_rejected": c["oi_reject"],
                     "complete": done.is_set() and q.empty()}
             with _lock:
                 _state["results"] = results
@@ -2988,7 +3151,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
 <div id="pg-scan" class="page active">
   <aside class="sb">
     <div class="ss"><div class="fl">Exchange</div>
-      <select id="exchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select></div>
+      <select id="exchange"><option value="all" selected>All (Binance first)</option><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
+      <div class="hint">All: Binance data, OKX / Bybit for coins Binance does not list, and each setup checked on the other venues (ALSO ON).</div></div>
 
     <div class="ss"><div class="fl">Minimum weekly volume ($M)</div>
       <div class="nw"><button class="nb" onclick="stepVol(-10)">-</button><input type="number" id="minVol" value="__DEFAULT_VOL_M__" min="5" max="2000" step="10"><button class="nb" onclick="stepVol(10)">+</button></div>
@@ -3017,7 +3181,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
 
     <div class="ss"><div class="fl">Specific coins (optional)</div>
       <input type="text" id="symOverride" placeholder="ENS, SOL, TAO">
-      <div class="hint">Comma-separated. Overrides the volume filter entirely &mdash; scans exactly these.</div></div>
+      <div class="hint">Comma-separated. Overrides the volume and thin-coin filters entirely &mdash; scans exactly these.</div></div>
 
     <div class="ss"><button class="rbtn" id="runBtn" onclick="startScan()">Run Scan</button></div>
     <div class="ss" id="pgSec" style="display:none">
@@ -3231,7 +3395,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>A then B, with a real bump between.</b> Two neighbouring troughs, 8 to 80 bars apart. The MACD peak between them must rise at least 25% of the leg's MACD range above the higher trough: that is the middle of the W.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be at least 15% of the leg's MACD range. This is what kills micro-divergences.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Reported only when wave B is closed.</b> The cross that ends wave B is the signal bar and its close is the signal price. Before that cross there is no signal.</div></div>
-      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars.</div></div>
+      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars. Thin coins are left out too: a top-of-book spread above 0.1%, a 4H ATR outside 0.6% to 8% of price, or (for a coin with a setup) open interest under $5M. A timeframe with fewer than 300 completed bars is not analysed, so the 200 EMA has settled. Unknown spread or OI never excludes a coin, and a symbol override skips all of these. The audit line under the table counts each.</div></div>
+      <div class="rule"><div class="rule-n">08</div><div class="rule-b"><b>One row per coin, Binance first.</b> The All exchange setting reads Binance; a coin Binance does not list is read on whichever of OKX / Bybit trades more of it and tagged NOT ON BINANCE. For each row the same detection then runs on the other venues listing the coin, and the row is tagged ALSO ON with those where the same side fires within one bar. A tag, never points. Picking one exchange scans only that one, with no venue tags.</div></div>
     </div>
   </div>
 
@@ -3368,6 +3533,9 @@ function ctxCell(r){
   (primary(r).tags || []).forEach(function(f){
     h.push('<span class="wflag wf-hioi"' + tip(f) + '>' + f + '</span>');
   });
+  (r.venue_tags || []).forEach(function(f){
+    h.push('<span class="wflag wf-hioi"' + tip(f.indexOf('ALSO ON') === 0 ? 'ALSO ON' : f) + '>' + f + '</span>');
+  });
   /* the title comes from an outside calendar feed */
   if(r.macro) h.push('<span class="wflag wf-hioi"' + tip('MACRO') + '>' + calEsc(r.macro) + '</span>');
   if(r.context_error) h.push('<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>');
@@ -3393,6 +3561,10 @@ function auditLine(m){
   var bits = [];
   bits.push(m.scanned + ' of ' + m.dispatched + ' candidate pairs analysed');
   if(m.vol_rejected) bits.push(m.vol_rejected + ' below the 7-day volume floor');
+  if(m.spread_rejected) bits.push(m.spread_rejected + ' spread above 0.1%');
+  if(m.atr_rejected)    bits.push(m.atr_rejected + ' 4H ATR outside 0.6-8% of price');
+  if(m.short_history)   bits.push(m.short_history + ' timeframe(s) skipped: under 300 completed bars');
+  if(m.oi_rejected)     bits.push(m.oi_rejected + ' with a setup dropped: open interest under $5M');
   if(m.no_data)      bits.push(m.no_data + ' returned no usable candles');
   if(m.no_1h)        bits.push(m.no_1h + ' analysed on 4H only (no usable 1H candles)');
   if(m.errors)       bits.push(m.errors + ' errored');
@@ -3453,6 +3625,8 @@ var TIP = {
   'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
   'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
   'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100.',
+  'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is shown under the pair name).',
+  'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.',
   '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags above are exactly that combination. n/a = too little OI history.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
@@ -3467,6 +3641,7 @@ var TAG_GROUPS = [
   ['Pattern tags (about the divergence itself)', ['TRIPLE','W-PATTERN','LTF TRIGGER','15M TRIGGER','ZERO-LINE CROSS']],
   ['Regime (sets how high the grade must be)', ['WITH TREND','CHOP','COUNTER TREND']],
   ['Score', ['PARTIAL DATA']],
+  ['Exchanges (All scan only, e.g. ALSO ON OKX, BYBIT)', ['NOT ON BINANCE','ALSO ON']],
   ['Calendar (shown with the print and its countdown, e.g. MACRO BOJ Policy Rate in 6h)', ['MACRO']],
   ['Open interest: 7-day positioning', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
   ['Open interest: funding and crowding', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
@@ -3692,7 +3867,7 @@ function checkUniverse(){
       btn.disabled = false; btn.textContent = 'How many coins pass?';
       if(d.error){ out.textContent = 'Error: ' + d.error; return; }
       out.innerHTML = '<span style="color:var(--bull)">' + d.passing + '</span> of ' + d.total_perps +
-        ' perps clear this floor on ' + (d.exchange || '').toUpperCase() + '.';
+        ' perps clear this floor on ' + (d.venues || [d.exchange]).join(' / ').toUpperCase() + '.';
     })
     .catch(function(){ btn.disabled = false; btn.textContent = 'How many coins pass?'; out.textContent = 'Failed.'; });
 }
@@ -3843,7 +4018,8 @@ function buildRow(r){
   tr.className = 'main-row ' + (bull ? 'rb' : 'rr') + (verdict(r) === 'skip' ? ' dim' : '');
   var tfs = r.tfs.map(function(t){ return '<span class="tfb' + (t === tf ? ' tfb-on' : '') + '">' + tfLabel(t) + '</span>'; }).join('');
   tr.innerHTML =
-    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP</span></div></td>' +
+    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP' +
+      (r.exchange ? ' &middot; ' + r.exchange.toUpperCase() : '') + '</span></div></td>' +
     '<td>' + evCell(r) + '</td>' +
     '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + (bull ? 'BULLISH' : 'BEARISH') + '</span>' + tfs + '</td>' +
     '<td>' + gradeCell(p) + '</td>' +

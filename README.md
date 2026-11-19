@@ -14,10 +14,23 @@ serves both the API and a browser dashboard.
   exchange, minus stablecoin bases and TradFi perps (stocks/ETFs/commodities
   listed as perps — filtered via exchange instrument metadata, with a name
   backstop). No hardcoded coin basket.
+- **All exchanges (default)**: one row per coin, Binance first. A coin
+  Binance does not list is read on whichever of OKX / Bybit has the larger
+  24h volume and tagged `NOT ON BINANCE`. Each row's primary timeframe is
+  then re-detected on the other venues listing the coin; where the same side
+  fires within one bar the row is tagged `ALSO ON OKX, BYBIT` (only the
+  venues that confirmed). A tag, not points; a venue that fails to fetch
+  never costs the row. The venue the data came from is shown under the pair.
+  Picking one exchange scans only that one, without venue tags.
 - **Liquidity gate**: a pair is only scanned if its true rolling 7-day traded
-  value clears a floor (default $70M/week ≈ $10M/day). This is the only
-  universe filter — there's no trend/regime gate, since regular divergences
-  are counter-trend by definition.
+  value clears a floor (default $70M/week ≈ $10M/day).
+- **Thin-coin filters**: a top-of-book spread above 0.10% or a 4H ATR outside
+  0.6%–8% of price keeps a pair out of the scan; a timeframe with fewer than
+  300 completed bars is not analysed on that timeframe; a pair with a setup
+  but under $5M open interest (latest daily OI point) has its rows dropped.
+  Unknown spread or OI never filters, a symbol override skips all four, and
+  the audit line counts each. There's no trend/regime gate, since regular
+  divergences are counter-trend by definition.
 - **Divergence detection**: the MACD/signal crossovers split the MACD line
   into waves. Each wave below the signal line is one trough (above it, one
   peak). Two neighbouring troughs A and B, 8 to 80 bars apart with a real
@@ -170,7 +183,8 @@ without re-scanning.
 
 Common query params (all optional, sane defaults apply):
 
-- `exchange` — `okx` (default), `binance`, or `bybit`
+- `exchange` — `all` (default for `/scan` and `/universe`: Binance first, see
+  above), `okx`, `binance`, or `bybit`. `/movers` takes one exchange (default `okx`)
 - `strictness` — `balanced` (default) or `strict`
 - `speed` — `safe`, `normal` (default), `fast`
 - `min_weekly_vol` — liquidity floor in USD (default `70000000`)
@@ -252,8 +266,9 @@ turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
    time.
 
 The *Specific coins* box scans only the tickers you type and skips the
-volume floor, so a thin name can still be checked on demand. Use the
-exchange with the deepest book (Binance for most pairs).
+volume floor and the thin-coin filters, so a thin name can still be checked
+on demand. Use the exchange with the deepest book (Binance for most pairs),
+or All.
 
 ## Disclaimer
 

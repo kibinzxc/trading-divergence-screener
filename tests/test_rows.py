@@ -12,7 +12,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import macd_divergence_screener_v5 as m  # noqa: E402
 
-SIG = {"status": "active", "fresh": True, "bars_ago": 2, "r_reached": 0.0,
+SIG = {"tf": "1h", "status": "active", "fresh": True, "bars_ago": 2, "r_reached": 0.0,
        "pct_chg": 0.4, "signal_price": 100.0, "stop_price": 97.0, "risk_pct": 3.0,
        "grade": "A", "score": 74, "regime": "WITH TREND",
        "forming": False, "trigger_first": False}
@@ -45,7 +45,11 @@ class EntryVerdict(unittest.TestCase):
     def test_old_signal_bar_is_no(self):
         v = m.entry_verdict(sig(fresh=False, bars_ago=20))
         self.assertEqual(v["verdict"], "skip")
-        self.assertIn("20 bars ago", v["reason"])
+        self.assertIn("closed 20h ago", v["reason"])
+        self.assertIn("limit on 1H is 8h", v["reason"])
+        v = m.entry_verdict(sig(tf="4h", fresh=False, bars_ago=7))
+        self.assertIn("closed 28h ago", v["reason"])
+        self.assertIn("limit on 4H is 24h", v["reason"])
 
     def test_grade_c_is_no(self):
         v = m.entry_verdict(sig(grade="C", score=41))
@@ -66,13 +70,24 @@ class EntryVerdict(unittest.TestCase):
         self.assertEqual((v["verdict"], v["level"]), ("wait", 100.0))
         self.assertIn("3.1%", v["reason"])
 
-    def test_event_inside_24h_is_wait_and_names_the_event(self):
-        v = m.entry_verdict(sig(), 14.2, "CPI m/m")
+    def test_blocker_inside_the_timeframe_window_is_wait_and_names_it(self):
+        v = m.entry_verdict(sig(), (3.2, "CPI m/m"))
         self.assertEqual(v["verdict"], "wait")
-        self.assertIn("CPI m/m is due in 14h", v["reason"])
+        self.assertIn("CPI m/m is due in 3h", v["reason"])
+        v = m.entry_verdict(sig(tf="4h"), (11.8, "FOMC Statement"))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("FOMC Statement is due in 12h", v["reason"])
 
-    def test_event_beyond_24h_or_unknown_does_not_block(self):
-        self.assertEqual(self.verdict(sig(), 30.0, "CPI m/m"), "enter")
+    def test_blocker_that_printed_in_the_last_hour_is_wait(self):
+        v = m.entry_verdict(sig(), (-0.5, "Non-Farm Employment Change"))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("Non-Farm Employment Change printed 30m ago", v["reason"])
+
+    def test_blocker_outside_the_window_or_unknown_does_not_block(self):
+        self.assertEqual(self.verdict(sig(), (4.5, "CPI m/m")), "enter")        # 1H waits 4h
+        self.assertEqual(self.verdict(sig(tf="4h"), (4.5, "CPI m/m")), "wait")
+        self.assertEqual(self.verdict(sig(tf="4h"), (12.5, "CPI m/m")), "enter")  # 4H waits 12h
+        self.assertEqual(self.verdict(sig(), (-1.5, "CPI m/m")), "enter")
         self.assertEqual(self.verdict(sig(), None), "enter")
 
     def test_forming_bar_is_early_only_with_the_trigger(self):
@@ -84,26 +99,52 @@ class EntryVerdict(unittest.TestCase):
         self.assertIn("still forming", v["reason"])
 
     def test_rules_apply_in_order(self):
-        self.assertEqual(self.verdict(sig(status="invalidated"), 2.0, "FOMC"), "skip")
+        self.assertEqual(self.verdict(sig(status="invalidated"), (2.0, "FOMC")), "skip")
+        self.assertIn("pull back", m.entry_verdict(sig(status="extended"), (2.0, "FOMC"))["reason"])
         self.assertEqual(self.verdict(sig(grade="C", regime="COUNTER TREND")), "skip")
         self.assertIn("Watch only", m.entry_verdict(
             sig(grade="B", regime="COUNTER TREND", status="extended"))["reason"])
 
 
-class NextMover(unittest.TestCase):
+def ev(ts, title, currency="USD", mover=True):
+    return {"ts": ts, "title": title, "currency": currency, "mover": mover}
+
+
+class MacroWindow(unittest.TestCase):
     NOW = dt.datetime(2026, 11, 19, 12, 0, tzinfo=dt.timezone.utc)
-    EVENTS = [
-        {"ts": "2026-11-19T10:00:00Z", "mover": True,  "title": "Past print"},
-        {"ts": "2026-11-19T15:00:00Z", "mover": False, "title": "Not a mover"},
-        {"ts": "2026-11-20T13:30:00Z", "mover": True,  "title": "CPI m/m"},
-        {"ts": "2026-11-21T19:00:00Z", "mover": True,  "title": "FOMC Statement"},
-    ]
 
-    def test_nearest_future_mover(self):
-        self.assertEqual(m.next_mover(self.EVENTS, self.NOW), (25.5, "CPI m/m"))
+    def test_nearest_blocker_and_nearest_other_mover(self):
+        events = [ev("2026-11-19T10:00:00Z", "CPI m/m"),                 # printed 2h ago: over
+                  ev("2026-11-19T15:00:00Z", "Unemployment Claims", mover=False),
+                  ev("2026-11-19T15:00:00Z", "CPI m/m", "CAD", mover=False),
+                  ev("2026-11-19T20:00:00Z", "FOMC Meeting Minutes"),    # a mover, not a blocker
+                  ev("2026-11-19T18:00:00Z", "BOJ Policy Rate", "JPY"),
+                  ev("2026-11-20T13:30:00Z", "Core PCE Price Index m/m"),
+                  ev("2026-11-21T19:00:00Z", "FOMC Statement")]
+        self.assertEqual(m.macro_window(events, self.NOW),
+                         ((25.5, "Core PCE Price Index m/m"), (6.0, "BOJ Policy Rate")))
 
-    def test_none_when_nothing_is_scheduled(self):
-        self.assertEqual(m.next_mover([], self.NOW), (None, ""))
+    def test_a_blocker_keeps_blocking_for_an_hour_after_it_printed(self):
+        events = [ev("2026-11-19T11:30:00Z", "Non-Farm Employment Change"),
+                  ev("2026-11-19T14:00:00Z", "Federal Funds Rate")]
+        self.assertEqual(m.macro_window(events, self.NOW)[0], (-0.5, "Non-Farm Employment Change"))
+
+    def test_every_blocker_on_the_list(self):
+        for t in ("CPI m/m", "Core CPI m/m", "Core PCE Price Index m/m", "PPI m/m", "Core PPI m/m",
+                  "Non-Farm Employment Change", "Unemployment Rate", "Federal Funds Rate",
+                  "FOMC Statement", "FOMC Press Conference", "Fed Chair Powell Speaks",
+                  "Fed Chair Powell Testifies"):
+            self.assertEqual(m.macro_window([ev("2026-11-19T14:00:00Z", t)], self.NOW),
+                             ((2.0, t), None), t)
+        for t in ("Average Hourly Earnings m/m", "Advance GDP q/q", "Retail Sales m/m",
+                  "ISM Manufacturing PMI", "FOMC Economic Projections"):
+            self.assertEqual(m.macro_window([ev("2026-11-19T14:00:00Z", t)], self.NOW),
+                             (None, (2.0, t)), t)
+
+    def test_other_movers_only_within_24h_and_none_when_nothing_is_scheduled(self):
+        self.assertEqual(m.macro_window([ev("2026-11-20T13:00:00Z", "Main Refinancing Rate", "EUR")],
+                                        self.NOW), (None, None))
+        self.assertEqual(m.macro_window([], self.NOW), (None, None))
 
 
 def oi_hist(values):
@@ -184,10 +225,17 @@ class BuildRows(unittest.TestCase):
     def test_context_and_event_are_carried_onto_the_row(self):
         rows = m.build_rows([full_sig("1h", "bearish")], mover={"flags": ["VOLUME SPIKE"]},
                             flow=None, context_error=None,
-                            hours_to_event=3.0, event_title="FOMC Statement")
+                            blocker=(3.0, "FOMC Statement"), macro=(6.2, "BOJ Policy Rate"))
         r = rows[0]
         self.assertEqual((r["mover"], r["flow"]), ({"flags": ["VOLUME SPIKE"]}, None))
         self.assertIn("FOMC Statement is due in 3h", r["entry"]["reason"])
+        self.assertEqual(r["macro"], "MACRO BOJ Policy Rate in 6h")
+        self.assertIsNone(m.build_rows([full_sig("1h", "bearish")])[0]["macro"])
+
+    def test_a_blocker_6h_out_holds_the_4h_signal_but_not_the_1h(self):
+        r = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bullish")],
+                         blocker=(6.0, "CPI m/m"))[0]
+        self.assertEqual((r["primary_tf"], r["entry"]["verdict"]), ("1h", "enter"))
 
 
 if __name__ == "__main__":

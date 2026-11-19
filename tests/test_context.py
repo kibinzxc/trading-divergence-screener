@@ -127,15 +127,18 @@ def trend_frame(freq, direction):
     return pd.DataFrame({"macd": direction * np.arange(900.0)}, index=idx)
 
 
-def ltf_for(sig):
-    """15m frame whose MACD crosses up 2 bars after the signal bar opens and
-    whose close clears the swing high (bar 10) 4 bars later. It starts at B."""
-    n, i0 = 70, int((sig["signal_ms"] - sig["b_ms"]) // 900_000)
-    high = np.full(n, 101.0); high[10] = 105; high[i0 + 6:] = 107
-    close = np.full(n, 100.0); close[i0 + 6:] = 106
+def ltf_for(sig, minutes=15, price=106.0, delay=4):
+    """Lower-timeframe frame whose MACD crosses up 2 bars after the signal bar
+    opens and whose close (`price`) clears the swing high (bar 10, 105) `delay`
+    bars later. It starts at B."""
+    i0 = int((sig["signal_ms"] - sig["b_ms"]) // (minutes * 60_000))
+    n, t = i0 + delay + 30, i0 + 2 + delay
+    high = np.full(n, 101.0); high[10] = 105; high[t:] = price + 1
+    close = np.full(n, 100.0); close[t:] = price
     d = np.full(n, -1.0); d[i0 + 2:] = 1
     return pd.DataFrame({"high": high, "low": 99.0, "close": close, "macd": d, "signal": 0.0},
-                        index=pd.date_range(pd.Timestamp(sig["b_ms"], unit="ms"), periods=n, freq="15min"))
+                        index=pd.date_range(pd.Timestamp(sig["b_ms"], unit="ms"), periods=n,
+                                            freq=f"{minutes}min"))
 
 
 class GradeSignals(unittest.TestCase):
@@ -164,9 +167,37 @@ class GradeSignals(unittest.TestCase):
         ok = self.grade(self.sig(), df15=ltf_for(s))
         self.assertIsNotNone(ok["trigger_price"])
         self.assertIn("LTF TRIGGER", ok["tags"])
+        self.assertNotIn("15M TRIGGER", ok["tags"])               # 15m IS a 1H signal's LTF
         wrong = self.grade(self.sig(), df1=ltf_for(s))            # 15m frame in the 1H slot
         self.assertIsNone(wrong["trigger_price"])
         self.assertNotIn("LTF TRIGGER", wrong["tags"])
+
+    def test_a_4h_signal_takes_both_triggers_and_the_price_of_the_first_to_close(self):
+        s = self.sig("4h")
+        self.assertTrue(s["fresh"])
+        h1, m15 = ltf_for(s, 60, price=108.0), ltf_for(s, 15, price=106.0)   # 15m closes first
+        both = self.grade(self.sig("4h"), df1=h1, df15=m15)
+        self.assertEqual([t for t in both["tags"] if "TRIGGER" in t], ["LTF TRIGGER", "15M TRIGGER"])
+        self.assertEqual((both["trigger_price"], both["trigger_first"]), (106.0, True))
+        only_1h = self.grade(self.sig("4h"), df1=h1)
+        self.assertEqual([t for t in only_1h["tags"] if "TRIGGER" in t], ["LTF TRIGGER"])
+        self.assertEqual((only_1h["trigger_price"], only_1h["trigger_first"]), (108.0, False))
+        late_1h = self.grade(self.sig("4h"), df1=ltf_for(s, 60, price=108.0, delay=40), df15=m15)
+        self.assertEqual(late_1h["trigger_price"], 106.0)
+
+    def test_a_15m_trigger_counts_only_within_8h_of_the_4h_close(self):
+        s = self.sig("4h")
+        # trigger bar index i0+2+delay closes (delay+3) x 15m after the 4H bar opens
+        on_time = self.grade(self.sig("4h"), df15=ltf_for(s, delay=45))     # closes at +8h
+        self.assertIn("15M TRIGGER", on_time["tags"])
+        late = self.grade(self.sig("4h"), df15=ltf_for(s, delay=46))        # +8h15m
+        self.assertNotIn("15M TRIGGER", late["tags"])
+        self.assertIsNone(late["trigger_price"])
+
+    def test_a_stale_4h_signal_gets_no_15m_trigger(self):
+        s = self.sig("4h", n=102)
+        self.assertFalse(s["fresh"])
+        self.assertNotIn("15M TRIGGER", self.grade(s, df15=ltf_for(s))["tags"])
 
     def test_oi_uses_hourly_when_it_covers_wave_b_else_daily(self):
         s = self.sig()

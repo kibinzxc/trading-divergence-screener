@@ -36,8 +36,9 @@ class Config(unittest.TestCase):
     def test_loose_is_gone(self):
         self.assertEqual(sorted(m.STRICTNESS), ["balanced", "strict"])
 
-    def test_signal_goes_stale_after_6_bars_on_4h_and_12_on_1h(self):
-        self.assertEqual((m.TF_CFG["4h"]["fresh"], m.TF_CFG["1h"]["fresh"]), (6, 12))
+    def test_signal_goes_stale_after_24_hours_on_4h_and_8_on_1h(self):
+        self.assertEqual((m.TF_CFG["4h"]["fresh_h"], m.TF_CFG["1h"]["fresh_h"]), (24, 8))
+        self.assertNotIn("fresh", m.TF_CFG["4h"])
 
     def test_the_pivot_detector_is_gone(self):
         for name in ("detect_divergences", "swing_pivots", "setup_score", "PIVOT_SYNC"):
@@ -67,7 +68,12 @@ class SignalsForTf(unittest.TestCase):
         self.assertNotIn("_b", s)
 
     def test_same_signal_is_stale_on_4h(self):
-        self.assertEqual([s["fresh"] for s in self.run_tf(wave_df(LONG), "4h")], [False])
+        self.assertEqual([s["fresh"] for s in self.run_tf(wave_df(LONG), "4h")], [False])   # 28h
+        self.assertEqual([s["fresh"] for s in self.run_tf(wave_df(LONG).iloc[:101], "4h")], [True])  # 24h
+
+    def test_1h_signal_is_stale_after_8_hours(self):
+        out = self.run_tf(wave_df(LONG[:-1] + [(10, 1, 0)]))     # 104 bars, 9 bars after the signal
+        self.assertEqual([(s["bars_ago"], s["fresh"]) for s in out], [(9, False)])
 
     def test_too_few_bars_gives_nothing(self):
         self.assertEqual(self.run_tf(wave_df(LONG).iloc[:60]), [])

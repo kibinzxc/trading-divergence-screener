@@ -57,19 +57,28 @@ serves both the API and a browser dashboard.
   shows which. Click a row for each timeframe's levels and a chart of the
   A-to-B leg with the troughs, crossovers, stop and 1R / 2R / 3R drawn in.
 - **Good to enter?**: every row answers Yes, Not yet or No in plain language.
-  First matching rule wins. No: stop hit, already ran 1R, signal bar older
-  than 6 bars (4H) or 12 bars (1H), or grade C. Not yet: counter trend below
-  grade A, price more than 2% past the signal price, or a market-mover print
-  inside 24 hours. Otherwise `Yes (confirmed)`. A signal bar that is still
+  First matching rule wins. No: stop hit, already ran 1R, signal bar closed
+  more than 24 hours ago (4H) or 8 hours ago (1H), or grade C. Not yet:
+  counter trend below grade A, price more than 2% past the signal price, or
+  a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment
+  rate, FOMC rate / statement / press conference, Fed Chair) due within 12
+  hours for a 4H signal or 4 hours for a 1H signal, or printed in the last
+  hour (`MACRO_BLOCKERS`, `MACRO_WAIT_H`). The other market movers never
+  block; one due within 24 hours shows as a `MACRO <name> in Xh` tag.
+  Otherwise `Yes (confirmed)`. A signal bar that is still
   forming is listed as provisional: `Yes (early)` if the lower timeframe (1H
   for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last
-  swing since B, otherwise Not yet. It is a checklist judged at scan time,
+  swing since B, otherwise Not yet. A 4H signal also checks 15m (tag
+  `15M TRIGGER`, counted only if it closes within 8 hours of the 4H close);
+  the trigger price is whichever trigger closed first. It is a checklist judged at scan time,
   not a prediction; the page dims answers once the scan is over an hour old.
 - **Context tags**: for coins that have a divergence, the scan also reads the
   last completed day against the coin's 20-day baseline (volume spike, range
   expansion, at the 7-day high or low) and 7-day open-interest flow with
   funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
-  change the answer. Pattern tags sit in the same column: TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS.
+  change the answer, and neither does `MACRO` (a non-blocking market mover
+  due within 24 hours). Pattern tags sit in the same column: TRIPLE,
+  W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS.
 - **Movers tab** (`/movers`): a separate scan of every liquid crypto perp for
   an unusual last completed day (5%+ move, 2x its 20-day volume, or 1.5x its
   ATR20), whether or not the coin diverges. Each row lists the prior-day and
@@ -224,8 +233,10 @@ turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
 
 ## Reading a row
 
-1. **Check the calendar strip first.** If a market mover is inside 24 hours,
-   every otherwise-ready row answers Not yet and names the event.
+1. **Check the calendar strip first.** A high-impact USD print within 12
+   hours holds every otherwise-ready 4H row at Not yet (within 4 hours, the
+   1H rows too), and so does one printed in the last hour; the reason names
+   the event. The other movers show as a `MACRO` tag on the row instead.
 2. **Read the audit line.** A short list from an unfinished scan is not a
    quiet market.
 3. **Start with the Yes rows, highest grade first.** Click a row and check

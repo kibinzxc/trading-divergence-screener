@@ -11,7 +11,8 @@ only once the cross that ends wave B has printed: that bar is the signal bar.
 Each signal gets a 0-100 quality score and an A/B/C grade (score_signal), a
 WITH TREND / CHOP / COUNTER TREND tag from the BTC 4H state (RSI and 200 EMA,
 btc_state) and the coin's 200 EMA, and an
-optional early entry from the lower timeframe (ltf_trigger). `--backtest`
+optional early entry from the lower timeframe (ltf_trigger; a 4H signal also
+checks 15m). `--backtest`
 replays the same detector bar by bar (backtest_pair) and reports win rate and
 R per grade and regime. Everything below about pivots, PIVOT_SYNC, the clean
 line and the setup score describes the detector this replaced.
@@ -142,15 +143,16 @@ STOP_ATR       = 0.25   # the stop sits this many ATR beyond price extreme B
 OI_AGAINST_PCT = 5.0    # OI rising more than this into B, against the signal, costs points
 GRADE_A, GRADE_B = 70, 55
 
-# Per-timeframe settings. `fresh` is how many bars a closed signal bar stays
-# enterable. htf / ltf are the timeframes used for agreement and for the
-# early-entry trigger.
+# Per-timeframe settings. `fresh_h` is how many hours after its close a signal
+# bar stays enterable (counted in bars, so the backtest stays deterministic).
+# htf / ltf are the timeframes used for agreement and for the early-entry trigger.
 TF_CFG = {
-    "4h": {"label": "4H", "minutes": 240, "bars": 720, "fresh": 6,
+    "4h": {"label": "4H", "minutes": 240, "bars": 720, "fresh_h": 24,
            "htf_minutes": 1440, "ltf": "1h", "ltf_minutes": 60},
-    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "fresh": 12,
+    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "fresh_h": 8,
            "htf_minutes": 240, "ltf": "15m", "ltf_minutes": 15},
 }
+LTF15_WINDOW_H = 8    # a 4H signal's 15m trigger must close within this many hours of the 4H close
 
 # Minimum divergence size. Strict also wants both troughs below zero
 # (both peaks above zero for bearish).
@@ -294,7 +296,7 @@ MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
 STATE_VERSION = 3    # scan_state.json written by an older row shape is ignored
 HTF_BARS_1D   = 200   # daily history, for the 4H signal's higher-timeframe check
-LTF_BARS_15M  = 300   # 15m history, for the 1H signal's early-entry trigger
+LTF_BARS_15M  = 300   # 15m history (75h), for the 1H and 4H signals' early-entry triggers
 
 # ── News calendar ──────────────────────────────────────────────────────────────
 # Scheduled macro prints, so a setup is never sized into a CPI or FOMC release
@@ -340,6 +342,12 @@ CAL_MOVERS = [
     ("GBP", r"^official bank rate"),
 ]
 _CAL_MOVERS_RE = [(c, re.compile(p, re.I)) for c, p in CAL_MOVERS]
+# The USD movers that hold an entry (spec "Good to enter?" rule 10). Every
+# other mover above only puts a MACRO tag on the row.
+MACRO_BLOCKERS = [re.compile(p, re.I) for p in (
+    r"^(core )?cpi\b", r"^core pce", r"^(core )?ppi\b", r"^non-farm employment",
+    r"^unemployment rate", r"^federal funds rate", r"^fomc (statement|press conference)",
+    r"^fed chair \w+ (speaks|testifies)")]
 
 # ── Server state ───────────────────────────────────────────────────────────────
 _state = {"results": [], "ts": None, "meta": {}}
@@ -571,7 +579,8 @@ def _mk(df, d, cfg, forming=False):
         "signal_price": px(sp), "stop_price": stop,
         "signal_risk": max((sp - stop) if bull else (stop - sp), sp * 0.005),
         "structure_target": px(float(df["high" if bull else "low"].iloc[d["bump_bar"]])),
-        "bars_ago": n - 1 - sb, "fresh": (n - 1 - sb) <= cfg["fresh"], "forming": forming,
+        "bars_ago": n - 1 - sb, "fresh": (n - 1 - sb) * cfg["minutes"] / 60 <= cfg["fresh_h"],
+        "forming": forming,
         "b_start_ms": ms(d["b_start"]), "b_ms": ms(bp), "signal_ms": ms(sb),
         "signal_close_ms": ms(sb) + cfg["minutes"] * 60_000,
         "above_ema200": bool(sp > float(df["ema200"].iloc[sb])),
@@ -710,24 +719,29 @@ def regime_tag(side, above_ema200, state):
     return "WITH TREND" if ok else "COUNTER TREND"
 
 
-def finish_signal(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None, trigger=None):
+def finish_signal(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None, trigger=None,
+                  trigger15=None):
     """Score, grade, regime, trigger, tags and targets.
 
     Called once without context so a signal is always complete, and again by
-    add_context() once the scan has fetched the outside data. `trigger` is
-    (price, close time in ms of the trigger bar) or None.
+    add_context() once the scan has fetched the outside data. `trigger` (the
+    lower-timeframe trigger) and `trigger15` (a 4H signal's 15m trigger) are
+    (price, close time in ms of the trigger bar) or None; the price comes from
+    whichever closed first.
     """
     sig["score"], sig["grade"], sig["partial"] = score_signal(sig, htf_ok, oi_chg, fund, btc_state)
     sig["htf_ok"] = htf_ok
     sig["oi_chg_pct"] = None if oi_chg is None else round(oi_chg, 1)
     sig["btc_state"] = btc_state
     sig["regime"] = regime_tag(sig["side"], sig["above_ema200"], btc_state)
-    sig["trigger_price"] = px(trigger[0]) if trigger else None
+    first = min((t for t in (trigger, trigger15) if t), key=lambda t: t[1], default=None)
+    sig["trigger_price"] = px(first[0]) if first else None
     # "first" = the trigger bar closed before the signal bar did
-    sig["trigger_first"] = bool(trigger and (sig["forming"] or trigger[1] < sig["signal_close_ms"]))
+    sig["trigger_first"] = bool(first and (sig["forming"] or first[1] < sig["signal_close_ms"]))
     sig["tags"] = [t for t, on in (("TRIPLE", sig["triple"]),
                                    ("W-PATTERN", sig["bump_frac"] >= 0.5),
                                    ("LTF TRIGGER", bool(trigger)),
+                                   ("15M TRIGGER", bool(trigger15)),
                                    ("ZERO-LINE CROSS", sig["zero_cross"]),
                                    ("PARTIAL DATA", sig["partial"])) if on]
     sig.update(build_targets(sig))
@@ -801,24 +815,30 @@ def btc_state_at(btc, close_ts):
     return btc_state(*(asof(btc[k], t) for k in ("rsi", "close", "ema200")))
 
 
-def add_context(sig, htf, ltf, oi_hist, fund, btc):
+def add_context(sig, htf, ltf, oi_hist, fund, btc, ltf15=None):
     """Re-grade a signal with everything fetched for it. Any argument may be
-    None; that component is then unavailable and leaves the score's denominator."""
+    None; that component is then unavailable and leaves the score's denominator.
+    `ltf15` is the 15m frame for a 4H signal's second trigger (spec Step 8); it
+    counts only if it closes within LTF15_WINDOW_H of the 4H close."""
     cfg = TF_CFG[sig["tf"]]
     close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
-    trig = None
+    since, start = pd.Timestamp(sig["b_ms"], unit="ms"), pd.Timestamp(sig["signal_ms"], unit="ms")
+    trig = trig15 = None
     if ltf is not None and sig["fresh"]:
-        trig = ltf_trigger(ltf, sig["side"], pd.Timestamp(sig["b_ms"], unit="ms"),
-                           pd.Timestamp(sig["signal_ms"], unit="ms"), cfg["ltf_minutes"])
+        trig = ltf_trigger(ltf, sig["side"], since, start, cfg["ltf_minutes"])
+    if ltf15 is not None and sig["fresh"]:
+        trig15 = ltf_trigger(ltf15, sig["side"], since, start, 15)
+        if trig15 and trig15[1] > sig["signal_close_ms"] + LTF15_WINDOW_H * 3_600_000:
+            trig15 = None
     return finish_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], sig["side"]),
                          oi_change_pct(oi_hist, sig["b_start_ms"], sig["b_ms"]),
-                         fund, btc_state_at(btc, close_ts), trig)
+                         fund, btc_state_at(btc, close_ts), trig, trig15)
 
 
 def grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, fund, btc):
     """Give each signal the context that belongs to its timeframe.
 
-    4H signal: higher timeframe = 1D (d1), lower = 1H (df1).
+    4H signal: higher timeframe = 1D (d1), lower = 1H (df1), plus the 15m trigger (df15).
     1H signal: higher timeframe = 4H (df4), lower = 15m (df15).
     Open interest: hourly history when it covers wave B, else daily.
     Any frame may be None.
@@ -826,28 +846,35 @@ def grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, fund, btc):
     for s in sigs:
         four = s["tf"] == "4h"
         hist = oi_h if oi_change_pct(oi_h, s["b_start_ms"], s["b_ms"]) is not None else oi_d
-        add_context(s, d1 if four else df4, df1 if four else df15, hist, fund, btc)
+        add_context(s, d1 if four else df4, df1 if four else df15, hist, fund, btc,
+                    df15 if four else None)
     return sigs
 
 
 # ── Entry verdict ──────────────────────────────────────────────────────────────
-EVENT_WAIT_H = 24     # a curated macro print inside this many hours means wait
+MACRO_WAIT_H = {"1h": 4, "4h": 12}   # a USD blocker due inside this many hours means wait
 
 
-def entry_verdict(sig, hours_to_event=None, event_title=""):
+def _hours_txt(h):
+    return f"{h:.0f}h" if h >= 1 else f"{h * 60:.0f}m"
+
+
+def entry_verdict(sig, blocker=None):
     """Is this setup enterable as of the scan? A CHECKLIST, not a prediction.
 
     First matching rule wins (spec "Good to enter?"):
       skip   stop hit · already ran 1R+ · signal bar too old · grade C
       wait   counter trend below grade A · price ran >MOVED_PCT from the signal ·
-             a market-mover print inside EVENT_WAIT_H · signal bar still
-             forming with no lower-timeframe trigger
+             a USD blocker due inside MACRO_WAIT_H or printed in the last
+             hour · signal bar still forming with no lower-timeframe trigger
       enter  none of the above: "Yes (early)" on a forming signal bar,
              "Yes (confirmed)" on a closed one
 
-    `level` is a price the dashboard prints after the reason, so it is
-    formatted in one place (sub-cent prices need plain digits).
+    `blocker` is (hours until it prints, negative once printed, title) from
+    macro_window(), or None. `level` is a price the dashboard prints after the
+    reason, so it is formatted in one place (sub-cent prices need plain digits).
     """
+    cfg = TF_CFG[sig["tf"]]
     def out(verdict, reason, level=None):
         return {"verdict": verdict, "reason": reason, "level": level}
 
@@ -858,8 +885,9 @@ def entry_verdict(sig, hours_to_event=None, event_title=""):
         return out("skip", f"No. Price already moved {sig['r_reached']:g}x the risk toward the "
                            "target. The move has happened; entering now is chasing it.")
     if not sig["fresh"]:
-        return out("skip", f"No. The signal bar closed {sig['bars_ago']} bars ago, "
-                           "too long ago to act on.")
+        return out("skip", f"No. The signal bar closed {sig['bars_ago'] * cfg['minutes'] / 60:g}h "
+                           f"ago, too long ago to act on (the limit on {cfg['label']} is "
+                           f"{cfg['fresh_h']}h).")
     if sig["grade"] == "C":
         return out("skip", f"No. Weak setup: grade C, score {sig['score']} of 100.")
     if sig["regime"] == "COUNTER TREND" and sig["grade"] != "A":
@@ -869,9 +897,13 @@ def entry_verdict(sig, hours_to_event=None, event_title=""):
         return out("wait", f"Not yet. Price has already moved {sig['pct_chg']:g}% away from the "
                            "signal. Wait for it to pull back to",
                    sig["signal_price"])
-    if hours_to_event is not None and hours_to_event <= EVENT_WAIT_H:
-        return out("wait", f"Not yet. {event_title} is due in {hours_to_event:.0f}h and can "
-                           "whip price. Wait until it has passed.")
+    if blocker and -1 <= blocker[0] <= MACRO_WAIT_H[sig["tf"]]:
+        h, title = blocker
+        if h > 0:
+            return out("wait", f"Not yet. {title} is due in {_hours_txt(h)} and can whip price. "
+                               "Wait until it has passed.")
+        return out("wait", f"Not yet. {title} printed {_hours_txt(-h)} ago. Give price the "
+                           "first hour to settle.")
     if sig["forming"] and not sig["trigger_first"]:
         return out("wait", "Not yet. The signal bar is still forming and the lower timeframe "
                            "has not triggered. Wait for the bar to close.")
@@ -884,19 +916,24 @@ def entry_verdict(sig, hours_to_event=None, event_title=""):
                sig["stop_price"])
 
 
-def next_mover(events, now):
-    """(hours until the next curated market mover, its title), or (None, "")."""
-    best = (None, "")
+def macro_window(events, now):
+    """(blocker, other), each (hours from now, title) or None.
+
+    blocker: the nearest USD MACRO_BLOCKERS print, including one that printed
+    within the last hour (negative hours). other: the nearest remaining curated
+    mover due within 24h, which only tags the row."""
+    blocker = other = None
     for e in events:
-        if not e.get("mover"):
-            continue
         ts = _cal_parse_ts("iso", e.get("ts"))
-        if ts is None or ts <= now:
+        if ts is None:
             continue
-        h = (ts - now).total_seconds() / 3600.0
-        if best[0] is None or h < best[0]:
-            best = (h, e.get("title", ""))
-    return best
+        h, title = (ts - now).total_seconds() / 3600.0, e.get("title", "")
+        if e.get("currency") == "USD" and any(rx.search(title.strip()) for rx in MACRO_BLOCKERS):
+            if h >= -1 and (blocker is None or h < blocker[0]):
+                blocker = (h, title)
+        elif e.get("mover") and 0 < h <= 24 and (other is None or h < other[0]):
+            other = (h, title)
+    return blocker, other
 
 
 # ── Exchange helpers ───────────────────────────────────────────────────────────
@@ -1815,14 +1852,16 @@ def dedupe(sigs):
 _VERDICT_RANK = {"enter": 0, "wait": 1, "skip": 2}
 
 
-def build_rows(sigs, mover=None, flow=None, context_error=None,
-               hours_to_event=None, event_title=""):
+def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, macro=None):
     """One row per side for ONE pair's signals across timeframes.
 
     The primary signal — the one whose status, levels and entry verdict the
     table shows — is the one with the best entry verdict (enter, then wait,
     then skip); on a tie the earlier timeframe in TF_CFG order (4H) wins.
+    `blocker` / `macro` are the two halves of macro_window(): the first feeds
+    the verdict, the second only becomes the row's MACRO tag.
     """
+    macro_tag = f"MACRO {macro[1]} in {_hours_txt(macro[0])}" if macro else None
     order = list(TF_CFG)
     rows = {}
     for s in sorted(sigs, key=lambda s: order.index(s["tf"])):
@@ -1830,11 +1869,11 @@ def build_rows(sigs, mover=None, flow=None, context_error=None,
             "pair": s["pair"], "base": s["base"], "side": s["side"],
             "current_price": s["current_price"], "weekly_volume": s["weekly_volume"],
             "tfs": [], "signals": {},
-            "mover": mover, "flow": flow, "context_error": context_error})
+            "mover": mover, "flow": flow, "context_error": context_error, "macro": macro_tag})
         r["tfs"].append(s["tf"])
         r["signals"][s["tf"]] = s
     for r in rows.values():
-        verdicts = {tf: entry_verdict(r["signals"][tf], hours_to_event, event_title)
+        verdicts = {tf: entry_verdict(r["signals"][tf], blocker)
                     for tf in r["tfs"]}
         best = min(r["tfs"], key=lambda tf: _VERDICT_RANK[verdicts[tf]["verdict"]])
         p = r["signals"][best]
@@ -2216,14 +2255,15 @@ def scan_route():
         if not funding:
             yield sse("log", {"msg": "No bulk funding data — OI-flow health flags will be blank"})
 
-        # Next curated macro print, for the entry verdict. A calendar failure
-        # must not stop a scan; the verdict then simply ignores the calendar.
-        ev_h, ev_title = None, ""
+        # Nearest USD blocker (for the entry verdict) and nearest other mover
+        # (a row tag). A calendar failure must not stop a scan; the verdict
+        # then simply ignores the calendar.
+        blocker = macro = None
         try:
             refresh_calendar()
             with _lock:
                 events = list(_cal_state["events"])
-            ev_h, ev_title = next_mover(events, datetime.datetime.now(datetime.timezone.utc))
+            blocker, macro = macro_window(events, datetime.datetime.now(datetime.timezone.utc))
         except Exception as e:
             yield sse("log", {"msg": f"Calendar unavailable for the entry verdict: {e}"})
 
@@ -2359,14 +2399,13 @@ def scan_route():
                 oi_h = df15 = None
                 if any(s["fresh"] for s in sigs):       # stale signals answer No whatever the grade
                     oi_h = fetch_oi_history(ex, limiter, sym, 100, tf="1h")
-                if any(s["tf"] == "1h" and s["fresh"] for s in sigs):
                     df15 = drop_forming_candle(
                         fetch_df_deep(ex, limiter, sym, "15m", LTF_BARS_15M), 15)
                     df15 = with_indicators(df15) if df15 is not None and len(df15) >= 80 else None
                 grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, funding.get(sym), btc)
                 for s in sigs:
                     _charts[f"{sym}|{s['side']}|{s['tf']}"] = (s.pop("_df"), s.pop("_d"), dict(s))
-                for row in build_rows(sigs, mover, flow, cerr, ev_h, ev_title):
+                for row in build_rows(sigs, mover, flow, cerr, blocker, macro):
                     q.put(("result", row))
             except Exception as e:
                 with clock:
@@ -3022,7 +3061,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a market-mover print inside 24 hours, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
+          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the signal bar closed more than 24h ago on 4H or 8h on 1H, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
           <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
           <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
           <th title="WITH TREND: the BTC 4H state (BULL or BEAR) and this coin's 200 EMA both agree with the side. CHOP: BTC is neither BULL nor BEAR; a reversal keeps the normal cutoff. COUNTER TREND (also when BTC data is missing) needs grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
@@ -3031,7 +3070,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
           <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
           <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
           <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. Click to sort, biggest build-up first.">7d OI</th>
-          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 8 score points and LTF TRIGGER is what allows Yes (early). PARTIAL DATA means some score context could not be checked. Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
+          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 8 score points and a trigger (LTF, or 15M on a 4H signal) is what allows Yes (early). PARTIAL DATA means some score context could not be checked. Then MACRO (a non-blocking calendar print within 24h), the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -3118,7 +3157,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     <div class="dash-sec-ttl">What every tag means</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
       Each tag as it appears in the table, with the same wording as its hover text. Only the pattern
-      tags TRIPLE and LTF TRIGGER feed the answer; every other tag is context for you to weigh.
+      tags TRIPLE, LTF TRIGGER and 15M TRIGGER feed the answer; every other tag, MACRO included,
+      is context for you to weigh.
     </div>
   </div>
   <div id="tagsBody"></div>
@@ -3198,9 +3238,9 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">Good to enter? &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a CPI / FOMC-class print inside 24 hours, or a signal bar that has not closed and has no lower-timeframe trigger.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the signal bar closed more than 24 hours ago on 4H or 8 hours ago on 1H, or the grade is C.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment rate, FOMC rate / statement / press conference, Fed Chair speech or testimony) due within 12 hours for a 4H signal or 4 hours for a 1H signal, or printed in the last hour, or a signal bar that has not closed and has no lower-timeframe trigger. BoJ / ECB / BoE rate decisions and the rest of the market movers never block; one due within 24 hours shows as a MACRO tag.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's levels and its chart.</div></div>
@@ -3328,6 +3368,8 @@ function ctxCell(r){
   (primary(r).tags || []).forEach(function(f){
     h.push('<span class="wflag wf-hioi"' + tip(f) + '>' + f + '</span>');
   });
+  /* the title comes from an outside calendar feed */
+  if(r.macro) h.push('<span class="wflag wf-hioi"' + tip('MACRO') + '>' + calEsc(r.macro) + '</span>');
   if(r.context_error) h.push('<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>');
   ((r.mover || {}).flags || []).forEach(function(f){
     h.push('<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
@@ -3404,6 +3446,8 @@ var TIP = {
   'TRIPLE':          'The trough before A also diverges from A: three troughs in a row, price lower each time, MACD higher each time.',
   'W-PATTERN':       'The bump between A and B is at least half the MACD range of the leg: a clear W (M for bearish).',
   'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
+  '15M TRIGGER':     '4H signals only: the 15m chart has crossed its MACD and closed beyond its last swing since B, within 8 hours of the 4H close. Your actual entry moment; the trigger price is whichever trigger (1H or 15m) closed first.',
+  'MACRO':           'A curated market mover that does not block the answer (BoJ / ECB / BoE rates, GDP, retail sales, ISM, FOMC minutes, ...) is due within 24 hours. Context only: the USD prints that do block (CPI, PCE, PPI, jobs, FOMC rate, Fed Chair) show in the answer instead.',
   'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.',
   'WITH TREND':      'The BTC 4H state agrees with the signal (BULL: RSI above 55 and close above its 200 EMA; BEAR: RSI below 45 and close below it) and so does the coin\'s own 200 EMA. Grade B is enough for Yes.',
   'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
@@ -3420,9 +3464,10 @@ var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-m
 
 /* ── Tags page: built from TIP so it cannot drift from the hover text ─────── */
 var TAG_GROUPS = [
-  ['Pattern tags (about the divergence itself)', ['TRIPLE','W-PATTERN','LTF TRIGGER','ZERO-LINE CROSS']],
+  ['Pattern tags (about the divergence itself)', ['TRIPLE','W-PATTERN','LTF TRIGGER','15M TRIGGER','ZERO-LINE CROSS']],
   ['Regime (sets how high the grade must be)', ['WITH TREND','CHOP','COUNTER TREND']],
   ['Score', ['PARTIAL DATA']],
+  ['Calendar (shown with the print and its countdown, e.g. MACRO BOJ Policy Rate in 6h)', ['MACRO']],
   ['Open interest: 7-day positioning', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
   ['Open interest: funding and crowding', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
   ['Daily movers (the last completed day)', ['VOLUME SPIKE','RANGE EXPANSION','BIG MOVE','AT RANGE HIGH','ABOVE 7D HIGH','AT RANGE LOW','BELOW 7D LOW']]

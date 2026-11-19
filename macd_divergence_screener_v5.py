@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""MACD Divergence Screener v5 — 4H + 1H regular divergences, one scan, one table
+"""MACD Divergence Screener v5 — 4H + 1H regular divergences read on MACD crossover waves
+
+WAVE DETECTION (spec v2, docs/superpowers/specs/2026-11-19-macd-wave-divergence-v2.md)
+──────────────────────────────────────────────────────────────────────────────────────
+Divergence is no longer found from price pivots. The MACD/signal crossovers
+split the MACD line into waves; each wave below the signal line is one trough
+(above it, one peak); two neighbouring troughs A and B are compared with the
+price lows inside those same waves (detect_wave_divergence). A signal exists
+only once the cross that ends wave B has printed: that bar is the signal bar.
+Each signal gets a 0-100 quality score and an A/B/C grade (score_signal), a
+WITH TREND / COUNTER TREND tag from BTC 4H RSI and the coin's 200 EMA, and an
+optional early entry from the lower timeframe (ltf_trigger). `--backtest`
+replays the same detector bar by bar (backtest_pair) and reports win rate and
+R per grade and regime. Everything below about pivots, PIVOT_SYNC, the clean
+line and the setup score describes the detector this replaced.
 
 WHAT CHANGED IN v5
 ──────────────────

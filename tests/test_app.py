@@ -10,6 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import macd_divergence_screener_v5 as m  # noqa: E402
+from tests.helpers import LONG, wave_df  # noqa: E402
 
 
 class Routes(unittest.TestCase):
@@ -19,6 +20,14 @@ class Routes(unittest.TestCase):
     def test_removed_scans_are_gone(self):
         for path in ("/watchlist", "/watch_signals"):
             self.assertEqual(self.c.get(path).status_code, 404, path)
+
+    def test_usdt_perps_keeps_only_active_crypto_linear_perps(self):
+        mkts = {"ENS/USDT:USDT":  {"active": True,  "base": "ENS"},
+                "USDC/USDT:USDT": {"active": True,  "base": "USDC"},
+                "TSLA/USDT:USDT": {"active": True,  "base": "TSLA"},
+                "OLD/USDT:USDT":  {"active": False, "base": "OLD"},
+                "BTC/USD:BTC":    {"active": True,  "base": "BTC"}}
+        self.assertEqual(m.usdt_perps(mkts), ["ENS/USDT:USDT"])
 
     def test_signals_returns_rows(self):
         m._state.update({"results": [{"pair": "ENS/USDT:USDT"}], "ts": None,
@@ -45,23 +54,50 @@ class SavedState(unittest.TestCase):
         with open(m.STATE_FILE, "w") as f:
             json.dump(data, f)
 
-    def test_old_flat_signal_state_is_ignored(self):
-        self.write({"results": [{"pair": "X", "side": "bullish"}],
-                    "ts": "2026-11-01T00:00:00+00:00", "meta": {"tf": "1d"}})
+    def test_state_from_before_wave_detection_is_ignored(self):
+        self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
+                    "ts": "2026-11-01T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"]}})
         m.load_state()
         self.assertEqual((m._state["results"], m._state["ts"]), ([], None))
 
     def test_row_state_round_trips(self):
         self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
-                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"]}})
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 2}})
         m.load_state()
         self.assertEqual(m._state["results"], [{"pair": "X", "tfs": ["4h"]}])
         m.save_state()
         with open(m.STATE_FILE) as f:
-            self.assertEqual(sorted(json.load(f)), ["meta", "results", "ts"])
+            saved = json.load(f)
+        self.assertEqual(sorted(saved), ["meta", "results", "ts"])
+        self.assertEqual(saved["meta"]["v"], 2)
 
 
 import re  # noqa: E402
+
+
+class Chart(unittest.TestCase):
+    KEY = "ENS/USDT:USDT|bullish|1h"
+
+    def setUp(self):
+        s = m.signals_for_tf(wave_df(LONG), "1h", m.STRICTNESS["balanced"],
+                             100.5, "ENS/USDT:USDT", 9e7)[0]
+        self.hit = (s.pop("_df"), s.pop("_d"), s)
+        m._charts[self.KEY] = self.hit
+        self.c = m.app.test_client()
+
+    def tearDown(self):
+        m._charts.clear()
+
+    def test_render_is_a_png(self):
+        self.assertEqual(m.render_chart(*self.hit)[:4], b"\x89PNG")
+
+    def test_route_serves_the_chart_of_a_scanned_row(self):
+        r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"})
+        self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"))
+
+    def test_unknown_row_is_404(self):
+        r = self.c.get("/chart", query_string={"pair": "NOPE/USDT:USDT", "side": "bullish", "tf": "1h"})
+        self.assertEqual(r.status_code, 404)
 
 
 class Page(unittest.TestCase):
@@ -84,8 +120,13 @@ class Page(unittest.TestCase):
 
     def test_new_table_and_filters(self):
         for want in ('data-f="enter"', 'data-f="both"', "function evCell", "function ctxCell",
-                     'id="scan-age"', 'id="dash-cal"'):
+                     'id="scan-age"', 'id="dash-cal"',
+                     "function gradeCell", "/chart?pair=", "'W-PATTERN'", "'LTF TRIGGER'"):
             self.assertIn(want, self.html, want)
+
+    def test_pivot_era_ui_is_gone(self):
+        for gone in ("macd_cross", "volCell", "FROM CURRENT PRICE", "MACD pivot must align"):
+            self.assertNotIn(gone, self.html, gone)
 
 
 if __name__ == "__main__":

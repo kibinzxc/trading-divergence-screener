@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""MACD Divergence Screener v5 — 4H + 1H regular divergences, one scan, one table
+"""MACD Divergence Screener v5 — 4H + 1H regular divergences read on MACD crossover waves
+
+WAVE DETECTION (spec v2, docs/superpowers/specs/2026-11-19-macd-wave-divergence-v2.md)
+──────────────────────────────────────────────────────────────────────────────────────
+Divergence is no longer found from price pivots. The MACD/signal crossovers
+split the MACD line into waves; each wave below the signal line is one trough
+(above it, one peak); two neighbouring troughs A and B are compared with the
+price lows inside those same waves (detect_wave_divergence). A signal exists
+only once the cross that ends wave B has printed: that bar is the signal bar.
+Each signal gets a 0-100 quality score and an A/B/C grade (score_signal), a
+WITH TREND / COUNTER TREND tag from BTC 4H RSI and the coin's 200 EMA, and an
+optional early entry from the lower timeframe (ltf_trigger). `--backtest`
+replays the same detector bar by bar (backtest_pair) and reports win rate and
+R per grade and regime. Everything below about pivots, PIVOT_SYNC, the clean
+line and the setup score describes the detector this replaced.
 
 WHAT CHANGED IN v5
 ──────────────────
@@ -101,33 +115,47 @@ complete one is how you end up trusting an empty table.
 
 from flask import Flask, Response, jsonify, request
 from concurrent.futures import ThreadPoolExecutor
-import ccxt, pandas as pd, numpy as np, json, time, threading, queue, datetime, os
+import ccxt, pandas as pd, numpy as np, json, time, threading, queue, datetime, os, io
 import re, statistics, urllib.request, urllib.error
+from matplotlib.figure import Figure   # no pyplot: Figure alone is safe across Flask threads
 
 app = Flask(__name__)
 
 # ── Indicator constants ────────────────────────────────────────────────────────
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ATR_PERIOD  = 14
-PIVOT_SYNC  = 3      # bars of slack allowed between a price pivot and its MACD pivot
+EMA_TREND   = 200
+RSI_PERIOD  = 14
 
-# Per-timeframe geometry. A pivot must be the extreme of pivot_lb bars to its
-# left but only pivot_rb to its right: the right side is pure waiting time
-# (5 bars on 4H is 20 hours), and a divergence listed a day late is not usable.
+# ── Wave detection (spec v2, Steps 1-4) ───────────────────────────────────────
+MIN_WAVE    = 3        # bars; a shorter wave is merged into its neighbours
+WHIP_FRAC   = 0.05     # a cross counts once |MACD - signal| reaches this share...
+WHIP_RANGE  = 50       # ...of the MACD range over this many bars...
+WHIP_BARS   = 3        # ...within this many bars, the cross bar being the first
+SPACING     = (8, 80)  # bars allowed between MACD trough A and MACD trough B
+BUMP_MIN    = 0.25     # height of the middle of the W, as a share of the leg's MACD range
+PRICE_TAIL  = 2        # a wave's price extreme may print up to 2 bars after the wave ends
+MAX_BUMPS   = 1        # 2 = the spec's extended mode (off by default)
+STOP_ATR       = 0.25   # the stop sits this many ATR beyond price extreme B
+OI_AGAINST_PCT = 5.0    # OI rising more than this into B, against the signal, costs points
+GRADE_A, GRADE_B = 70, 55
+
+# Per-timeframe settings. `fresh` is how many bars a closed signal bar stays
+# enterable. htf / ltf are the timeframes used for agreement and for the
+# early-entry trigger.
 TF_CFG = {
-    "4h": {"label": "4H", "minutes": 240, "bars": 720, "pivot_lb": 5, "pivot_rb": 3,
-           "min_dist": 5, "max_dist": 60, "fresh": 12},
-    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "pivot_lb": 5, "pivot_rb": 3,
-           "min_dist": 5, "max_dist": 60, "fresh": 12},
+    "4h": {"label": "4H", "minutes": 240, "bars": 720, "fresh": 6,
+           "htf_minutes": 1440, "ltf": "1h", "ltf_minutes": 60},
+    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "fresh": 12,
+           "htf_minutes": 240, "ltf": "15m", "ltf_minutes": 15},
 }
 
-# Strictness presets — see the module docstring for what each rule does.
+# Minimum divergence size. Strict also wants both troughs below zero
+# (both peaks above zero for bearish).
 STRICTNESS = {
-    "balanced": {"require_macd_pivot": True,  "require_clean": True,
-                 "min_price_pct": 0.25, "atr_frac": 0.20, "min_macd_frac": 0.15,
+    "balanced": {"min_price_pct": 0.25, "atr_frac": 0.20, "min_macd_frac": 0.15,
                  "zero_line": False},
-    "strict":   {"require_macd_pivot": True,  "require_clean": True,
-                 "min_price_pct": 0.50, "atr_frac": 0.55, "min_macd_frac": 0.22,
+    "strict":   {"min_price_pct": 0.50, "atr_frac": 0.55, "min_macd_frac": 0.22,
                  "zero_line": True},
 }
 
@@ -190,7 +218,7 @@ def is_tradfi(mkt):
 DEFAULT_MIN_WEEKLY_VOL = 70_000_000      # $70M / 7 days ≈ $10M/day
 DEFAULT_MAX_PAIRS      = 400
 PREGATE_SLACK          = 0.30            # loose: the real gate is the 7-day measurement
-MOVED_PCT              = 2.0             # beyond this, re-anchor targets to spot
+MOVED_PCT              = 2.0             # beyond this the setup is "extended"
 DISPLAY_TZ_OFFSET_H    = 8               # PHT / UTC+8 for displayed timestamps
 
 # Threading: workers and requests/sec per exchange. OKX's candle endpoints are
@@ -262,6 +290,9 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # divergence scan's saved state, and vice versa.
 MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
+STATE_VERSION = 2     # scan_state.json written by an older row shape is ignored
+HTF_BARS_1D   = 200   # daily history, for the 4H signal's higher-timeframe check
+LTF_BARS_15M  = 300   # 15m history, for the 1H signal's early-entry trigger
 
 # ── News calendar ──────────────────────────────────────────────────────────────
 # Scheduled macro prints, so a setup is never sized into a CPI or FOMC release
@@ -315,6 +346,11 @@ _movers_state = {"rows": [], "ts": None, "meta": {}}
 _cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
               "jb": {"events": [], "ts": None, "attempt": None}}
 
+# Candles and geometry of the last scan's signals, for /chart.
+# shortcut: memory only, so charts need a fresh scan after a restart; persist
+# a slice per signal in scan_state.json if that becomes annoying.
+_charts = {}
+
 
 # ── Indicators ─────────────────────────────────────────────────────────────────
 def ema(s, p):
@@ -322,7 +358,7 @@ def ema(s, p):
 
 
 def compute_indicators(df):
-    """MACD line / signal / histogram plus ATR14 (Wilder), on completed bars."""
+    """MACD line / signal / histogram, ATR14 (Wilder) and EMA 200, on completed bars."""
     close = df["close"]
     ml = ema(close, MACD_FAST) - ema(close, MACD_SLOW)
     sl = ema(ml, MACD_SIG)
@@ -333,8 +369,16 @@ def compute_indicators(df):
                     (df["low"] - prev).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean()
 
-    return pd.DataFrame({"macd": ml, "signal": sl, "hist": ml - sl, "atr": atr},
-                        index=df.index)
+    return pd.DataFrame({"macd": ml, "signal": sl, "hist": ml - sl, "atr": atr,
+                         "ema200": ema(close, EMA_TREND)}, index=df.index)
+
+
+def rsi(close, p=RSI_PERIOD):
+    """Wilder RSI. Used on BTC 4H only, for the regime tag."""
+    d = close.diff()
+    up = d.clip(lower=0).ewm(alpha=1.0 / p, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1.0 / p, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn)
 
 
 # ── Pivots ─────────────────────────────────────────────────────────────────────
@@ -362,179 +406,114 @@ def find_pivots(vals, lb, rb=None):
     return highs, lows
 
 
-def swing_pivots(high, low, lb, rb=None):
-    """Price pivots on true swing extremes: highs from `high`, lows from `low`.
+# ── Wave divergence (spec v2) ─────────────────────────────────────────────────
+def macd_crosses(macd, signal):
+    """Confirmed MACD/signal crossovers as [(bar, +1 bullish | -1 bearish)].
 
-    v3 ran both off the close, which puts the pivot on the wrong bar whenever
-    the actual extreme was a wick — and wicks are exactly where divergences get
-    drawn from.
+    The list alternates direction, so consecutive entries bound one wave. A
+    cross that never opens a real gap (the whipsaw filter) is dropped, and a
+    wave shorter than MIN_WAVE bars is removed together with the two crosses
+    around it. Either way the waves on both sides join into one, which is what
+    stops a tiny double dot from splitting one trough into two.
     """
-    ph, _ = find_pivots(high, lb, rb)
-    _, pl = find_pivots(low, lb, rb)
-    return ph, pl
+    d = macd - signal
+    m = pd.Series(macd)
+    rng = (m.rolling(WHIP_RANGE, min_periods=1).max()
+           - m.rolling(WHIP_RANGE, min_periods=1).min()).values
+    raw = np.flatnonzero(((d[1:] > 0) & (d[:-1] <= 0)) | ((d[1:] < 0) & (d[:-1] >= 0))) + 1
+    out = []
+    for i in raw:
+        i = int(i)
+        s = 1 if d[i] > 0 else -1
+        if out and out[-1][1] == s:
+            continue                                   # already on that side
+        if (s * d[i:i + WHIP_BARS]).max() < WHIP_FRAC * rng[i]:
+            continue                                   # whipsaw
+        if out and i - out[-1][0] < MIN_WAVE:
+            out.pop()                                  # the wave it would close is too short
+            continue
+        out.append((i, s))
+    return out
 
 
-# ── Divergence detection ───────────────────────────────────────────────────────
-def _macd_anchor(macd, macd_piv_set, idx, mode, need_pivot):
-    """Find the MACD swing that belongs to the price pivot at `idx`.
+def detect_wave_divergence(df, side, preset):
+    """REGULAR divergences of one side, read trough to trough on the MACD line.
 
-    Returns (bar, value) for the MACD pivot within PIVOT_SYNC bars — the
-    lowest one for a price trough, the highest for a price peak. Momentum
-    commonly turns a bar or two before or after price, so demanding they land
-    on the same bar throws away good setups; demanding nothing accepts bars
-    where MACD was not swinging at all.
+    Bullish : two bear waves (MACD below signal) A then B with one bull wave,
+              the bump, between them. Price low B < price low A while MACD
+              trough B > MACD trough A.
+    Bearish : the same picture upside down, so it is computed as the bullish
+              case on a negated MACD line and negated highs.
 
-    With need_pivot=False this falls back to the MACD value at the
-    price pivot bar, which is what v3 always did.
+    A divergence exists only once wave B has been closed by a cross; that
+    cross is the signal bar. The function reads nothing but `df`, so calling
+    it on df.iloc[:i + 1] is exactly what was knowable at bar i. The live scan
+    and the backtest both rely on that.
     """
-    cands = [j for j in macd_piv_set if abs(j - idx) <= PIVOT_SYNC]
-    if not cands:
-        if need_pivot:
-            return None
-        return idx, float(macd[idx])
-    j = min(cands, key=lambda k: macd[k]) if mode == "low" else max(cands, key=lambda k: macd[k])
-    return j, float(macd[j])
-
-
-def detect_divergences(df, cfg, rules):
-    """REGULAR bullish / bearish divergences only.
-
-    Bullish : price makes a LOWER LOW, MACD makes a HIGHER LOW  → reversal up
-    Bearish : price makes a HIGHER HIGH, MACD makes a LOWER HIGH → reversal down
-
-    Every candidate right-hand pivot B is tested against ALL prior pivots A in
-    the [min_dist, max_dist] window (v3.2's fix — the nearest prior pivot is
-    usually a shallow intermediate swing that does not diverge, so pairing only
-    with it missed most chart-visible divergences). Among the A's that survive
-    every rule, the one with the deepest MACD extreme wins: that is the line a
-    human would draw.
-    """
-    high = df["high"].values
-    low  = df["low"].values
-    close = df["close"].values
-    macd = df["macd"].values
-    atrv = df["atr"].values
+    s = 1 if side == "bullish" else -1
+    macd = df["macd"].values * s
+    ext = df["low"].values if s > 0 else -df["high"].values
+    o, c, h, l = (df[k].values for k in ("open", "close", "high", "low"))
+    vol, atr = df["volume"].values, df["atr"].values
     n = len(df)
+    crosses = macd_crosses(df["macd"].values, df["signal"].values)
 
-    lb, rb = cfg["pivot_lb"], cfg["pivot_rb"]
-    mn, mx = cfg["min_dist"], cfg["max_dist"]
-
-    price_h, price_l = swing_pivots(high, low, lb, rb)
-    macd_h,  macd_l  = find_pivots(macd, lb, rb)
-    macd_h, macd_l = set(macd_h), set(macd_l)
+    waves = []                                         # closed waves on the trough side
+    for (c0, d0), (c1, _) in zip(crosses, crosses[1:]):
+        if d0 != -s:
+            continue
+        tm = c0 + int(np.argmin(macd[c0:c1]))
+        tp = c0 + int(np.argmin(ext[c0:min(c1 + PRICE_TAIL, n)]))
+        waves.append({"start": c0, "end": c1, "tm": tm, "tp": tp,
+                      "m": float(macd[tm]), "p": float(ext[tp])})
 
     out = []
-
-    # ── Regular bullish: lower low in price, higher low in MACD ────────────────
-    anchors = {}
-    for i in price_l:
-        a = _macd_anchor(macd, macd_l, i, "low", rules["require_macd_pivot"])
-        if a:
-            anchors[i] = a
-
-    for b in price_l:
-        if b not in anchors:
-            continue
-        mb_bar, mb_val = anchors[b]
-        atr_pct = (atrv[b] / close[b] * 100) if close[b] else 0.0
-        min_pct = max(rules["min_price_pct"], rules["atr_frac"] * atr_pct)
-        best = None
-
-        for a in price_l:
-            if not (mn <= b - a <= mx) or a not in anchors:
+    for k in range(1, len(waves)):
+        B = waves[k]
+        for j in range(k - 1, max(k - 1 - MAX_BUMPS, -1), -1):
+            A = waves[j]
+            if not (B["p"] < A["p"] and B["m"] > A["m"]):
                 continue
-            ma_bar, ma_val = anchors[a]
-
-            # core divergence conditions
-            if not (low[b] < low[a] and mb_val > ma_val):
+            if not (SPACING[0] <= B["tm"] - A["tm"] <= SPACING[1]):
                 continue
-
-            # minimum price separation (absolute floor + ATR-relative)
-            if (low[a] - low[b]) / low[a] * 100 < min_pct:
+            seg = macd[A["tm"]:B["tm"] + 1]
+            leg = float(seg.max() - seg.min())
+            if leg <= 0:
                 continue
-
-            # minimum MACD separation, as a share of the leg's MACD range
-            seg = macd[min(ma_bar, a):max(mb_bar, b) + 1]
-            span = float(seg.max() - seg.min())
-            if span <= 0:
+            bump = A["end"] + int(np.argmax(macd[A["end"]:B["start"]]))
+            bump_frac = (float(macd[bump]) - B["m"]) / leg      # B is the higher trough
+            if bump_frac < BUMP_MIN:
                 continue
-            if (mb_val - ma_val) < rules["min_macd_frac"] * span:
+            tp = B["tp"]
+            atr_pct = atr[tp] / c[tp] * 100 if c[tp] else 0.0
+            if (A["p"] - B["p"]) / abs(A["p"]) * 100 < max(preset["min_price_pct"],
+                                                         preset["atr_frac"] * atr_pct):
                 continue
-
-            if rules["zero_line"] and not (ma_val < 0 and mb_val < 0):
+            macd_frac = (B["m"] - A["m"]) / leg
+            if macd_frac < preset["min_macd_frac"]:
                 continue
-
-            if rules["require_clean"]:
-                # B must be the lowest low of the leg (0.1% undercut tolerance)
-                if float(low[a:b + 1].min()) < low[b] * 0.999:
-                    continue
-                # A must be the MACD low of the leg (2% of span tolerance)
-                lo_seg = min(ma_bar, a)
-                hi_seg = max(mb_bar, b) + 1
-                if float(macd[lo_seg:hi_seg].min()) < ma_val - 0.02 * span:
-                    continue
-
-            cand = (a, ma_bar, ma_val, span)
-            if best is None or ma_val < best[2]:      # deepest MACD trough wins
-                best = cand
-
-        if best:
-            a, ma_bar, ma_val, span = best
-            out.append(_mk("REGULAR BULLISH", "bullish", df, a, b,
-                           ma_bar, ma_val, mb_bar, mb_val, span, cfg))
-
-    # ── Regular bearish: higher high in price, lower high in MACD ─────────────
-    anchors = {}
-    for i in price_h:
-        a = _macd_anchor(macd, macd_h, i, "high", rules["require_macd_pivot"])
-        if a:
-            anchors[i] = a
-
-    for b in price_h:
-        if b not in anchors:
-            continue
-        mb_bar, mb_val = anchors[b]
-        atr_pct = (atrv[b] / close[b] * 100) if close[b] else 0.0
-        min_pct = max(rules["min_price_pct"], rules["atr_frac"] * atr_pct)
-        best = None
-
-        for a in price_h:
-            if not (mn <= b - a <= mx) or a not in anchors:
+            zero_ok = B["m"] < 0                                # then A, the lower one, is too
+            if preset["zero_line"] and not zero_ok:
                 continue
-            ma_bar, ma_val = anchors[a]
-
-            if not (high[b] > high[a] and mb_val < ma_val):
-                continue
-            if (high[b] - high[a]) / high[a] * 100 < min_pct:
-                continue
-
-            seg = macd[min(ma_bar, a):max(mb_bar, b) + 1]
-            span = float(seg.max() - seg.min())
-            if span <= 0:
-                continue
-            if (ma_val - mb_val) < rules["min_macd_frac"] * span:
-                continue
-
-            if rules["zero_line"] and not (ma_val > 0 and mb_val > 0):
-                continue
-
-            if rules["require_clean"]:
-                if float(high[a:b + 1].max()) > high[b] * 1.001:
-                    continue
-                lo_seg = min(ma_bar, a)
-                hi_seg = max(mb_bar, b) + 1
-                if float(macd[lo_seg:hi_seg].max()) > ma_val + 0.02 * span:
-                    continue
-
-            if best is None or ma_val > best[2]:      # highest MACD peak wins
-                best = (a, ma_bar, ma_val, span)
-
-        if best:
-            a, ma_bar, ma_val, span = best
-            out.append(_mk("REGULAR BEARISH", "bearish", df, a, b,
-                           ma_bar, ma_val, mb_bar, mb_val, span, cfg))
-
+            C = waves[j - 1] if j else None
+            bar_rng = h[tp] - l[tp]
+            wick = (min(o[tp], c[tp]) - l[tp]) if s > 0 else (h[tp] - max(o[tp], c[tp]))
+            out.append({
+                "side": side, "a_m": A["tm"], "b_m": B["tm"], "a_p": A["tp"], "b_p": tp,
+                "a_macd": A["m"] * s, "b_macd": B["m"] * s,
+                "a_price": abs(A["p"]), "b_price": abs(B["p"]),
+                "a_start": A["start"], "b_start": B["start"], "signal_bar": B["end"],
+                "bump_bar": bump, "bump_frac": bump_frac, "macd_frac": macd_frac,
+                "price_atr": float((A["p"] - B["p"]) / atr[tp]) if atr[tp] > 0 else 0.0,
+                "zero_ok": bool(zero_ok),
+                "triple": bool(C and A["p"] < C["p"] and A["m"] > C["m"]),
+                "vol_dry": bool(vol[B["start"]:B["end"]].mean() < vol[A["start"]:A["end"]].mean()),
+                "wick": bool(bar_rng > 0 and wick >= 0.5 * bar_rng),
+                "crosses": [x for x in crosses if A["start"] <= x[0] <= B["end"]],
+            })
+            break
     return out
+
 
 
 def px(v):
@@ -550,82 +529,50 @@ def px(v):
     return round(v, d)
 
 
+
+
 # ── Build a signal record ──────────────────────────────────────────────────────
-def _mk(kind, side, df, a, b, ma_bar, ma_val, mb_bar, mb_val, span, cfg):
-    n = len(df)
-    sp   = float(df["close"].iloc[b])          # signal price = pivot bar close
-    sl   = float(df["low"].iloc[b])
-    sh   = float(df["high"].iloc[b])
-    atrb = float(df["atr"].iloc[b]) if not pd.isna(df["atr"].iloc[b]) else sp * 0.01
+def _mk(df, d, cfg, forming=False):
+    """Signal record for one detect_wave_divergence() hit `d` on frame `df`.
 
-    # Stop sits beyond the swing extreme by the LARGER of 0.3% and 0.3 ATR.
-    # A flat percentage buffer is too tight on a high-volatility alt and
-    # needlessly wide on a mega-cap; ATR sizes it to the coin.
-    buf = max(sp * 0.003, atrb * 0.30)
-    if side == "bullish":
-        stop = px(sl - buf)
-        risk = max(sp - stop, sp * 0.005)
-    else:
-        stop = px(sh + buf)
-        risk = max(stop - sp, sp * 0.005)
-
+    The pivot1_* / pivot2_* names are kept from v5: 1 is A, 2 is B.
+    """
+    side, bull = d["side"], d["side"] == "bullish"
+    n, sb, bp = len(df), d["signal_bar"], d["b_p"]
+    sp = float(df["close"].iloc[sb])                 # signal price = close of the signal bar
+    atrb = float(df["atr"].iloc[bp])
+    if not atrb > 0:
+        atrb = sp * 0.01
+    stop = px(d["b_price"] - STOP_ATR * atrb) if bull else px(d["b_price"] + STOP_ATR * atrb)
+    macd = df["macd"].values
+    after = macd[sb + 1:]
+    zero_cross = bool(len(after) and ((macd[sb] <= 0 and after.max() > 0) if bull
+                                      else (macd[sb] >= 0 and after.min() < 0)))
     off = pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
-    def fmt(ts):
-        return (ts + off).strftime("%b %d %Y, %I:%M %p")
 
-    # ── Structure metrics, used by the setup score ─────────────────────────────
-    if side == "bullish":
-        price_gap = (float(df["low"].iloc[a]) - sl)
-        zero_ok   = (ma_val < 0 and mb_val < 0)
-        macd_gap  = mb_val - ma_val
-    else:
-        price_gap = (sh - float(df["high"].iloc[a]))
-        zero_ok   = (ma_val > 0 and mb_val > 0)
-        macd_gap  = ma_val - mb_val
+    def fmt(i):
+        return (df.index[i] + off).strftime("%b %d %Y, %I:%M %p")
 
-    macd_strength = float(np.clip(macd_gap / span, 0, 1)) if span > 0 else 0.0
-    price_atr     = float(price_gap / atrb) if atrb > 0 else 0.0
-
-    # Has momentum actually turned since the pivot? This is the one
-    # confirmation kept from v3 — MACD-native, so it needs no second indicator.
-    #
-    # CAREFUL: the obvious version of this ("is MACD on the correct side of
-    # signal at any bar after b") is wrong, and shipped wrong once. If MACD was
-    # ALREADY aligned at the pivot it returns true on the very first bar, so a
-    # cross that happened well BEFORE the divergence completed gets scored as
-    # confirmation of it. A cross means a cross: wrong side at i-1, right side
-    # at i. Being already aligned at the pivot is reported separately and
-    # scores less, because it is a weaker fact.
-    mv, sv = df["macd"].values, df["signal"].values
-    aligned_at_pivot = bool(mv[b] > sv[b]) if side == "bullish" else bool(mv[b] < sv[b])
-    cross_at = None
-    for i in range(b + 1, n):
-        crossed = (mv[i] > sv[i] and mv[i - 1] <= sv[i - 1]) if side == "bullish" \
-            else (mv[i] < sv[i] and mv[i - 1] >= sv[i - 1])
-        if crossed:
-            cross_at = fmt(df.index[i])
-            break
+    def ms(i):
+        return int(df.index[i].timestamp() * 1000)
 
     return {
-        "type": kind, "side": side,
-        "implication": "Potential reversal UP" if side == "bullish" else "Potential reversal DOWN",
-        "pivot1_time": fmt(df.index[a]), "pivot2_time": fmt(df.index[b]),
-        "pivot1_price": px(float(df["low"].iloc[a] if side == "bullish" else df["high"].iloc[a])),
-        "pivot2_price": px(sl if side == "bullish" else sh),
-        "pivot1_macd": round(ma_val, 8), "pivot2_macd": round(mb_val, 8),
-        "signal_price": px(sp),
-        "pivot_dist": b - a,
-        "bars_ago": n - 1 - b,
-        "fresh": (n - 1 - b) <= cfg["fresh"],
-        "stop_price": stop,
-        "signal_risk": risk,
-        "macd_strength": round(macd_strength, 4),
-        "price_atr": round(price_atr, 3),
-        "zero_ok": bool(zero_ok),
-        "macd_cross": cross_at is not None,
-        "macd_cross_at": cross_at,
-        "macd_aligned_at_pivot": aligned_at_pivot,
-        "_b": b,
+        "side": side,
+        "pivot1_time": fmt(d["a_p"]), "pivot2_time": fmt(bp), "signal_time": fmt(sb),
+        "pivot1_price": px(d["a_price"]), "pivot2_price": px(d["b_price"]),
+        "pivot1_macd": round(d["a_macd"], 8), "pivot2_macd": round(d["b_macd"], 8),
+        "signal_price": px(sp), "stop_price": stop,
+        "signal_risk": max((sp - stop) if bull else (stop - sp), sp * 0.005),
+        "structure_target": px(float(df["high" if bull else "low"].iloc[d["bump_bar"]])),
+        "bars_ago": n - 1 - sb, "fresh": (n - 1 - sb) <= cfg["fresh"], "forming": forming,
+        "b_start_ms": ms(d["b_start"]), "b_ms": ms(bp), "signal_ms": ms(sb),
+        "signal_close_ms": ms(sb) + cfg["minutes"] * 60_000,
+        "above_ema200": bool(sp > float(df["ema200"].iloc[sb])),
+        "price_atr": round(d["price_atr"], 3), "macd_frac": round(d["macd_frac"], 4),
+        "bump_frac": round(d["bump_frac"], 4),
+        "zero_ok": d["zero_ok"], "triple": d["triple"], "vol_dry": d["vol_dry"],
+        "wick": d["wick"], "zero_cross": zero_cross,
+        "_b": sb, "_d": d,
     }
 
 
@@ -682,62 +629,163 @@ def evaluate_status(df, sig, live_price):
     return dict(base, status=status, r_reached=round(r, 2))
 
 
-def build_targets(sig, current_price):
-    """1R/2R/3R levels.
+def build_targets(sig):
+    """1R / 2R / 3R and the structure target, from the entry reference.
 
-    Anchored to the signal price while the setup is still near it, and
-    re-anchored to spot once price has run — because if you enter now, your
-    risk is measured from now, and quoting the original targets would flatter
-    the R:R you'd actually get.
+    The entry reference is the signal price, or the lower-timeframe trigger
+    price when the trigger fired before the signal bar closed.
     """
-    side = sig["side"]
+    k = 1 if sig["side"] == "bullish" else -1
     stop = sig["stop_price"]
-    moved = sig.get("status") in ("extended", "ran")
-    ref = current_price if moved else sig["signal_price"]
-
-    if side == "bullish":
-        risk = max(ref - stop, ref * 0.005)
-        tg = {"1r": px(ref + risk), "2r": px(ref + 2 * risk), "3r": px(ref + 3 * risk)}
-    else:
-        risk = max(stop - ref, ref * 0.005)
-        tg = {"1r": px(ref - risk), "2r": px(ref - 2 * risk), "3r": px(ref - 3 * risk)}
-
+    early = bool(sig.get("trigger_first"))
+    ref = sig["trigger_price"] if early else sig["signal_price"]
+    risk = max((ref - stop) * k, ref * 0.005)
     return {"entry_ref_price": px(ref),
-            "targets_from": "current" if moved else "signal",
+            "targets_from": "trigger" if early else "signal",
             "risk_pct": round(risk / ref * 100, 2),
-            "targets": tg}
+            "targets": {"1r": px(ref + k * risk), "2r": px(ref + 2 * k * risk),
+                        "3r": px(ref + 3 * k * risk),
+                        "structure": sig["structure_target"]}}
 
 
-# ── Setup score ────────────────────────────────────────────────────────────────
-def setup_score(sig, weekly_vol):
-    """0–100 description of how textbook the divergence looks.
+# ── Quality score, regime, tags ────────────────────────────────────────────────
+def score_signal(sig, htf_ok=False, oi_chg=None, fund=None):
+    """(0-100 score, grade). A description of the setup, not a win rate.
 
-    READ THIS BEFORE TRUSTING THE NUMBER: it is NOT a win rate and NOT a
-    backtested edge. It is a structural description — how large the momentum
-    divergence is relative to the leg, how decisive the price break is in ATR
-    terms, whether the pivots are sensibly spaced, whether they sit on the
-    classic side of the MACD zero line, whether momentum has crossed since,
-    and how liquid the pair is. A 90 is a clean textbook picture. It is still
-    your call whether to take it.
+    oi_chg is the % change in open interest into B, fund the funding rate
+    (only its sign is used). Either one unknown: no OI points, no penalty.
     """
-    s  = round(sig["macd_strength"] * 30)                          # 0–30
-    s += round(float(np.clip(sig["price_atr"] / 1.5, 0, 1)) * 15)  # 0–15
-    d  = sig["pivot_dist"]                                          # 0–15
-    s += 15 if 10 <= d <= 60 else (10 if 6 <= d <= 90 else 5)
-    s += 15 if sig["zero_ok"] else 0                                # 0–15
-    # a genuine post-pivot cross is worth more than momentum that had already
-    # turned before the divergence finished forming
-    s += 15 if sig["macd_cross"] else (7 if sig.get("macd_aligned_at_pivot") else 0)
+    s = min(sig["price_atr"], 1.0) * 15                                   # 0-15
+    s += min(sig["macd_frac"] / 0.5, 1.0) * 15                            # 0-15
+    s += float(np.clip((sig["bump_frac"] - BUMP_MIN) / 0.5, 0, 1)) * 10   # 0-10
+    s += 10 * sig["zero_ok"] + 15 * bool(htf_ok) + 10 * sig["vol_dry"] + 10 * sig["wick"]
+    s += 5 * sig["triple"]
+    if oi_chg is not None and fund is not None:
+        f = fund if sig["side"] == "bullish" else -fund
+        if oi_chg < 0 and f <= 0:
+            s += 10
+        elif oi_chg > OI_AGAINST_PCT and f > 0:
+            s -= 10
+    score = int(max(0, min(100, round(s))))
+    return score, ("A" if score >= GRADE_A else "B" if score >= GRADE_B else "C")
 
-    if weekly_vol:                                                  # 0–10
-        s += 10 if weekly_vol >= 700e6 else (7 if weekly_vol >= 250e6 else 4)
-    else:
-        # Liquidity unknown (the exchange reported no usable volume). Capping
-        # at 90 would make those pairs look structurally worse than they are
-        # and sort them below equivalent setups, so the structural 0–90 is
-        # rescaled onto the same 0–100 axis instead.
-        s = round(s * 100 / 90)
-    return int(max(0, min(100, s)))
+
+def regime_tag(side, above_ema200, btc_rsi):
+    """WITH TREND when BTC 4H RSI and the coin's 200 EMA both agree with the side."""
+    if btc_rsi is None:
+        return "COUNTER TREND"
+    ok = (btc_rsi > 50 and above_ema200) if side == "bullish" \
+        else (btc_rsi < 50 and not above_ema200)
+    return "WITH TREND" if ok else "COUNTER TREND"
+
+
+def finish_signal(sig, htf_ok=False, oi_chg=None, fund=None, btc_rsi=None, trigger=None):
+    """Score, grade, regime, trigger, tags and targets.
+
+    Called once without context so a signal is always complete, and again by
+    add_context() once the scan has fetched the outside data. `trigger` is
+    (price, close time in ms of the trigger bar) or None.
+    """
+    sig["score"], sig["grade"] = score_signal(sig, htf_ok, oi_chg, fund)
+    sig["htf_ok"] = bool(htf_ok)
+    sig["oi_chg_pct"] = None if oi_chg is None else round(oi_chg, 1)
+    sig["regime"] = regime_tag(sig["side"], sig["above_ema200"], btc_rsi)
+    sig["trigger_price"] = px(trigger[0]) if trigger else None
+    # "first" = the trigger bar closed before the signal bar did
+    sig["trigger_first"] = bool(trigger and (sig["forming"] or trigger[1] < sig["signal_close_ms"]))
+    sig["tags"] = [t for t, on in (("TRIPLE", sig["triple"]),
+                                   ("W-PATTERN", sig["bump_frac"] >= 0.5),
+                                   ("LTF TRIGGER", bool(trigger)),
+                                   ("ZERO-LINE CROSS", sig["zero_cross"])) if on]
+    sig.update(build_targets(sig))
+    return sig
+
+
+# ── Outside context for a signal ───────────────────────────────────────────────
+def asof(series, ts):
+    """Last value at or before ts, or None."""
+    s = series.loc[:ts]
+    return float(s.iloc[-1]) if len(s) else None
+
+
+def htf_agrees(htf, close_ts, htf_minutes, side):
+    """Was the higher-timeframe MACD line rising (falling for bearish) on its
+    last bar completed by close_ts? Frames are indexed by bar OPEN time, so a
+    bar is complete once open + htf_minutes <= close_ts."""
+    if htf is None:
+        return False
+    m = htf["macd"].loc[:close_ts - pd.Timedelta(minutes=htf_minutes)]
+    if len(m) < 2:
+        return False
+    return bool(m.iloc[-1] > m.iloc[-2]) if side == "bullish" else bool(m.iloc[-1] < m.iloc[-2])
+
+
+def ltf_trigger(ltf, side, since_ts, from_ts, ltf_minutes):
+    """Early-entry trigger on the lower timeframe (spec Step 8).
+
+    From from_ts (the signal bar's open) onward: the MACD has crossed in the
+    signal's direction AND a candle closes beyond the last 3/3 swing high
+    (low for bearish) made since since_ts (price extreme B). Returns
+    (close of that candle, its close time in ms), or None.
+    """
+    k = 1 if side == "bullish" else -1
+    d = ((ltf["macd"] - ltf["signal"]) * k).values
+    close = ltf["close"].values
+    src = ltf["high"].values if k > 0 else ltf["low"].values
+    highs, lows = find_pivots(src, 3, 3)
+    piv = [p for p in (highs if k > 0 else lows) if ltf.index[p] >= since_ts]
+    crossed = False
+    for i in range(max(1, int(ltf.index.searchsorted(from_ts))), len(ltf)):
+        crossed = crossed or (d[i] > 0 and d[i - 1] <= 0)
+        known = [p for p in piv if p + 3 < i]          # confirmed by bars before this one
+        if crossed and known and k * close[i] > k * src[known[-1]]:
+            return float(close[i]), int(ltf.index[i].timestamp() * 1000) + ltf_minutes * 60_000
+    return None
+
+
+def oi_change_pct(hist, t0_ms, t1_ms):
+    """% change in open interest between two times, or None when the history
+    does not cover both. One unit is used for both points (coin amount when the
+    venue reports it, else USD value) so a price move is not read as OI."""
+    # shortcut: nearest point at or before each time, so a history coarser than
+    # the wave gives None; grade_signals then tries the daily one after the hourly.
+    pts = sorted((p for p in (hist or []) if p.get("timestamp")), key=lambda p: p["timestamp"])
+    for key in ("openInterestAmount", "openInterestValue"):
+        a = [p for p in pts if p["timestamp"] <= t0_ms and p.get(key)]
+        b = [p for p in pts if p["timestamp"] <= t1_ms and p.get(key)]
+        if a and b and b[-1] is not a[-1]:
+            return (float(b[-1][key]) / float(a[-1][key]) - 1) * 100.0
+    return None
+
+
+def add_context(sig, htf, ltf, oi_hist, fund, btc):
+    """Re-grade a signal with everything fetched for it. Any argument may be
+    None; that component then scores nothing."""
+    cfg = TF_CFG[sig["tf"]]
+    close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
+    trig = None
+    if ltf is not None and sig["fresh"]:
+        trig = ltf_trigger(ltf, sig["side"], pd.Timestamp(sig["b_ms"], unit="ms"),
+                           pd.Timestamp(sig["signal_ms"], unit="ms"), cfg["ltf_minutes"])
+    btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) if btc is not None else None
+    return finish_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], sig["side"]),
+                         oi_change_pct(oi_hist, sig["b_start_ms"], sig["b_ms"]),
+                         fund, btc_rsi, trig)
+
+
+def grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, fund, btc):
+    """Give each signal the context that belongs to its timeframe.
+
+    4H signal: higher timeframe = 1D (d1), lower = 1H (df1).
+    1H signal: higher timeframe = 4H (df4), lower = 15m (df15).
+    Open interest: hourly history when it covers wave B, else daily.
+    Any frame may be None.
+    """
+    for s in sigs:
+        four = s["tf"] == "4h"
+        hist = oi_h if oi_change_pct(oi_h, s["b_start_ms"], s["b_ms"]) is not None else oi_d
+        add_context(s, d1 if four else df4, df1 if four else df15, hist, fund, btc)
+    return sigs
 
 
 # ── Entry verdict ──────────────────────────────────────────────────────────────
@@ -747,11 +795,13 @@ EVENT_WAIT_H = 24     # a curated macro print inside this many hours means wait
 def entry_verdict(sig, hours_to_event=None, event_title=""):
     """Is this setup enterable as of the scan? A CHECKLIST, not a prediction.
 
-    First matching rule wins, dead setups before waiting ones:
-      skip   stop hit · already ran 1R+ · second pivot outside the fresh window
-      wait   price ran >MOVED_PCT from the signal · MACD has not crossed since
-             the pivot · a market-mover print is inside EVENT_WAIT_H
-      enter  none of the above
+    First matching rule wins (spec "Good to enter?"):
+      skip   stop hit · already ran 1R+ · signal bar too old · grade C
+      wait   counter trend below grade A · price ran >MOVED_PCT from the signal ·
+             a market-mover print inside EVENT_WAIT_H · signal bar still
+             forming with no lower-timeframe trigger
+      enter  none of the above: "Yes (early)" on a forming signal bar,
+             "Yes (confirmed)" on a closed one
 
     `level` is a price the dashboard prints after the reason, so it is
     formatted in one place (sub-cent prices need plain digits).
@@ -766,20 +816,29 @@ def entry_verdict(sig, hours_to_event=None, event_title=""):
         return out("skip", f"No. Price already moved {sig['r_reached']:g}x the risk toward the "
                            "target. The move has happened; entering now is chasing it.")
     if not sig["fresh"]:
-        return out("skip", f"No. The divergence finished {sig['bars_ago']} bars ago, "
+        return out("skip", f"No. The signal bar closed {sig['bars_ago']} bars ago, "
                            "too long ago to act on.")
+    if sig["grade"] == "C":
+        return out("skip", f"No. Weak setup: grade C, score {sig['score']} of 100.")
+    if sig["regime"] == "COUNTER TREND" and sig["grade"] != "A":
+        return out("wait", "Not yet. Watch only: this is against the trend, and a counter-trend "
+                           f"setup needs grade A. This one is grade {sig['grade']}.")
     if st == "extended":
         return out("wait", f"Not yet. Price has already moved {sig['pct_chg']:g}% away from the "
                            "signal. Wait for it to pull back to",
                    sig["signal_price"])
-    if not sig["macd_cross"]:
-        return out("wait", "Not yet. MACD has not crossed its signal line, so momentum "
-                           "has not turned. Wait for the cross.")
     if hours_to_event is not None and hours_to_event <= EVENT_WAIT_H:
         return out("wait", f"Not yet. {event_title} is due in {hours_to_event:.0f}h and can "
                            "whip price. Wait until it has passed.")
-    return out("enter", "Yes. Price is still near the signal, MACD has crossed and the stop "
-                            f"is untouched. Risk {sig['risk_pct']}% to the stop at",
+    if sig["forming"] and not sig["trigger_first"]:
+        return out("wait", "Not yet. The signal bar is still forming and the lower timeframe "
+                           "has not triggered. Wait for the bar to close.")
+    if sig["forming"]:
+        return out("enter", "Yes (early). The lower timeframe triggered while the signal bar is "
+                            f"still forming. Risk {sig['risk_pct']}% to the stop at",
+                   sig["stop_price"])
+    return out("enter", f"Yes (confirmed). The signal bar has closed, the grade is {sig['grade']} "
+                        f"and the stop is untouched. Risk {sig['risk_pct']}% to the stop at",
                sig["stop_price"])
 
 
@@ -929,12 +988,12 @@ def oi_point_usd(pt, fallback_price):
     return None
 
 
-def fetch_oi_history(ex, limiter, sym, limit, tries=3):
+def fetch_oi_history(ex, limiter, sym, limit, tf="1d", tries=3):
     """Daily OI history with the same backoff discipline as fetch_ohlcv."""
     for attempt in range(tries):
         try:
             limiter.acquire()
-            return ex.fetch_open_interest_history(sym, timeframe="1d", limit=limit)
+            return ex.fetch_open_interest_history(sym, timeframe=tf, limit=limit)
         except Exception as e:
             msg = str(e)
             if any(t in msg for t in _TRANSIENT) and attempt < tries - 1:
@@ -1074,8 +1133,8 @@ def classify_mover(m, thin=False):
     """(qualifies, flags, score) for one analysed pair.
 
     The score ranks how UNUSUAL the day was and how close price sits to a
-    decision level. It carries NO direction and is NOT a win rate — the same
-    caveat as setup_score, for the same reason: nothing here was backtested.
+    decision level. It carries NO direction and is NOT a win rate. It is a
+    description, not a prediction.
 
     thin=True is the stricter test for the low-liquidity band: volume spike
     AND range expansion, where a liquid pair needs any one trigger.
@@ -1623,9 +1682,9 @@ def drop_forming_candle(df, tf_minutes):
 
     ccxt returns the in-progress bar as the last row. Leaving it in means MACD
     and ATR are computed partly from a bar that will change, so a scan run at
-    14:05 and one at 15:55 can disagree about the same setup. Pivots need
-    pivot_rb closed bars after it, so the open bar can't create one — but it can
-    still shift the indicator values everything else is measured against.
+    14:05 and one at 15:55 can disagree about the same setup. A signal needs a
+    closed cross, so the open bar cannot create one, but it can still shift the
+    indicator values.
     """
     if df is None or df.empty:
         return df
@@ -1635,31 +1694,59 @@ def drop_forming_candle(df, tf_minutes):
     return df
 
 
+def with_indicators(df):
+    return pd.concat([df, compute_indicators(df)], axis=1).dropna()
+
+
+def forming_df(raw, closed):
+    """The completed candles plus the still-open one, with indicators, or None
+    when no candle is open. Only ever used to spot a signal bar that is still
+    forming; everything else is computed on completed candles."""
+    return with_indicators(raw) if len(raw) == len(closed) + 1 else None
+
+
+def usdt_perps(mkts):
+    """Active linear USDT perps, minus stablecoin bases and TradFi perps."""
+    return [s for s in mkts
+            if s.endswith("/USDT:USDT") and mkts[s].get("active")
+            and s.split("/")[0] not in STABLE_BASES and not is_tradfi(mkts[s])]
+
+
+def fetch_btc_rsi(ex, limiter):
+    """BTC 4H RSI 14 on completed bars, for the regime tag. None when unavailable."""
+    df = drop_forming_candle(
+        fetch_df_deep(ex, limiter, "BTC/USDT:USDT", "4h", TF_CFG["4h"]["bars"]), 240)
+    if df is None or len(df) < 80:
+        return None
+    return pd.DataFrame({"rsi": rsi(df["close"])}).dropna()
+
+
 def pair_context(ex, limiter, sym, live_price, fund_day, wk_vol):
     """Movers + OI-flow context for a pair that HAS a divergence.
 
-    Returns (mover, flow, error). Two calls, spent only on pairs worth a row.
-    A failure here must never cost the row itself, so it comes back as text.
+    Returns (mover, flow, error, daily candles, daily OI history). The last two
+    are reused to grade the signal. A failure here must never cost the row
+    itself, so it comes back as text.
     """
     try:
         df = drop_forming_candle(
-            _to_df(fetch_ohlcv(ex, limiter, sym, "1d", limit=MOVER_LOOKBACK_D + 12)), 1440)
+            _to_df(fetch_ohlcv(ex, limiter, sym, "1d", limit=HTF_BARS_1D)), 1440)
         if df is None or df.empty:
-            return None, None, "no daily candles"
+            return None, None, "no daily candles", None, None
         mover = analyse_mover(df, live_price)
         if mover is not None:
             mover["flags"] = classify_mover(mover)[1]
         hist = fetch_oi_history(ex, limiter, sym, OI_LOOKBACK_D + 4)
-        return mover, flow_context(hist, df, live_price, fund_day, wk_vol), None
+        return mover, flow_context(hist, df, live_price, fund_day, wk_vol), None, df, hist
     except Exception as e:
-        return None, None, str(e)
+        return None, None, str(e), None, None
 
 
 # ── Dedupe ─────────────────────────────────────────────────────────────────────
 def dedupe(sigs):
     """One signal per side per pair.
 
-    Successive pivots of the same side are the same setup seen twice. Keep the
+    Successive divergences of the same side are the same setup seen twice. Keep the
     newest that is still alive; if every one on that side is invalidated, keep
     the newest anyway so the pair still reports what happened rather than going
     silent.
@@ -1706,38 +1793,220 @@ def build_rows(sigs, mover=None, flow=None, context_error=None,
         verdicts = {tf: entry_verdict(r["signals"][tf], hours_to_event, event_title)
                     for tf in r["tfs"]}
         best = min(r["tfs"], key=lambda tf: _VERDICT_RANK[verdicts[tf]["verdict"]])
+        p = r["signals"][best]
         r["primary_tf"] = best
-        r["score"]  = max(s["score"] for s in r["signals"].values())
+        r["score"], r["grade"], r["regime"] = p["score"], p["grade"], p["regime"]
         r["fresh"]  = any(s["fresh"] for s in r["signals"].values())
-        r["status"] = r["signals"][best]["status"]
+        r["status"] = p["status"]
         r["entry"]  = verdicts[best]
     return list(rows.values())
 
 
-def signals_for_tf(df, tf, rules, live_price, sym, wk_vol):
+def signals_for_tf(df, tf, rules, live_price, sym, wk_vol, forming_df=None):
     """Finished signals for one pair on one timeframe.
 
-    `df` must already carry the indicator columns. Fewer than 80 bars is not
-    enough for MACD to have settled, so that timeframe reports nothing.
+    `df` holds completed candles with the indicator columns. `forming_df` is
+    the same frame plus the still-open candle (or None); it contributes only a
+    signal whose signal bar is that open candle, flagged `forming`. Fewer than
+    80 bars is not enough for MACD to have settled.
+
+    Each signal keeps two private keys for the caller: `_df` (the frame it was
+    found on) and `_d` (the raw detection), used for the chart.
     """
     if df is None or len(df) < 80:
         return []
-    found = []
-    for sig in detect_divergences(df, TF_CFG[tf], rules):
-        sig.update(evaluate_status(df, sig, live_price))
-        found.append(sig)
+    cfg, found = TF_CFG[tf], []
+    for src, forming in ((forming_df, True), (df, False)):
+        if src is None:
+            continue
+        for side in ("bullish", "bearish"):
+            for d in detect_wave_divergence(src, side, rules):
+                if forming and d["signal_bar"] != len(src) - 1:
+                    continue
+                sig = _mk(src, d, cfg, forming)
+                sig.update(evaluate_status(src, sig, live_price))
+                sig["_df"] = src
+                found.append(sig)
     out = []
     for sig in dedupe(found):
-        sig.pop("_b", None)
-        sig.update(build_targets(sig, live_price))
+        sig.pop("_b")
         sig.update({
             "pair": sym, "base": sym.split("/")[0], "tf": tf,
             "current_price": px(live_price),
             "weekly_volume": round(wk_vol, 2) if wk_vol else None,
-            "score": setup_score(sig, wk_vol),
         })
-        out.append(sig)
+        out.append(finish_signal(sig))
     return out
+
+
+# ── Chart preview ──────────────────────────────────────────────────────────────
+def render_chart(df, d, sig):
+    """PNG of the A-to-B leg: candles with the stop and R lines over the MACD
+    panel with its trough and crossover dots. `d` is the raw detection (bar
+    indexes into `df`), `sig` the finished signal (levels)."""
+    lo = max(0, d["a_start"] - 10)
+    v = df.iloc[lo:min(len(df), d["signal_bar"] + 30)]
+    x = np.arange(len(v))
+    fig = Figure(figsize=(9, 5.5), tight_layout=True)
+    ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
+
+    up = (v["close"] >= v["open"]).values
+    for mask, col in ((up, "#26a69a"), (~up, "#ef5350")):
+        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=1)
+        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=3)
+    ax.plot([d["a_p"] - lo, d["b_p"] - lo], [d["a_price"], d["b_price"]],
+            color="#f5a623", lw=1.5, marker="o")
+    t = sig["targets"]
+    for lvl, col, lbl in ((sig["stop_price"], "#ef5350", "stop"), (t["1r"], "#26a69a", "1R"),
+                          (t["2r"], "#26a69a", "2R"), (t["3r"], "#26a69a", "3R")):
+        ax.axhline(lvl, color=col, lw=0.8, ls="--")
+        ax.text(len(v) - 1, lvl, lbl, color=col, fontsize=8, va="bottom", ha="right")
+    ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']} divergence, "
+                 f"grade {sig['grade']} ({sig['score']})", fontsize=10)
+
+    am.plot(x, v["macd"].values, color="#2962ff", lw=1.2, label="MACD")
+    am.plot(x, v["signal"].values, color="#ff6d00", lw=1, label="signal")
+    am.axhline(0, color="#888888", lw=0.5)
+    am.plot([d["a_m"] - lo, d["b_m"] - lo], [d["a_macd"], d["b_macd"]],
+            color="#f5a623", lw=1.5, marker="o")
+    for bar, direction in d["crosses"]:
+        am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
+                color="#26a69a" if direction > 0 else "#ef5350")
+    am.legend(loc="upper left", fontsize=7)
+    step = max(1, len(v) // 6)
+    shown = v.index[::step] + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
+    am.set_xticks(x[::step])
+    am.set_xticklabels([ts.strftime("%b %d %H:%M") for ts in shown], fontsize=7)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110)
+    return buf.getvalue()
+
+
+# ── Backtest ───────────────────────────────────────────────────────────────────
+BT_WARMUP = 80      # bars before the replay starts, so MACD has settled
+
+
+def trade_outcome(df, i, side, entry, stop):
+    """What happened to a trade entered at the close of bar i.
+
+    hit = highest R target (0-3) reached before the stop. Inside one bar the
+    stop is checked first, the conservative read when a bar touches both.
+    """
+    k = 1 if side == "bullish" else -1
+    risk = max((entry - stop) * k, entry * 0.005)
+    hi, lo = df["high"].values, df["low"].values
+    hit, mae, stopped, bars = 0, 0.0, False, None
+    for j in range(i + 1, len(df)):
+        worst, best = (lo[j], hi[j]) if k > 0 else (hi[j], lo[j])
+        mae = max(mae, (entry - worst) * k / risk)
+        if (worst - stop) * k <= 0:
+            stopped, bars = True, j - i
+            break
+        hit = max(hit, min(3, int((best - entry) * k // risk)))
+        if hit == 3:
+            bars = j - i
+            break
+    return {"hit": hit, "stopped": stopped, "bars": bars, "mae_r": round(float(mae), 2)}
+
+
+def backtest_pair(df, tf, rules, htf=None, btc=None):
+    """Replay one pair bar by bar. Bar i sees df.iloc[:i + 1] and nothing else.
+
+    A signal is taken the first time the detector reports it, at that bar's
+    close. Not replayed: open interest (no bar-by-bar history) and the
+    lower-timeframe trigger, so a score here can differ from the live one by up
+    to 10 points either way.
+    """
+    cfg, seen, trades = TF_CFG[tf], set(), []
+    close = df["close"].values
+    for i in range(BT_WARMUP, len(df) - 1):
+        view = df.iloc[:i + 1]
+        for side in ("bullish", "bearish"):
+            k = 1 if side == "bullish" else -1
+            for d in detect_wave_divergence(view, side, rules):
+                key = (side, d["b_m"])
+                if d["signal_bar"] <= i - WHIP_BARS or key in seen:
+                    continue                       # old news, or already taken
+                seen.add(key)
+                sig = _mk(view, d, cfg)
+                entry, stop = float(close[i]), sig["stop_price"]
+                if (entry - stop) * k <= 0:
+                    continue                       # already through the stop when first seen
+                # Graded as of the signal bar's close, exactly like add_context.
+                close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
+                btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) \
+                    if btc is not None else None
+                score, grade = score_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], side))
+                trades.append(dict(
+                    trade_outcome(df, i, side, entry, stop), tf=tf, side=side,
+                    score=score, grade=grade, time=str(view.index[-1]),
+                    regime=regime_tag(side, sig["above_ema200"], btc_rsi)))
+    return trades
+
+
+def summarise(trades, key):
+    """Per group: count, and for each target R the win rate (%) and average R
+    of exiting there, over trades that reached that target or the stop."""
+    rows = []
+    for g in sorted({t[key] for t in trades}):
+        ts = [t for t in trades if t[key] == g]
+        row = {key: g, "n": len(ts)}
+        for r in (1, 2, 3):
+            done = [t for t in ts if t["stopped"] or t["hit"] >= r]
+            wins = sum(t["hit"] >= r for t in done)
+            row[f"win{r}"] = round(100 * wins / len(done), 1) if done else None
+            row[f"avg_r{r}"] = round((wins * r - (len(done) - wins)) / len(done), 2) if done else None
+        rows.append(row)
+    return rows
+
+
+def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
+    """Fetch the scan's own history for the most liquid pairs and print win
+    rate and average R per grade and per regime."""
+    rules = STRICTNESS[strictness]
+    ex = make_exchange(exid)
+    mkts = ex.load_markets()
+    limiter = RateLimiter(SPEED["safe"]["rps"][exid])
+    perps = usdt_perps(mkts)
+    if symbols:
+        pairs = [s for s in perps if s.split("/")[0] in symbols]
+        if not pairs:
+            print(f"No matching USDT perps on {exid.upper()}.")
+            return
+    else:
+        tickers = ex.fetch_tickers()
+        pairs = sorted(perps, key=lambda s: usd_volume(tickers.get(s)) or 0, reverse=True)[:n_pairs]
+
+    def load(sym, tf, bars, minutes):
+        df = drop_forming_candle(fetch_df_deep(ex, limiter, sym, tf, bars), minutes)
+        return with_indicators(df) if df is not None and len(df) >= 80 else None
+
+    btc = fetch_btc_rsi(ex, limiter)
+    trades = []
+    for n, sym in enumerate(pairs, 1):
+        d4 = load(sym, "4h", TF_CFG["4h"]["bars"], 240)
+        d1h = load(sym, "1h", TF_CFG["1h"]["bars"], 60)
+        d1d = load(sym, "1d", HTF_BARS_1D, 1440)
+        got = (backtest_pair(d4, "4h", rules, d1d, btc) if d4 is not None else []) + \
+              (backtest_pair(d1h, "1h", rules, d4, btc) if d1h is not None else [])
+        trades += got
+        print(f"[{n}/{len(pairs)}] {sym}: {len(got)} signal(s)")
+
+    def cell(v, suffix=""):
+        return f"{'-' if v is None else str(v) + suffix:>9}"
+
+    for key in ("grade", "regime"):
+        print(f"\nBy {key}")
+        print(f"{key:<15}{'n':>5}" + "".join(f"{f'win@{r}R':>9}{f'avgR@{r}R':>9}" for r in (1, 2, 3)))
+        for row in summarise(trades, key):
+            print(f"{row[key]:<15}{row['n']:>5}" +
+                  "".join(cell(row[f'win{r}'], '%') + cell(row[f'avg_r{r}']) for r in (1, 2, 3)))
+    print("\nwin@NR = share of resolved trades that reached N x risk before the stop; "
+          "avgR@NR = average result of exiting there.\n"
+          "Entry is the close of the bar the signal first appears on. Open interest and the "
+          "lower-timeframe trigger are not replayed,\nso a score here can differ from the "
+          "live scan's by up to 10 points either way.")
 
 
 # ── State persistence ──────────────────────────────────────────────────────────
@@ -1758,9 +2027,9 @@ def load_state():
         with open(STATE_FILE) as f:
             data = json.load(f)
         meta = data.get("meta", {})
-        if "tfs" not in meta:
-            # Written before rows existed (flat signal list, single timeframe).
-            # The page cannot draw it, so start empty rather than broken.
+        if meta.get("v") != STATE_VERSION:
+            # Written with an older row shape. The page cannot draw it, so
+            # start empty rather than broken.
             print("[state] last scan is from an older version - ignored")
             return
         with _lock:
@@ -1821,6 +2090,14 @@ def signals_route():
                         "ts": _state["ts"].isoformat() if _state["ts"] else None})
 
 
+@app.route("/chart")
+def chart_route():
+    hit = _charts.get("|".join(request.args.get(k, "") for k in ("pair", "side", "tf")))
+    if hit is None:
+        return "No chart data for this row. Run the scan again.", 404
+    return Response(render_chart(*hit), mimetype="image/png")
+
+
 @app.route("/universe")
 def universe_route():
     """How big the tradable universe is at a given weekly-volume floor, without
@@ -1836,12 +2113,8 @@ def universe_route():
         return jsonify({"error": str(e)}), 500
 
     rows = []
-    for sym in mkts:
-        if not (sym.endswith("/USDT:USDT") and mkts[sym].get("active")):
-            continue
+    for sym in usdt_perps(mkts):
         base = sym.split("/")[0]
-        if base in STABLE_BASES or is_tradfi(mkts[sym]):
-            continue
         v = usd_volume(tickers.get(sym))
         if v:
             rows.append({"base": base, "sym": sym, "wk": v * 7.0})
@@ -1887,10 +2160,7 @@ def scan_route():
         except Exception as e:
             yield sse("error", {"msg": f"load_markets failed: {e}"}); return
 
-        perps = [s for s in mkts
-                 if s.endswith("/USDT:USDT") and mkts[s].get("active")
-                 and s.split("/")[0] not in STABLE_BASES
-                 and not is_tradfi(mkts[s])]
+        perps = usdt_perps(mkts)
         yield sse("log", {"msg": f"{len(perps)} active linear USDT perps on {exid.upper()}"})
 
         yield sse("log", {"msg": "Fetching 24h volumes (one bulk call)..."})
@@ -1960,6 +2230,10 @@ def scan_route():
 
         spd = SPEED[speed]
         limiter = RateLimiter(spd["rps"].get(exid, 8))
+        btc = fetch_btc_rsi(main_ex, limiter)
+        if btc is None:
+            yield sse("log", {"msg": "BTC 4H candles unavailable: every setup is tagged COUNTER TREND"})
+        _charts.clear()
         workers = spd["workers"]
         yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on 4H + 1H · "
                                  f"{strictness} · {workers} workers"})
@@ -1979,9 +2253,6 @@ def scan_route():
         counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0,
                    "no_1h": 0}
         clock = threading.Lock()
-
-        def with_indicators(df):
-            return pd.concat([df, compute_indicators(df)], axis=1).dropna()
 
         def scan_pair(sym):
             base = sym.split("/")[0]
@@ -2011,18 +2282,21 @@ def scan_route():
                         counter["vol_reject"] += 1
                     return
 
+                f4 = forming_df(raw, df4)
                 df4 = with_indicators(df4)
                 if len(df4) < 80:
                     with clock:
                         counter["no_data"] += 1
                     return
 
-                df1 = None
+                df1 = f1 = None
                 raw1 = fetch_df_deep(ex, limiter, sym, "1h", TF_CFG["1h"]["bars"])
                 if raw1 is not None and len(raw1) >= 80:
                     live_price = float(raw1["close"].iloc[-1])    # the newer tick
                     df1 = drop_forming_candle(raw1, TF_CFG["1h"]["minutes"])
-                    df1 = with_indicators(df1) if df1 is not None else None
+                    if df1 is not None:
+                        f1 = forming_df(raw1, df1)
+                        df1 = with_indicators(df1)
                 if df1 is None or len(df1) < 80:
                     with clock:
                         counter["no_1h"] += 1
@@ -2030,12 +2304,24 @@ def scan_route():
                 with clock:
                     counter["analysed"] += 1
 
-                sigs = (signals_for_tf(df4, "4h", rules, live_price, sym, wk_vol) +
-                        signals_for_tf(df1, "1h", rules, live_price, sym, wk_vol))
+                sigs = (signals_for_tf(df4, "4h", rules, live_price, sym, wk_vol, f4) +
+                        signals_for_tf(df1, "1h", rules, live_price, sym, wk_vol, f1))
                 if not sigs:
                     return
-                mover, flow, cerr = pair_context(ex, limiter, sym, live_price,
-                                                 funding.get(sym), wk_vol)
+                # Everything below is fetched only for pairs worth a row.
+                mover, flow, cerr, d1, oi_d = pair_context(ex, limiter, sym, live_price,
+                                                           funding.get(sym), wk_vol)
+                d1 = with_indicators(d1) if d1 is not None else None
+                oi_h = df15 = None
+                if any(s["fresh"] for s in sigs):       # stale signals answer No whatever the grade
+                    oi_h = fetch_oi_history(ex, limiter, sym, 100, tf="1h")
+                if any(s["tf"] == "1h" and s["fresh"] for s in sigs):
+                    df15 = drop_forming_candle(
+                        fetch_df_deep(ex, limiter, sym, "15m", LTF_BARS_15M), 15)
+                    df15 = with_indicators(df15) if df15 is not None and len(df15) >= 80 else None
+                grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, funding.get(sym), btc)
+                for s in sigs:
+                    _charts[f"{sym}|{s['side']}|{s['tf']}"] = (s.pop("_df"), s.pop("_d"), dict(s))
                 for row in build_rows(sigs, mover, flow, cerr, ev_h, ev_title):
                     q.put(("result", row))
             except Exception as e:
@@ -2066,11 +2352,11 @@ def scan_route():
             # that failed the weekly-volume gate, came back with no candles or
             # threw were all counted as scanned, so the headline could be
             # nearly double the number of coins actually analysed. It now
-            # reports what reached detect_divergences, and every other bucket
+            # reports what reached the detector, and every other bucket
             # is reported alongside it instead of disappearing.
             with clock:
                 c = dict(counter)
-            meta = {"exchange": exid, "tfs": list(TF_CFG), "strictness": strictness,
+            meta = {"v": STATE_VERSION, "exchange": exid, "tfs": list(TF_CFG), "strictness": strictness,
                     "min_weekly_vol": min_vol, "universe": len(perps),
                     "dispatched": len(pairs), "scanned": c["analysed"],
                     "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
@@ -2475,10 +2761,9 @@ table.stale .ev{opacity:.4}
 tbody tr.main-row{cursor:pointer}
 tr.det td{background:var(--sf);font-family:var(--mono);font-size:10px;color:var(--tx2);line-height:1.8;padding:10px 16px}
 tr.det b{color:var(--tx)}
+tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1px solid var(--bd2);border-radius:4px}
 .tfb-on{color:var(--tx);border-color:var(--tx3)}
 .tfb{display:inline-block;margin-left:4px;padding:2px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
-.volc{font-family:var(--mono);font-size:11px;color:var(--tx2)}
-.volc small{display:block;font-size:9px;color:var(--tx3)}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;color:var(--tx3);font-family:var(--mono);font-size:12px}
 .empty-icon{font-size:28px;opacity:.3}
 .greet{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;padding:48px 40px}
@@ -2632,7 +2917,7 @@ tr.det b{color:var(--tx)}
         <button class="tbtn active" data-val="balanced">Balanced</button>
         <button class="tbtn" data-val="strict">Strict</button>
       </div>
-      <div class="hint" id="strHint">MACD pivot must align with the price pivot, the divergence line must be unbroken, and the move must clear a minimum size.</div></div>
+      <div class="hint" id="strHint">Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.</div></div>
 
     <div class="ss"><div class="fl">Max pairs to scan</div>
       <div class="nw"><button class="nb" onclick="stepPairs(-25)">-</button><input type="number" id="maxPairs" value="__DEFAULT_MAX_PAIRS__" min="10" max="600" step="25"><button class="nb" onclick="stepPairs(25)">+</button></div>
@@ -2692,13 +2977,15 @@ tr.det b{color:var(--tx)}
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. ENTER: second pivot is recent, price has not run more than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on whichever timeframe's signal is furthest along: Enter beats Wait beats Skip, 4H wins a tie. The highlighted timeframe tag shows which one. Default order: Yes, then Not yet, then No. Yes and Not yet put 4H+1H first; No rows are newest first.">Good to enter? &#8595;</th>
-          <th title="Regular bullish: price makes a lower low while the MACD line makes a higher low. Regular bearish: price makes a higher high while the MACD line makes a lower high. The tags show which timeframes diverge; 4H+1H agreeing sorts first.">Side &middot; TF</th>
-          <th title="Not part of the verdict. Movers tags describe the last completed day against this coin's own 20-day baseline. OI tags describe 7-day open-interest flow and funding. Hover a tag for its definition.">Context</th>
-          <th class="sortable" data-sort="vol" title="Rolling 7-day traded value in USD, measured from the 4H candles. The liquidity gate.">Weekly vol</th>
-          <th class="sortable" data-sort="age" title="Time of pivot B, the bar that completed the divergence, on the row's main timeframe.">Signal date</th>
-          <th title="Just past pivot B plus an ATR-sized buffer. Price trading through it means the divergence has failed. Risk = stop distance as a % of the entry reference.">Stop</th>
-          <th title="Multiples of the stop distance. Anchored to the signal price while the setup is still near it; re-anchored to the live price once it has run.">Targets (1R / 2R / 3R)</th>
+          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a market-mover print inside 24 hours, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
+          <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
+          <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
+          <th title="WITH TREND: BTC 4H RSI and this coin's 200 EMA both agree with the side. COUNTER TREND setups need grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
+          <th class="sortable" data-sort="age" title="The signal bar is the MACD cross that ends the second wave. Shown: its closing price, and the bar's time as a chart labels it (the bar's open).">Signal</th>
+          <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
+          <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
+          <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
+          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 5 score points and LTF TRIGGER is what allows Yes (early). Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -2786,8 +3073,7 @@ tr.det b{color:var(--tx)}
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75;margin-bottom:18px">
       Regular divergence only &mdash; price and momentum disagreeing at a trend extreme, which is the
       classic <b style="color:var(--tx)">reversal</b> signature. Hidden (continuation) divergences are
-      not scanned. Between pivot A and pivot B the price line and the MACD line move in opposite
-      directions; that mismatch is the whole signal.
+      not scanned. It is read the way you would on a chart: the MACD/signal crossovers split the MACD line into waves, each wave below the signal line is one trough, and two neighbouring troughs A and B are compared with the price lows inside those same waves. Price lower, MACD trough higher: that mismatch is the whole signal.
     </div>
   </div>
 
@@ -2842,32 +3128,32 @@ tr.det b{color:var(--tx)}
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">The rules a signal has to pass (Balanced)</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so a scan at 14:05 and one at 15:55 agree about the same setup. Nothing repaints.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Real swing extremes.</b> Troughs come from the candle low and peaks from the high &mdash; not the close. Divergence lines get drawn from wicks, so pivots found on closes sit on the wrong bar.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>MACD has to be pivoting too.</b> A price pivot only counts if a MACD pivot sits within 3 bars of it, and the MACD value used is that pivot's own extreme. Momentum often turns a bar or two off price &mdash; demanding the same bar loses real setups, demanding nothing accepts bars where MACD was not swinging at all.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The line must be clean.</b> No bar between A and B may undercut B's low (bullish) or exceed B's high (bearish), and no bar's MACD may break past A's extreme. If either happens, the swing you would have drawn is not actually there.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be a meaningful share of the MACD range across the leg. This is what kills micro-divergences that look like nothing on the chart.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Every prior pivot is tested, not just the nearest.</b> The nearest prior swing is usually a shallow intermediate dip that does not diverge. Pivot B is compared against every pivot in the lookback window, and among those that pass, the deepest MACD extreme wins &mdash; the line you would draw by hand.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so two scans inside the same bar agree. The one exception is a row marked &ldquo;bar still forming&rdquo;: it is provisional and can disappear.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Waves come from the crossovers.</b> A bear wave runs from a bearish MACD/signal cross to the next bullish cross, a bull wave the other way. A cross only counts if the two lines separate by 5% of the recent MACD range within 3 bars, and a wave shorter than 3 bars is merged into its neighbours, so a tiny double dot cannot split one trough into two.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One trough per wave.</b> The MACD trough is the lowest MACD-line value in the wave. The price low is the lowest wick from the start of the wave to 2 bars after it ends, because price often bottoms just after momentum turns.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>A then B, with a real bump between.</b> Two neighbouring troughs, 8 to 80 bars apart. The MACD peak between them must rise at least 25% of the leg's MACD range above the higher trough: that is the middle of the W.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be at least 15% of the leg's MACD range. This is what kills micro-divergences.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Reported only when wave B is closed.</b> The cross that ends wave B is the signal bar and its close is the signal price. Before that cross there is no signal.</div></div>
       <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars.</div></div>
     </div>
   </div>
 
   <div class="dash-sec" style="margin-top:28px">
-    <div class="dash-sec-ttl">Entry verdict &mdash; a checklist, not a prediction</div>
+    <div class="dash-sec-ttl">Good to enter? &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>ENTER means five things are true at scan time.</b> The second pivot is within the last 12 bars, price has not run more than 2% past the signal price, the stop has not been touched, the MACD line has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. It does not mean the trade works.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>WAIT names the one thing missing.</b> A pullback to the signal price after price ran, the MACD cross, or a CPI / FOMC-class print that is too close. A divergence is listed as WAIT as soon as its second pivot is confirmed, so you see it before it is enterable.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>SKIP is history.</b> The stop was hit, the move already made 1R or more, or the second pivot is older than 12 bars. These rows only appear under the All filter.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The verdict ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old, one full 1H bar has closed since, the verdicts dim and the page asks for a re-run.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags, sorts first, and takes its verdict, stop and targets from whichever signal is furthest along (Enter beats Wait beats Skip, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's pivots and levels.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>When a divergence is listed, and when it leaves.</b> A pivot is confirmed once 3 closed bars follow it, so a 4H divergence appears about 12 hours after its second pivot and a 1H one after 3 hours. The two pivots are at most 60 bars apart. A divergence is never dropped for its age: each coin lists its most recent one per side and timeframe from the candles scanned (about 120 days of 4H, 21 days of 1H). Old ones stay listed and answer No.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a CPI / FOMC-class print inside 24 hours, or a signal bar that has not closed and has no lower-timeframe trigger.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> WITH TREND means BTC 4H RSI is on the signal's side of 50 and the coin is on the right side of its 200 EMA. Anything else is COUNTER TREND and needs grade A.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's levels and its chart.</div></div>
     </div>
   </div>
 
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">Context tags &mdash; what else is true about this coin</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Context never changes the verdict.</b> It is fetched only for coins that already have a divergence, and it is yours to weigh.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Movers and OI-flow tags never change the answer.</b> They are fetched only for coins that already have a divergence, and they are yours to weigh. The grade does use some of the same data: the higher timeframe's MACD and the change in open interest into B are score components.</div></div>
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Movers tags describe the last completed day.</b> VOLUME SPIKE and RANGE EXPANSION are measured against the coin's own 20-day baseline, BIG MOVE is a 5%+ day, and the range tags say price is at or through its 7-day high or low. A bearish divergence AT RANGE HIGH is the textbook fade; the same divergence mid-range is weaker.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>OI tags describe 7-day positioning.</b> Price and open interest together give the quadrant: NEW LONGS, NEW SHORTS, SHORT COVERING, CAPITULATION. Funding refines it: SPOT-LED is the healthy version of new longs, CROWDED LONGS is leverage arriving late, SQUEEZE FUEL is shorts crowded and paying. No OI tag means open interest moved less than 5% or the contract is too new to judge.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL is a crowding warning, not a direction.</b> Open interest above about 1.5x average daily volume means positions cannot exit without moving the price. Size down.</div></div>
@@ -2883,23 +3169,22 @@ tr.det b{color:var(--tx)}
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Every row arrives with levels.</b> Prior-day high and low, the 7-day range boundaries, and where price sits inside that range right now. A watchlist without a level and a point where you are wrong is a list of names, not a plan &mdash; and that is the part these posts usually leave out.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Completed bars only.</b> The scan describes the last <b>closed</b> day, so it reads the same at 02:00 and at 22:00. It tells you what happened yesterday so you can plan today; it is not a live intraday tape.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>No stocks, ETFs or commodities.</b> Those perps are excluded from the universe entirely. Their underlying market closes at the weekend, leaving a thin book, funding-driven drift and a gap at the Monday cash open &mdash; quoting a weekend level on one is quoting a level on nothing.</div></div>
-      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>The standout score is a description, not an edge.</b> Volume anomaly (35), range expansion (30), proximity to a 7-day boundary (20), size of the move (15). It has no direction and has not been backtested &mdash; the same caveat as the setup score.</div></div>
+      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>The standout score is a description, not an edge.</b> Volume anomaly (35), range expansion (30), proximity to a 7-day boundary (20), size of the move (15). It has no direction and has not been backtested &mdash; it is not a win rate.</div></div>
     </div>
   </div>
 
   <div class="dash-sec">
-    <div class="dash-sec-ttl">Setup score &mdash; only used to order rows</div>
+    <div class="dash-sec-ttl">Quality score and grade</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
-      The table no longer shows this number; it only breaks ties in the row order. The score is a <b style="color:var(--tx)">description of the structure</b>, not a win rate and not a
-      backtested edge. It adds up: how large the momentum divergence is relative to the leg (30), how
-      decisive the price break is in ATR terms (15), whether the pivots are sensibly spaced (15), whether
-      they sit on the classic side of the MACD zero line (15), whether MACD has crossed its signal line
-      since the pivot (15), and how liquid the pair is (10).
+      0 to 100, graded <b style="color:var(--tx)">A</b> (70+), <b style="color:var(--tx)">B</b> (55-69) or
+      <b style="color:var(--tx)">C</b> (below 55). It adds up: the price difference A to B in ATR (15), the MACD
+      trough improvement (15), the height of the bump (10), both troughs on the classic side of zero (10), the
+      higher timeframe's MACD agreeing (15), volume drying up in wave B (10), a rejection wick at B (10), open
+      interest falling into B with funding not against it (10), a triple divergence (5). Open interest rising
+      more than 5% against the signal costs 10.
       <br><br>
-      A 90 means a clean textbook picture. It does not mean the trade works. The previous version quoted
-      win rates from a backtest of a different configuration &mdash; weekly regime filter on, hidden
-      divergences included, 22 fixed pairs &mdash; and none of that describes what you are looking at here,
-      so those numbers are gone rather than quietly repurposed.
+      The grade describes the setup. It is not a win rate. To see how each grade and regime has actually done on
+      the stored candles, run <b style="color:var(--tx)">python macd_divergence_screener_v5.py --backtest</b>.
     </div>
   </div>
 </div>
@@ -2923,6 +3208,12 @@ function qcell(q){
     '<span style="font-size:9px;opacity:.7;margin-left:3px">' + lbl + '</span></span>' +
     '<div class="qbar"><div class="qfill" style="width:' + q + '%;background:' + c + '"></div></div></div>';
 }
+function gradeCell(p){
+  var c = p.grade === 'A' ? 'var(--bull)' : p.grade === 'B' ? 'var(--fresh)' : 'var(--tx3)';
+  return '<div class="qc"><span class="qnum" style="color:' + c + '">' + p.grade +
+    '<span style="font-size:9px;opacity:.7;margin-left:3px">' + p.score + '</span></span>' +
+    '<div class="qbar"><div class="qfill" style="width:' + p.score + '%;background:' + c + '"></div></div></div>';
+}
 // Sub-cent tokens round to values like 9.8e-06, and JS stringifies anything
 // below 1e-6 with an exponent — an unusable price level. Force plain digits.
 function fmtPx(v){
@@ -2936,9 +3227,6 @@ function fmtVol(v){
   if(v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
   return '$' + Math.round(v).toLocaleString();
 }
-function volCell(d){
-  return '<div class="volc">' + fmtVol(d.weekly_volume) + '<small>7 days</small></div>';
-}
 function b2t(bars, tf){
   var m = bars * ((TFM[tf] && TFM[tf].minutes) || 240);
   if(m < 60) return m + 'm ago';
@@ -2948,9 +3236,9 @@ function b2t(bars, tf){
 }
 
 var EV = {
-  enter: {lbl:'&#10003; ENTER', cls:'ev-enter'},
-  wait:  {lbl:'&#9203; WAIT',   cls:'ev-wait'},
-  skip:  {lbl:'&#10005; SKIP',  cls:'ev-skip'}
+  enter: {lbl:'&#10003; YES',     cls:'ev-enter'},
+  wait:  {lbl:'&#9203; NOT YET', cls:'ev-wait'},
+  skip:  {lbl:'&#10005; NO',     cls:'ev-skip'}
 };
 var EV_RANK = {enter:0, wait:1, skip:2};
 function verdict(r){ return (r.entry && r.entry.verdict) || 'skip'; }
@@ -2974,8 +3262,11 @@ function evCell(r){
          '<span class="tsub">' + txt + '</span></div>';
 }
 function ctxCell(r){
-  if(r.context_error) return '<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>';
   var h = [];
+  (primary(r).tags || []).forEach(function(f){
+    h.push('<span class="wflag wf-hioi"' + tip(f) + '>' + f + '</span>');
+  });
+  if(r.context_error) h.push('<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>');
   ((r.mover || {}).flags || []).forEach(function(f){
     h.push('<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
   });
@@ -3047,7 +3338,11 @@ var TIP = {
   'AT RANGE HIGH':   'Within ' + TH.edge + '% of the 7-day high.',
   'ABOVE 7D HIGH':   'Price has traded through the 7-day high.',
   'AT RANGE LOW':    'Within ' + TH.edge + '% of the 7-day low.',
-  'BELOW 7D LOW':    'Price has traded through the 7-day low.'
+  'BELOW 7D LOW':    'Price has traded through the 7-day low.',
+  'TRIPLE':          'The trough before A also diverges from A: three troughs in a row, price lower each time, MACD higher each time.',
+  'W-PATTERN':       'The bump between A and B is at least half the MACD range of the leg: a clear W (M for bearish).',
+  'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
+  'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 
@@ -3226,8 +3521,8 @@ function startMovers(){
 
 /* ── Sidebar controls ─────────────────────────────────────────────────────── */
 var STR_HINTS = {
-  balanced: 'MACD pivot must align with the price pivot, the divergence line must be unbroken, and the move must clear a minimum size.',
-  strict:   'Balanced plus the zero-line condition: both bullish MACD pivots below zero, both bearish above. Fewer signals, higher conviction.'
+  balanced: 'Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.',
+  strict:   'Larger minimum size, and both troughs must sit below the zero line (both peaks above it for bearish).'
 };
 ['strG','spdG'].forEach(function(g){
   document.querySelectorAll('#' + g + ' .tbtn').forEach(function(b){
@@ -3371,12 +3666,13 @@ function pushBg(pair, isHit){
 function resetBg(){ var f = document.getElementById('sbgFeed'); if(f) f.innerHTML = ''; }
 
 function tgtHtml(d){
-  var tgt = d.targets || {}, fromCur = d.targets_from === 'current';
-  return '<div style="font-family:var(--mono);font-size:8px;color:' + (fromCur ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
-    (fromCur ? 'FROM CURRENT PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>' +
+  var tgt = d.targets || {}, trig = d.targets_from === 'trigger';
+  return '<div style="font-family:var(--mono);font-size:8px;color:' + (trig ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
+    (trig ? 'FROM TRIGGER PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>' +
     '<span style="color:var(--tx3)">' + fmtPx(tgt['1r']) + '</span>' +
     ' <span style="color:var(--tx3)">/</span> <span style="color:var(--tx2)">' + fmtPx(tgt['2r']) + '</span>' +
-    ' <span style="color:var(--tx3)">/</span> <span style="color:var(--bull);font-weight:600">' + fmtPx(tgt['3r']) + '</span>';
+    ' <span style="color:var(--tx3)">/</span> <span style="color:var(--bull);font-weight:600">' + fmtPx(tgt['3r']) + '</span>' +
+    '<div style="font-size:8px;color:var(--tx3);margin-top:2px">structure ' + fmtPx(tgt.structure) + '</div>';
 }
 function detailRow(r){
   var tr = document.createElement('tr');
@@ -3386,13 +3682,18 @@ function detailRow(r){
     return '<div><b>' + tfLabel(tf) + '</b> &nbsp;A ' + s.pivot1_time + ' @ ' + fmtPx(s.pivot1_price) +
       ' &rarr; B ' + s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price) +
       ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
+      ' &nbsp;&middot;&nbsp; grade ' + s.grade + ' (' + s.score + ') &middot; ' + s.regime +
+      ' &nbsp;&middot;&nbsp; HTF ' + (s.htf_ok ? 'agrees' : 'no') + ', OI ' + (s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
+      ', volume ' + (s.vol_dry ? 'drying' : 'not drying') + ', wick ' + (s.wick ? 'yes' : 'no') + (s.triple ? ', triple' : '') +
       ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
-      ' &nbsp;&middot;&nbsp; ' + (s.macd_cross ? 'MACD crossed ' + s.macd_cross_at : 'no MACD cross yet') +
+      (s.trigger_price != null ? ' &nbsp;&middot;&nbsp; lower-timeframe trigger at ' + fmtPx(s.trigger_price) : '') +
       ' &nbsp;&middot;&nbsp; stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)' +
       ' &nbsp;&middot;&nbsp; 1R ' + fmtPx((s.targets || {})['1r']) + ' / 2R ' + fmtPx((s.targets || {})['2r']) +
-      ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>';
+      ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>' +
+      '<img class="chart" loading="lazy" alt="Chart needs a fresh scan" src="/chart?pair=' +
+      encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '">';
   }).join('');
-  tr.innerHTML = '<td colspan="8">' + h + '</td>';
+  tr.innerHTML = '<td colspan="10"><div>Weekly volume ' + fmtVol(r.weekly_volume) + ' (7 days)</div>' + h + '</td>';
   return tr;
 }
 function buildRow(r){
@@ -3404,11 +3705,14 @@ function buildRow(r){
     '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP</span></div></td>' +
     '<td>' + evCell(r) + '</td>' +
     '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + (bull ? 'BULLISH' : 'BEARISH') + '</span>' + tfs + '</td>' +
-    '<td>' + ctxCell(r) + '</td>' +
-    '<td>' + volCell(r) + '</td>' +
-    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.pivot2_time + '</div><div class="ptm">' + tfLabel(tf) + ' &middot; ' + b2t(p.bars_ago, tf) + '</div></td>' +
+    '<td>' + gradeCell(p) + '</td>' +
+    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.regime + '</div><div class="ptm">' + (SC[p.status] || SC.active).lbl + '</div></td>' +
+    '<td><span style="font-family:var(--mono);font-size:11px">' + fmtPx(p.signal_price) + '</span><div class="ptm">' +
+      (p.forming ? tfLabel(tf) + ' &middot; bar still forming' : p.signal_time + ' &middot; ' + b2t(p.bars_ago, tf)) + '</div></td>' +
     '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(p.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + p.risk_pct + '%</div></td>' +
-    '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>';
+    '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>' +
+    '<td><div class="ptm">A ' + p.pivot1_time + '</div><div class="ptm">B ' + p.pivot2_time + '</div></td>' +
+    '<td>' + ctxCell(r) + '</td>';
   tr.addEventListener('click', function(){
     var n = tr.nextSibling;
     if(n && n.className === 'det'){ n.parentNode.removeChild(n); return; }
@@ -3421,11 +3725,10 @@ function ageMin(r){ var tf = r.primary_tf || r.tfs[0]; return primary(r).bars_ag
 function renderAll(results){
   var rows = (results || []).filter(function(d){ return matches(d, af); });
   rows.sort(function(a, b){
-    if(sortKey === 'vol') return (b.weekly_volume || 0) - (a.weekly_volume || 0);
     if(sortKey === 'age') return ageMin(a) - ageMin(b);
     return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
            (verdict(a) === 'skip' ? ageMin(a) - ageMin(b) : 0) ||   /* played-out rows: newest first */
-           (b.tfs.length - a.tfs.length) || (b.score - a.score);
+           (b.score - a.score);
   });
   var tb = document.getElementById('resB'); tb.innerHTML = '';
   var st = rows.length > 1 ? Math.min(60, 800 / rows.length) : 0;
@@ -3796,8 +4099,22 @@ document.addEventListener('DOMContentLoaded', function(){
 </html>"""
 
 if __name__ == "__main__":
-    load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
-    load_state()      # restore the last scan so the dashboard isn't amnesiac
-    load_movers()     # ...and the last movers scan
-    load_calendar()   # ...and the news calendar
-    app.run(debug=False, threaded=True, port=5099)
+    import argparse
+    ap = argparse.ArgumentParser(description="MACD wave divergence screener")
+    ap.add_argument("--backtest", action="store_true",
+                    help="replay the stored history and print win rates instead of starting the dashboard")
+    ap.add_argument("--exchange", default="okx", choices=sorted(ALLOWED_EXCHANGES))
+    ap.add_argument("--pairs", type=int, default=30, help="backtest the N most liquid pairs")
+    ap.add_argument("--symbols", default="", help="backtest exactly these, e.g. BTC,ETH")
+    ap.add_argument("--strictness", default="balanced", choices=sorted(STRICTNESS))
+    args = ap.parse_args()
+    if args.backtest:
+        run_backtest(args.exchange, args.pairs,
+                     {s.strip().upper() for s in args.symbols.split(",") if s.strip()},
+                     args.strictness)
+    else:
+        load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
+        load_state()      # restore the last scan so the dashboard isn't amnesiac
+        load_movers()     # ...and the last movers scan
+        load_calendar()   # ...and the news calendar
+        app.run(debug=False, threaded=True, port=5099)

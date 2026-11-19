@@ -1,7 +1,7 @@
 # trading-divergence-screener
 
 A self-contained Flask app that scans linear USDT perpetuals on OKX, Binance,
-and Bybit for **regular MACD divergences** (bullish and bearish) on the **4H
+and Bybit for **regular MACD divergences** (bullish and bearish), read trough to trough on MACD crossover waves, on the **4H
 and 1H** timeframes in one run. Each result row says whether the setup is
 enterable right now, and carries daily-movers and open-interest context for
 that coin. A news calendar covers the scheduled macro prints that move
@@ -18,37 +18,50 @@ serves both the API and a browser dashboard.
   value clears a floor (default $70M/week ≈ $10M/day). This is the only
   universe filter — there's no trend/regime gate, since regular divergences
   are counter-trend by definition.
-- **Divergence detection**: price pivots are found on real swing highs/lows
-  (not closes), matched to a MACD pivot within a few bars, confirmed once 3 closed bars follow it (5 bars before, 3 after), required to have a
-  "clean" line between the two pivots, and sized against both a percentage
-  floor and ATR/MACD-range fractions to filter out micro-divergences. The two pivots are at most 60 bars apart, and a divergence is never dropped for its age: each coin lists its most recent one per side and timeframe from the candles scanned (about 120 days of 4H, 21 days of 1H). The
-  still-forming candle is always dropped so nothing repaints between scans.
-- **Strictness presets**: `balanced` (default) and `strict`. Strict adds the
-  zero-line condition and a larger minimum divergence.
-- **Setup score, only for ordering**: each signal gets a score describing how
-  textbook the divergence structure is. The table does not show it; it only
-  breaks ties in the row order. It is not a backtested probability.
+- **Divergence detection**: the MACD/signal crossovers split the MACD line
+  into waves. Each wave below the signal line is one trough (above it, one
+  peak). Two neighbouring troughs A and B, 8 to 80 bars apart with a real
+  bump between them, are compared with the lowest wicks inside those same
+  waves: price lower, MACD trough higher is a regular bullish divergence
+  (bearish is the mirror). A cross that never opens a gap and a wave shorter
+  than 3 bars are merged away, so a double dot cannot split a trough. A
+  divergence is reported only once the cross that ends wave B has closed;
+  that bar is the signal bar. The still-forming candle is dropped, with one
+  labelled exception (see *Good to enter?*).
+- **Strictness presets**: `balanced` (default) and `strict`. Strict needs a
+  larger divergence and both troughs below the zero line (peaks above it).
+- **Quality score and grade**: 0-100, graded A (70+), B (55-69) or C. Points
+  for the size of the price and MACD differences, the height of the bump,
+  the zero-line side, the higher timeframe's MACD agreeing (1D for a 4H
+  signal, 4H for a 1H signal), volume drying up in wave B, a rejection wick
+  at B, open interest falling into B, and a triple divergence. It describes
+  the setup; the backtest below is what measures it.
+- **Regime tag**: `WITH TREND` when BTC 4H RSI is on the signal's side of 50
+  and the coin is on the right side of its 200 EMA, else `COUNTER TREND`. It
+  never hides a row; a counter-trend setup needs grade A to answer Yes.
 - **Transparent scan accounting**: every run reports pairs dispatched,
   analysed, rejected on volume, errored, or missing volume data, and whether
   the scan actually completed — so a quiet-looking result can't be mistaken
   for "the market is quiet" when it was actually a partial/failed scan.
 - **One row per coin and side**: when 4H and 1H diverge the same way they
-  share a row, which sorts first and takes its verdict, stop and targets
-  from whichever signal is furthest along (Enter beats Wait beats Skip, 4H
-  wins a tie); the highlighted tag shows which.
-- **Entry verdict**: every row is `ENTER`, `WAIT` or `SKIP` with a plain-language
-  answer to "is it good to enter now?". The table opens on All, so divergences
-  that already played out stay listed (dimmed) under their 4H / 1H tags.
-  `ENTER` means the second pivot is within 12 bars, price has not run more
-  than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since
-  the pivot, and no market-mover print is due inside 24 hours. It is a
-  checklist judged at scan time, not a prediction; the page dims verdicts
-  once the scan is over an hour old.
+  share a row, which takes its answer, grade and levels from the better
+  signal (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag
+  shows which. Click a row for each timeframe's levels and a chart of the
+  A-to-B leg with the troughs, crossovers, stop and 1R / 2R / 3R drawn in.
+- **Good to enter?**: every row answers Yes, Not yet or No in plain language.
+  First matching rule wins. No: stop hit, already ran 1R, signal bar older
+  than 6 bars (4H) or 12 bars (1H), or grade C. Not yet: counter trend below
+  grade A, price more than 2% past the signal price, or a market-mover print
+  inside 24 hours. Otherwise `Yes (confirmed)`. A signal bar that is still
+  forming is listed as provisional: `Yes (early)` if the lower timeframe (1H
+  for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last
+  swing since B, otherwise Not yet. It is a checklist judged at scan time,
+  not a prediction; the page dims answers once the scan is over an hour old.
 - **Context tags**: for coins that have a divergence, the scan also reads the
   last completed day against the coin's 20-day baseline (volume spike, range
   expansion, at the 7-day high or low) and 7-day open-interest flow with
   funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
-  change the verdict.
+  change the answer. Pattern tags sit in the same column: TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS.
 - **Movers tab** (`/movers`): a separate scan of every liquid crypto perp for
   an unusual last completed day (5%+ move, 2x its 20-day volume, or 1.5x its
   ATR20), whether or not the coin diverges. Each row lists the prior-day and
@@ -67,10 +80,10 @@ serves both the API and a browser dashboard.
 ## Requirements
 
 - Python 3.9+
-- `flask`, `ccxt`, `pandas`, `numpy`
+- `flask`, `ccxt`, `pandas`, `numpy`, `matplotlib` (chart preview)
 
 ```bash
-pip install flask ccxt pandas numpy
+pip install flask ccxt pandas numpy matplotlib
 ```
 
 Optional: a [JBlanked](https://www.jblanked.com/news/api/docs/) API key to
@@ -100,6 +113,25 @@ jblanked_api_key=YOUR_KEY
 The script reads `.env` itself at startup; no extra package and no shell
 export needed. A real environment variable `JBLANKED_API_KEY` also works.
 
+## Backtest
+
+```bash
+python macd_divergence_screener_v5.py --backtest                      # 30 most liquid pairs on OKX
+python macd_divergence_screener_v5.py --backtest --exchange binance --pairs 60
+python macd_divergence_screener_v5.py --backtest --symbols BTC,ETH,SOL --strictness strict
+```
+
+Replays the same candles the scan uses (720 bars of 4H, 500 of 1H) bar by
+bar with the same detector, each bar seeing only the bars up to and including it. A
+signal is entered at the close of the bar it first appears on, with the
+scan's stop. The report gives, per grade and per regime, how many signals
+there were and, for 1R, 2R and 3R targets, the share that got there before
+the stop and the average R of exiting there. Use it to check whether grade A
+actually beats grade B before trusting the cutoffs.
+
+Limits: open interest and the lower-timeframe trigger are not replayed (no
+bar-by-bar history), so a backtest score can differ from the live one by up to 10 points either way; when one bar touches both the stop and a target, the stop is counted.
+
 ## API
 
 The scan endpoint streams progress via SSE (`log`, `progress`, `result`,
@@ -114,6 +146,7 @@ without re-scanning.
 | `/movers` | GET (SSE) | Run the daily movers scan; `thin=1` adds the low-liquidity band |
 | `/mover_signals` | GET | Last cached `/movers` result (`rows`, `meta`, `ts`) |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
+| `/chart` | GET | PNG of one row's A-to-B leg from the last scan (`pair`, `side`, `tf`) |
 | `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 
 Common query params (all optional, sane defaults apply):
@@ -182,18 +215,19 @@ turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
 ## Reading a row
 
 1. **Check the calendar strip first.** If a market mover is inside 24 hours,
-   every otherwise-ready row reads `WAIT` and names the event.
+   every otherwise-ready row answers Not yet and names the event.
 2. **Read the audit line.** A short list from an unfinished scan is not a
    quiet market.
-3. **Start with `ENTER` rows, 4H+1H first.** Click a row for both
-   timeframes' pivots and check the line on your chart before anything else.
-4. **`WAIT` rows are the ones to keep an eye on.** The reason says what to wait for: the
-   MACD cross, a pullback to the signal price, or the macro print.
+3. **Start with the Yes rows, highest grade first.** Click a row and check
+   the chart: the two troughs, the bump between them and the stop.
+4. **Not yet rows are the ones to keep an eye on.** The reason says what to
+   wait for: a pullback to the signal price, the macro print, the signal bar
+   closing, or (counter trend, grade B) nothing: watch only.
 5. **Weigh the context tags.** A bearish divergence `AT RANGE HIGH` with
    `CROWDED LONGS` is a stronger fade than the same divergence mid-range.
    `SQUEEZE FUEL` under a bearish row is a warning. `HIGH OI/VOL` means size
    down.
-6. **Re-run before acting on an old table.** Verdicts use the price at scan
+6. **Re-run before acting on an old table.** Answers use the price at scan
    time.
 
 The *Specific coins* box scans only the tickers you type and skips the
@@ -202,5 +236,4 @@ exchange with the deepest book (Binance for most pairs).
 
 ## Disclaimer
 
-Signal scores describe setup quality, not a backtested edge. This is a
-research/screening tool, not trading advice.
+The grade describes setup quality; the backtest measures the past, not the future. This is a research/screening tool, not trading advice.

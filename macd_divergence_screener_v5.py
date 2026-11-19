@@ -1854,6 +1854,127 @@ def render_chart(df, d, sig):
     return buf.getvalue()
 
 
+# ── Backtest ───────────────────────────────────────────────────────────────────
+BT_WARMUP = 80      # bars before the replay starts, so MACD has settled
+
+
+def trade_outcome(df, i, side, entry, stop):
+    """What happened to a trade entered at the close of bar i.
+
+    hit = highest R target (0-3) reached before the stop. Inside one bar the
+    stop is checked first, the conservative read when a bar touches both.
+    """
+    k = 1 if side == "bullish" else -1
+    risk = max((entry - stop) * k, entry * 0.005)
+    hi, lo = df["high"].values, df["low"].values
+    hit, mae, stopped, bars = 0, 0.0, False, None
+    for j in range(i + 1, len(df)):
+        worst, best = (lo[j], hi[j]) if k > 0 else (hi[j], lo[j])
+        mae = max(mae, (entry - worst) * k / risk)
+        if (worst - stop) * k <= 0:
+            stopped, bars = True, j - i
+            break
+        hit = max(hit, min(3, int((best - entry) * k // risk)))
+        if hit == 3:
+            bars = j - i
+            break
+    return {"hit": hit, "stopped": stopped, "bars": bars, "mae_r": round(float(mae), 2)}
+
+
+def backtest_pair(df, tf, rules, htf=None, btc=None):
+    """Replay one pair bar by bar. Bar i sees df.iloc[:i + 1] and nothing else.
+
+    A signal is taken the first time the detector reports it, at that bar's
+    close. Not replayed: open interest (no bar-by-bar history) and the
+    lower-timeframe trigger, so scores here run up to 10 points below live.
+    """
+    cfg, seen, trades = TF_CFG[tf], set(), []
+    close = df["close"].values
+    for i in range(BT_WARMUP, len(df) - 1):
+        view = df.iloc[:i + 1]
+        for side in ("bullish", "bearish"):
+            k = 1 if side == "bullish" else -1
+            for d in detect_wave_divergence(view, side, rules):
+                key = (side, d["b_m"])
+                if d["signal_bar"] <= i - WHIP_BARS or key in seen:
+                    continue                       # old news, or already taken
+                seen.add(key)
+                sig = _mk(view, d, cfg)
+                entry, stop = float(close[i]), sig["stop_price"]
+                if (entry - stop) * k <= 0:
+                    continue                       # already through the stop when first seen
+                close_ts = view.index[-1] + pd.Timedelta(minutes=cfg["minutes"])
+                btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) \
+                    if btc is not None else None
+                score, grade = score_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], side))
+                trades.append(dict(
+                    trade_outcome(df, i, side, entry, stop), tf=tf, side=side,
+                    score=score, grade=grade, time=str(view.index[-1]),
+                    regime=regime_tag(side, entry > float(view["ema200"].iloc[-1]), btc_rsi)))
+    return trades
+
+
+def summarise(trades, key):
+    """Per group: count, and for each target R the win rate (%) and average R
+    of exiting there, over trades that reached that target or the stop."""
+    rows = []
+    for g in sorted({t[key] for t in trades}):
+        ts = [t for t in trades if t[key] == g]
+        row = {key: g, "n": len(ts)}
+        for r in (1, 2, 3):
+            done = [t for t in ts if t["stopped"] or t["hit"] >= r]
+            wins = sum(t["hit"] >= r for t in done)
+            row[f"win{r}"] = round(100 * wins / len(done), 1) if done else None
+            row[f"avg_r{r}"] = round((wins * r - (len(done) - wins)) / len(done), 2) if done else None
+        rows.append(row)
+    return rows
+
+
+def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
+    """Fetch the scan's own history for the most liquid pairs and print win
+    rate and average R per grade and per regime."""
+    rules = STRICTNESS[strictness]
+    ex = make_exchange(exid)
+    mkts = ex.load_markets()
+    limiter = RateLimiter(SPEED["safe"]["rps"][exid])
+    perps = usdt_perps(mkts)
+    if symbols:
+        pairs = [s for s in perps if s.split("/")[0] in symbols]
+    else:
+        tickers = ex.fetch_tickers()
+        pairs = sorted(perps, key=lambda s: usd_volume(tickers.get(s)) or 0, reverse=True)[:n_pairs]
+
+    def load(sym, tf, bars, minutes):
+        df = drop_forming_candle(fetch_df_deep(ex, limiter, sym, tf, bars), minutes)
+        return with_indicators(df) if df is not None and len(df) >= 80 else None
+
+    btc = fetch_btc_rsi(ex, limiter)
+    trades = []
+    for n, sym in enumerate(pairs, 1):
+        d4 = load(sym, "4h", TF_CFG["4h"]["bars"], 240)
+        d1h = load(sym, "1h", TF_CFG["1h"]["bars"], 60)
+        d1d = load(sym, "1d", HTF_BARS_1D, 1440)
+        got = (backtest_pair(d4, "4h", rules, d1d, btc) if d4 is not None else []) + \
+              (backtest_pair(d1h, "1h", rules, d4, btc) if d1h is not None else [])
+        trades += got
+        print(f"[{n}/{len(pairs)}] {sym}: {len(got)} signal(s)")
+
+    def cell(v, suffix=""):
+        return f"{'-' if v is None else str(v) + suffix:>9}"
+
+    for key in ("grade", "regime"):
+        print(f"\nBy {key}")
+        print(f"{key:<15}{'n':>5}" + "".join(f"{f'win@{r}R':>9}{f'avgR@{r}R':>9}" for r in (1, 2, 3)))
+        for row in summarise(trades, key):
+            print(f"{row[key]:<15}{row['n']:>5}" +
+                  "".join(cell(row[f'win{r}'], '%') + cell(row[f'avg_r{r}']) for r in (1, 2, 3)))
+    print("\nwin@NR = share of resolved trades that reached N x risk before the stop; "
+          "avgR@NR = average result of exiting there.\n"
+          "Entry is the close of the bar the signal first appears on. Open interest and the "
+          "lower-timeframe trigger are not replayed,\nso grades here can sit up to 10 points "
+          "below the live scan's.")
+
+
 # ── State persistence ──────────────────────────────────────────────────────────
 def save_state():
     try:
@@ -3946,8 +4067,22 @@ document.addEventListener('DOMContentLoaded', function(){
 </html>"""
 
 if __name__ == "__main__":
-    load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
-    load_state()      # restore the last scan so the dashboard isn't amnesiac
-    load_movers()     # ...and the last movers scan
-    load_calendar()   # ...and the news calendar
-    app.run(debug=False, threaded=True, port=5099)
+    import argparse
+    ap = argparse.ArgumentParser(description="MACD wave divergence screener")
+    ap.add_argument("--backtest", action="store_true",
+                    help="replay the stored history and print win rates instead of starting the dashboard")
+    ap.add_argument("--exchange", default="okx", choices=sorted(ALLOWED_EXCHANGES))
+    ap.add_argument("--pairs", type=int, default=30, help="backtest the N most liquid pairs")
+    ap.add_argument("--symbols", default="", help="backtest exactly these, e.g. BTC,ETH")
+    ap.add_argument("--strictness", default="balanced", choices=sorted(STRICTNESS))
+    args = ap.parse_args()
+    if args.backtest:
+        run_backtest(args.exchange, args.pairs,
+                     {s.strip().upper() for s in args.symbols.split(",") if s.strip()},
+                     args.strictness)
+    else:
+        load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
+        load_state()      # restore the last scan so the dashboard isn't amnesiac
+        load_movers()     # ...and the last movers scan
+        load_calendar()   # ...and the news calendar
+        app.run(debug=False, threaded=True, port=5099)

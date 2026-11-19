@@ -20,6 +20,14 @@ class Routes(unittest.TestCase):
         for path in ("/watchlist", "/watch_signals"):
             self.assertEqual(self.c.get(path).status_code, 404, path)
 
+    def test_usdt_perps_keeps_only_active_crypto_linear_perps(self):
+        mkts = {"ENS/USDT:USDT":  {"active": True,  "base": "ENS"},
+                "USDC/USDT:USDT": {"active": True,  "base": "USDC"},
+                "TSLA/USDT:USDT": {"active": True,  "base": "TSLA"},
+                "OLD/USDT:USDT":  {"active": False, "base": "OLD"},
+                "BTC/USD:BTC":    {"active": True,  "base": "BTC"}}
+        self.assertEqual(m.usdt_perps(mkts), ["ENS/USDT:USDT"])
+
     def test_signals_returns_rows(self):
         m._state.update({"results": [{"pair": "ENS/USDT:USDT"}], "ts": None,
                          "meta": {"tfs": ["4h", "1h"]}})
@@ -45,15 +53,15 @@ class SavedState(unittest.TestCase):
         with open(m.STATE_FILE, "w") as f:
             json.dump(data, f)
 
-    def test_old_flat_signal_state_is_ignored(self):
-        self.write({"results": [{"pair": "X", "side": "bullish"}],
-                    "ts": "2026-11-01T00:00:00+00:00", "meta": {"tf": "1d"}})
+    def test_state_from_before_wave_detection_is_ignored(self):
+        self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
+                    "ts": "2026-11-01T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"]}})
         m.load_state()
         self.assertEqual((m._state["results"], m._state["ts"]), ([], None))
 
     def test_row_state_round_trips(self):
         self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
-                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"]}})
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 2}})
         m.load_state()
         self.assertEqual(m._state["results"], [{"pair": "X", "tfs": ["4h"]}])
         m.save_state()

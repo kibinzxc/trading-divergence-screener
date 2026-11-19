@@ -275,6 +275,9 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # divergence scan's saved state, and vice versa.
 MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
+STATE_VERSION = 2     # scan_state.json written by an older row shape is ignored
+HTF_BARS_1D   = 200   # daily history, for the 4H signal's higher-timeframe check
+LTF_BARS_15M  = 300   # 15m history, for the 1H signal's early-entry trigger
 
 # ── News calendar ──────────────────────────────────────────────────────────────
 # Scheduled macro prints, so a setup is never sized into a CPI or FOMC release
@@ -327,6 +330,11 @@ _lock  = threading.Lock()
 _movers_state = {"rows": [], "ts": None, "meta": {}}
 _cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
               "jb": {"events": [], "ts": None, "attempt": None}}
+
+# Candles and geometry of the last scan's signals, for /chart.
+# shortcut: memory only, so charts need a fresh scan after a restart; persist
+# a slice per signal in scan_state.json if that becomes annoying.
+_charts = {}
 
 
 # ── Indicators ─────────────────────────────────────────────────────────────────
@@ -950,12 +958,12 @@ def oi_point_usd(pt, fallback_price):
     return None
 
 
-def fetch_oi_history(ex, limiter, sym, limit, tries=3):
+def fetch_oi_history(ex, limiter, sym, limit, tf="1d", tries=3):
     """Daily OI history with the same backoff discipline as fetch_ohlcv."""
     for attempt in range(tries):
         try:
             limiter.acquire()
-            return ex.fetch_open_interest_history(sym, timeframe="1d", limit=limit)
+            return ex.fetch_open_interest_history(sym, timeframe=tf, limit=limit)
         except Exception as e:
             msg = str(e)
             if any(t in msg for t in _TRANSIENT) and attempt < tries - 1:
@@ -1656,24 +1664,52 @@ def drop_forming_candle(df, tf_minutes):
     return df
 
 
+def with_indicators(df):
+    return pd.concat([df, compute_indicators(df)], axis=1).dropna()
+
+
+def forming_df(raw, closed):
+    """The completed candles plus the still-open one, with indicators, or None
+    when no candle is open. Only ever used to spot a signal bar that is still
+    forming; everything else is computed on completed candles."""
+    return with_indicators(raw) if len(raw) == len(closed) + 1 else None
+
+
+def usdt_perps(mkts):
+    """Active linear USDT perps, minus stablecoin bases and TradFi perps."""
+    return [s for s in mkts
+            if s.endswith("/USDT:USDT") and mkts[s].get("active")
+            and s.split("/")[0] not in STABLE_BASES and not is_tradfi(mkts[s])]
+
+
+def fetch_btc_rsi(ex, limiter):
+    """BTC 4H RSI 14 on completed bars, for the regime tag. None when unavailable."""
+    df = drop_forming_candle(
+        fetch_df_deep(ex, limiter, "BTC/USDT:USDT", "4h", TF_CFG["4h"]["bars"]), 240)
+    if df is None or len(df) < 80:
+        return None
+    return pd.DataFrame({"rsi": rsi(df["close"])}).dropna()
+
+
 def pair_context(ex, limiter, sym, live_price, fund_day, wk_vol):
     """Movers + OI-flow context for a pair that HAS a divergence.
 
-    Returns (mover, flow, error). Two calls, spent only on pairs worth a row.
-    A failure here must never cost the row itself, so it comes back as text.
+    Returns (mover, flow, error, daily candles, daily OI history). The last two
+    are reused to grade the signal. A failure here must never cost the row
+    itself, so it comes back as text.
     """
     try:
         df = drop_forming_candle(
-            _to_df(fetch_ohlcv(ex, limiter, sym, "1d", limit=MOVER_LOOKBACK_D + 12)), 1440)
+            _to_df(fetch_ohlcv(ex, limiter, sym, "1d", limit=HTF_BARS_1D)), 1440)
         if df is None or df.empty:
-            return None, None, "no daily candles"
+            return None, None, "no daily candles", None, None
         mover = analyse_mover(df, live_price)
         if mover is not None:
             mover["flags"] = classify_mover(mover)[1]
         hist = fetch_oi_history(ex, limiter, sym, OI_LOOKBACK_D + 4)
-        return mover, flow_context(hist, df, live_price, fund_day, wk_vol), None
+        return mover, flow_context(hist, df, live_price, fund_day, wk_vol), None, df, hist
     except Exception as e:
-        return None, None, str(e)
+        return None, None, str(e), None, None
 
 
 # ── Dedupe ─────────────────────────────────────────────────────────────────────
@@ -1791,9 +1827,9 @@ def load_state():
         with open(STATE_FILE) as f:
             data = json.load(f)
         meta = data.get("meta", {})
-        if "tfs" not in meta:
-            # Written before rows existed (flat signal list, single timeframe).
-            # The page cannot draw it, so start empty rather than broken.
+        if meta.get("v") != STATE_VERSION:
+            # Written with an older row shape. The page cannot draw it, so
+            # start empty rather than broken.
             print("[state] last scan is from an older version - ignored")
             return
         with _lock:
@@ -1869,12 +1905,8 @@ def universe_route():
         return jsonify({"error": str(e)}), 500
 
     rows = []
-    for sym in mkts:
-        if not (sym.endswith("/USDT:USDT") and mkts[sym].get("active")):
-            continue
+    for sym in usdt_perps(mkts):
         base = sym.split("/")[0]
-        if base in STABLE_BASES or is_tradfi(mkts[sym]):
-            continue
         v = usd_volume(tickers.get(sym))
         if v:
             rows.append({"base": base, "sym": sym, "wk": v * 7.0})
@@ -1920,10 +1952,7 @@ def scan_route():
         except Exception as e:
             yield sse("error", {"msg": f"load_markets failed: {e}"}); return
 
-        perps = [s for s in mkts
-                 if s.endswith("/USDT:USDT") and mkts[s].get("active")
-                 and s.split("/")[0] not in STABLE_BASES
-                 and not is_tradfi(mkts[s])]
+        perps = usdt_perps(mkts)
         yield sse("log", {"msg": f"{len(perps)} active linear USDT perps on {exid.upper()}"})
 
         yield sse("log", {"msg": "Fetching 24h volumes (one bulk call)..."})
@@ -1993,6 +2022,10 @@ def scan_route():
 
         spd = SPEED[speed]
         limiter = RateLimiter(spd["rps"].get(exid, 8))
+        btc = fetch_btc_rsi(main_ex, limiter)
+        if btc is None:
+            yield sse("log", {"msg": "BTC 4H candles unavailable: every setup is tagged COUNTER TREND"})
+        _charts.clear()
         workers = spd["workers"]
         yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on 4H + 1H · "
                                  f"{strictness} · {workers} workers"})
@@ -2012,9 +2045,6 @@ def scan_route():
         counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0,
                    "no_1h": 0}
         clock = threading.Lock()
-
-        def with_indicators(df):
-            return pd.concat([df, compute_indicators(df)], axis=1).dropna()
 
         def scan_pair(sym):
             base = sym.split("/")[0]
@@ -2044,18 +2074,21 @@ def scan_route():
                         counter["vol_reject"] += 1
                     return
 
+                f4 = forming_df(raw, df4)
                 df4 = with_indicators(df4)
                 if len(df4) < 80:
                     with clock:
                         counter["no_data"] += 1
                     return
 
-                df1 = None
+                df1 = f1 = None
                 raw1 = fetch_df_deep(ex, limiter, sym, "1h", TF_CFG["1h"]["bars"])
                 if raw1 is not None and len(raw1) >= 80:
                     live_price = float(raw1["close"].iloc[-1])    # the newer tick
                     df1 = drop_forming_candle(raw1, TF_CFG["1h"]["minutes"])
-                    df1 = with_indicators(df1) if df1 is not None else None
+                    if df1 is not None:
+                        f1 = forming_df(raw1, df1)
+                        df1 = with_indicators(df1)
                 if df1 is None or len(df1) < 80:
                     with clock:
                         counter["no_1h"] += 1
@@ -2063,14 +2096,26 @@ def scan_route():
                 with clock:
                     counter["analysed"] += 1
 
-                sigs = (signals_for_tf(df4, "4h", rules, live_price, sym, wk_vol) +
-                        signals_for_tf(df1, "1h", rules, live_price, sym, wk_vol))
+                sigs = (signals_for_tf(df4, "4h", rules, live_price, sym, wk_vol, f4) +
+                        signals_for_tf(df1, "1h", rules, live_price, sym, wk_vol, f1))
                 if not sigs:
                     return
-                for s in sigs:                      # frames cannot go over the wire
-                    s.pop("_df"); s.pop("_d")
-                mover, flow, cerr = pair_context(ex, limiter, sym, live_price,
-                                                 funding.get(sym), wk_vol)
+                # Everything below is fetched only for pairs worth a row.
+                mover, flow, cerr, d1, oi_d = pair_context(ex, limiter, sym, live_price,
+                                                           funding.get(sym), wk_vol)
+                d1 = with_indicators(d1) if d1 is not None else None
+                oi_h = df15 = None
+                if any(s["tf"] == "1h" for s in sigs):
+                    oi_h = fetch_oi_history(ex, limiter, sym, 100, tf="1h")
+                if any(s["tf"] == "1h" and s["fresh"] for s in sigs):
+                    df15 = drop_forming_candle(
+                        fetch_df_deep(ex, limiter, sym, "15m", LTF_BARS_15M), 15)
+                    df15 = with_indicators(df15) if df15 is not None and len(df15) >= 80 else None
+                for s in sigs:
+                    four = s["tf"] == "4h"
+                    add_context(s, d1 if four else df4, df1 if four else df15,
+                                oi_d if four else oi_h, funding.get(sym), btc)
+                    _charts[f"{sym}|{s['side']}|{s['tf']}"] = (s.pop("_df"), s.pop("_d"), dict(s))
                 for row in build_rows(sigs, mover, flow, cerr, ev_h, ev_title):
                     q.put(("result", row))
             except Exception as e:
@@ -2105,7 +2150,7 @@ def scan_route():
             # is reported alongside it instead of disappearing.
             with clock:
                 c = dict(counter)
-            meta = {"exchange": exid, "tfs": list(TF_CFG), "strictness": strictness,
+            meta = {"v": STATE_VERSION, "exchange": exid, "tfs": list(TF_CFG), "strictness": strictness,
                     "min_weekly_vol": min_vol, "universe": len(perps),
                     "dispatched": len(pairs), "scanned": c["analysed"],
                     "vol_rejected": c["vol_reject"], "no_data": c["no_data"],

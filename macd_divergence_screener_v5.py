@@ -101,8 +101,9 @@ complete one is how you end up trusting an empty table.
 
 from flask import Flask, Response, jsonify, request
 from concurrent.futures import ThreadPoolExecutor
-import ccxt, pandas as pd, numpy as np, json, time, threading, queue, datetime, os
+import ccxt, pandas as pd, numpy as np, json, time, threading, queue, datetime, os, io
 import re, statistics, urllib.request, urllib.error
+from matplotlib.figure import Figure   # no pyplot: Figure alone is safe across Flask threads
 
 app = Flask(__name__)
 
@@ -1809,6 +1810,50 @@ def signals_for_tf(df, tf, rules, live_price, sym, wk_vol, forming_df=None):
     return out
 
 
+# ── Chart preview ──────────────────────────────────────────────────────────────
+def render_chart(df, d, sig):
+    """PNG of the A-to-B leg: candles with the stop and R lines over the MACD
+    panel with its trough and crossover dots. `d` is the raw detection (bar
+    indexes into `df`), `sig` the finished signal (levels)."""
+    lo = max(0, d["a_start"] - 10)
+    v = df.iloc[lo:min(len(df), d["signal_bar"] + 30)]
+    x = np.arange(len(v))
+    fig = Figure(figsize=(9, 5.5), tight_layout=True)
+    ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
+
+    up = (v["close"] >= v["open"]).values
+    for mask, col in ((up, "#26a69a"), (~up, "#ef5350")):
+        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=1)
+        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=3)
+    ax.plot([d["a_p"] - lo, d["b_p"] - lo], [d["a_price"], d["b_price"]],
+            color="#f5a623", lw=1.5, marker="o")
+    t = sig["targets"]
+    for lvl, col, lbl in ((sig["stop_price"], "#ef5350", "stop"), (t["1r"], "#26a69a", "1R"),
+                          (t["2r"], "#26a69a", "2R"), (t["3r"], "#26a69a", "3R")):
+        ax.axhline(lvl, color=col, lw=0.8, ls="--")
+        ax.text(len(v) - 1, lvl, lbl, color=col, fontsize=8, va="bottom", ha="right")
+    ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']} divergence, "
+                 f"grade {sig['grade']} ({sig['score']})", fontsize=10)
+
+    am.plot(x, v["macd"].values, color="#2962ff", lw=1.2, label="MACD")
+    am.plot(x, v["signal"].values, color="#ff6d00", lw=1, label="signal")
+    am.axhline(0, color="#888888", lw=0.5)
+    am.plot([d["a_m"] - lo, d["b_m"] - lo], [d["a_macd"], d["b_macd"]],
+            color="#f5a623", lw=1.5, marker="o")
+    for bar, direction in d["crosses"]:
+        am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
+                color="#26a69a" if direction > 0 else "#ef5350")
+    am.legend(loc="upper left", fontsize=7)
+    step = max(1, len(v) // 6)
+    shown = v.index[::step] + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
+    am.set_xticks(x[::step])
+    am.set_xticklabels([ts.strftime("%b %d %H:%M") for ts in shown], fontsize=7)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110)
+    return buf.getvalue()
+
+
 # ── State persistence ──────────────────────────────────────────────────────────
 def save_state():
     try:
@@ -1888,6 +1933,14 @@ def signals_route():
         return jsonify({"rows": list(_state["results"]),
                         "meta": dict(_state["meta"]),
                         "ts": _state["ts"].isoformat() if _state["ts"] else None})
+
+
+@app.route("/chart")
+def chart_route():
+    hit = _charts.get("|".join(request.args.get(k, "") for k in ("pair", "side", "tf")))
+    if hit is None:
+        return "No chart data for this row. Run the scan again.", 404
+    return Response(render_chart(*hit), mimetype="image/png")
 
 
 @app.route("/universe")

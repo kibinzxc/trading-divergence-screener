@@ -10,6 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import macd_divergence_screener_v5 as m  # noqa: E402
+from tests.helpers import LONG, wave_df  # noqa: E402
 
 
 class Routes(unittest.TestCase):
@@ -70,6 +71,31 @@ class SavedState(unittest.TestCase):
 
 
 import re  # noqa: E402
+
+
+class Chart(unittest.TestCase):
+    KEY = "ENS/USDT:USDT|bullish|1h"
+
+    def setUp(self):
+        s = m.signals_for_tf(wave_df(LONG), "1h", m.STRICTNESS["balanced"],
+                             100.5, "ENS/USDT:USDT", 9e7)[0]
+        self.hit = (s.pop("_df"), s.pop("_d"), s)
+        m._charts[self.KEY] = self.hit
+        self.c = m.app.test_client()
+
+    def tearDown(self):
+        m._charts.clear()
+
+    def test_render_is_a_png(self):
+        self.assertEqual(m.render_chart(*self.hit)[:4], b"\x89PNG")
+
+    def test_route_serves_the_chart_of_a_scanned_row(self):
+        r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"})
+        self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"))
+
+    def test_unknown_row_is_404(self):
+        r = self.c.get("/chart", query_string={"pair": "NOPE/USDT:USDT", "side": "bullish", "tf": "1h"})
+        self.assertEqual(r.status_code, 404)
 
 
 class Page(unittest.TestCase):

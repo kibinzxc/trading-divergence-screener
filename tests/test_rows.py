@@ -78,5 +78,38 @@ class NextMover(unittest.TestCase):
         self.assertEqual(m.next_mover([], self.NOW), (None, ""))
 
 
+def oi_hist(values):
+    idx = pd.date_range("2026-01-01", periods=len(values), freq="D")
+    return [{"timestamp": int(t.timestamp() * 1000), "openInterestValue": v}
+            for t, v in zip(idx, values)]
+
+
+def daily(closes):
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="D")
+    return pd.DataFrame({"close": closes}, index=idx)
+
+
+class FlowContext(unittest.TestCase):
+    RISING = [100, 104, 108, 112, 116, 120, 125, 130]      # +30% over 7 days
+    UP = [10, 10.2, 10.4, 10.6, 10.8, 11.0, 11.2, 11.5]    # +15%
+
+    def test_new_longs_with_flat_funding_is_spot_led(self):
+        f = m.flow_context(oi_hist(self.RISING), daily(self.UP), 11.5, 0.0, 7e9)
+        self.assertEqual((f["quadrant"], f["flags"], f["oi_chg_pct"]),
+                         ("NEW LONGS", ["SPOT-LED"], 30.0))
+
+    def test_oi_above_daily_volume_multiple_is_flagged(self):
+        f = m.flow_context(oi_hist(self.RISING), daily(self.UP), 11.5, None, 70.0)
+        self.assertEqual(f["flags"], ["HIGH OI/VOL"])      # OI 130 vs $10/day volume
+
+    def test_quiet_oi_gives_no_context(self):
+        flat = [100, 100, 101, 100, 101, 100, 101, 102]
+        self.assertIsNone(m.flow_context(oi_hist(flat), daily(self.UP), 11.5, 0.0, 7e9))
+
+    def test_short_history_gives_no_context(self):
+        self.assertIsNone(m.flow_context(oi_hist([100, 130]), daily(self.UP), 11.5, 0.0, 7e9))
+        self.assertIsNone(m.flow_context(None, daily(self.UP), 11.5, 0.0, 7e9))
+
+
 if __name__ == "__main__":
     unittest.main()

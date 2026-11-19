@@ -949,6 +949,50 @@ def classify_flow(price_chg, oi_chg, fund_day):
     return quad, flags
 
 
+def flow_context(hist, df, live_price, fund_day, wk_vol):
+    """OI-flow read for one pair from its daily OI history and daily candles.
+
+    None means "nothing to say": too little history (a fresh listing's OI
+    always ramps from zero), no baseline point near the lookback, or OI that
+    moved less than OI_MIN_CHANGE_PCT.
+    """
+    hist = sorted((p for p in (hist or []) if p.get("timestamp")),
+                  key=lambda p: p["timestamp"])
+    if len(hist) < OI_MIN_HISTORY:
+        return None
+
+    # Baseline = the OI point closest to (now − lookback). Daily points can be
+    # sparse on some venues, so "closest" with a ±36h tolerance beats indexing
+    # back a fixed count.
+    now_ms = hist[-1]["timestamp"]
+    target = now_ms - OI_LOOKBACK_D * 86_400_000
+    past = min(hist[:-1], key=lambda p: abs(p["timestamp"] - target))
+    if abs(past["timestamp"] - target) > 36 * 3_600_000:
+        return None
+
+    # price for amount→USD conversion at the baseline: that day's close
+    day_close = {int(ts.timestamp() * 1000) // 86_400_000: float(c)
+                 for ts, c in df["close"].items()}
+    past_px = day_close.get(past["timestamp"] // 86_400_000, live_price)
+    oi_now  = oi_point_usd(hist[-1], live_price)
+    oi_then = oi_point_usd(past, past_px)
+    if not oi_now or not oi_then:
+        return None
+
+    oi_chg = (oi_now - oi_then) / oi_then * 100.0
+    if abs(oi_chg) < OI_MIN_CHANGE_PCT:
+        return None
+    span = min(OI_LOOKBACK_D + 1, len(df))
+    price_chg = (float(df["close"].iloc[-1]) / float(df["close"].iloc[-span]) - 1) * 100.0
+
+    quad, flags = classify_flow(price_chg, oi_chg, fund_day)
+    if wk_vol and oi_now / (wk_vol / 7.0) >= OI_VOL_RATIO_HIGH:
+        flags.append("HIGH OI/VOL")
+    return {"quadrant": quad, "flags": flags,
+            "oi_chg_pct": round(oi_chg, 1), "price_chg_pct": round(price_chg, 1),
+            "funding_day_pct": round(fund_day, 4) if fund_day is not None else None}
+
+
 # ── Daily movers helpers ───────────────────────────────────────────────────────
 def analyse_mover(df, live_price):
     """Per-pair daily statistics, from COMPLETED bars only.
@@ -1569,6 +1613,26 @@ def drop_forming_candle(df, tf_minutes):
     if df.index[-1] + pd.Timedelta(minutes=tf_minutes) > pd.Timestamp(now):
         return df.iloc[:-1]
     return df
+
+
+def pair_context(ex, limiter, sym, live_price, fund_day, wk_vol):
+    """Movers + OI-flow context for a pair that HAS a divergence.
+
+    Returns (mover, flow, error). Two calls, spent only on pairs worth a row.
+    A failure here must never cost the row itself, so it comes back as text.
+    """
+    try:
+        df = drop_forming_candle(
+            _to_df(fetch_ohlcv(ex, limiter, sym, "1d", limit=MOVER_LOOKBACK_D + 12)), 1440)
+        if df is None or df.empty:
+            return None, None, "no daily candles"
+        mover = analyse_mover(df, live_price)
+        if mover is not None:
+            mover["flags"] = classify_mover(mover)[1]
+        hist = fetch_oi_history(ex, limiter, sym, OI_LOOKBACK_D + 4)
+        return mover, flow_context(hist, df, live_price, fund_day, wk_vol), None
+    except Exception as e:
+        return None, None, str(e)
 
 
 # ── Dedupe ─────────────────────────────────────────────────────────────────────

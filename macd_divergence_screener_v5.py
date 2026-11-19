@@ -98,22 +98,20 @@ MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ATR_PERIOD  = 14
 PIVOT_SYNC  = 3      # bars of slack allowed between a price pivot and its MACD pivot
 
-# Per-timeframe geometry. Pivot windows that make sense on 4H are far too wide
-# on the daily, so every distance is defined per timeframe rather than shared.
+# Per-timeframe geometry. A pivot must be the extreme of pivot_lb bars to its
+# left but only pivot_rb to its right: the right side is pure waiting time
+# (5 bars on 4H is 20 hours), and a divergence listed a day late is not usable.
 TF_CFG = {
-    "4h": {"label": "4H",  "minutes": 240,  "bars": 720, "pivot_lb": 5,
-           "min_dist": 5, "max_dist": 120, "max_age": 60,  "fresh": 12},
-    "1d": {"label": "1D",  "minutes": 1440, "bars": 500, "pivot_lb": 5,
-           "min_dist": 4, "max_dist": 90,  "max_age": 30,  "fresh": 3},
+    "4h": {"label": "4H", "minutes": 240, "bars": 720, "pivot_lb": 5, "pivot_rb": 3,
+           "min_dist": 5, "max_dist": 60, "max_age": 30, "fresh": 12},
+    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "pivot_lb": 5, "pivot_rb": 3,
+           "min_dist": 5, "max_dist": 60, "max_age": 24, "fresh": 12},
 }
 
 # Strictness presets — see the module docstring for what each rule does.
 STRICTNESS = {
-    "loose":    {"require_macd_pivot": False, "require_clean": False,
-                 "min_price_pct": 0.15, "atr_frac": 0.00, "min_macd_frac": 0.00,
-                 "zero_line": False},
     "balanced": {"require_macd_pivot": True,  "require_clean": True,
-                 "min_price_pct": 0.25, "atr_frac": 0.20, "min_macd_frac": 0.08,
+                 "min_price_pct": 0.25, "atr_frac": 0.20, "min_macd_frac": 0.15,
                  "zero_line": False},
     "strict":   {"require_macd_pivot": True,  "require_clean": True,
                  "min_price_pct": 0.50, "atr_frac": 0.55, "min_macd_frac": 0.22,
@@ -326,22 +324,23 @@ def compute_indicators(df):
 
 
 # ── Pivots ─────────────────────────────────────────────────────────────────────
-def find_pivots(vals, lb):
-    """Indices that are the extreme of a 2*lb+1 window centred on them.
+def find_pivots(vals, lb, rb=None):
+    """Indices that are the extreme of a window of lb bars before and rb after.
 
     Ties resolve to the EARLIEST bar (np.argmax/argmin return the first
     occurrence), so a flat double-bottom produces exactly one pivot instead of
     zero. v3 required a strictly unique extreme and silently dropped every
     flat-bottomed swing — common on low-tick-size alts.
 
-    A pivot needs lb bars on BOTH sides, so the newest possible pivot is lb
+    A pivot needs rb CLOSED bars after it, so the newest possible pivot is rb
     bars old. That is what makes this non-repainting: a pivot never appears,
-    moves, or disappears on a later scan.
+    moves, or disappears on a later scan. rb defaults to lb.
     """
+    rb = lb if rb is None else rb
     n = len(vals)
     highs, lows = [], []
-    for i in range(lb, n - lb):
-        w = vals[i - lb:i + lb + 1]
+    for i in range(lb, n - rb):
+        w = vals[i - lb:i + rb + 1]
         if i - lb + int(np.argmax(w)) == i:
             highs.append(i)
         if i - lb + int(np.argmin(w)) == i:
@@ -349,15 +348,15 @@ def find_pivots(vals, lb):
     return highs, lows
 
 
-def swing_pivots(high, low, lb):
+def swing_pivots(high, low, lb, rb=None):
     """Price pivots on true swing extremes: highs from `high`, lows from `low`.
 
     v3 ran both off the close, which puts the pivot on the wrong bar whenever
     the actual extreme was a wick — and wicks are exactly where divergences get
     drawn from.
     """
-    ph, _ = find_pivots(high, lb)
-    _, pl = find_pivots(low, lb)
+    ph, _ = find_pivots(high, lb, rb)
+    _, pl = find_pivots(low, lb, rb)
     return ph, pl
 
 
@@ -403,11 +402,11 @@ def detect_divergences(df, cfg, rules):
     atrv = df["atr"].values
     n = len(df)
 
-    lb  = cfg["pivot_lb"]
+    lb, rb = cfg["pivot_lb"], cfg["pivot_rb"]
     mn, mx, age = cfg["min_dist"], cfg["max_dist"], cfg["max_age"]
 
-    price_h, price_l = swing_pivots(high, low, lb)
-    macd_h,  macd_l  = find_pivots(macd, lb)
+    price_h, price_l = swing_pivots(high, low, lb, rb)
+    macd_h,  macd_l  = find_pivots(macd, lb, rb)
     macd_h, macd_l = set(macd_h), set(macd_l)
 
     out = []

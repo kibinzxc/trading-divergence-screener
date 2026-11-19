@@ -2608,6 +2608,7 @@ table.stale .ev{opacity:.4}
 tbody tr.main-row{cursor:pointer}
 tr.det td{background:var(--sf);font-family:var(--mono);font-size:10px;color:var(--tx2);line-height:1.8;padding:10px 16px}
 tr.det b{color:var(--tx)}
+tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1px solid var(--bd2);border-radius:4px}
 .tfb-on{color:var(--tx);border-color:var(--tx3)}
 .tfb{display:inline-block;margin-left:4px;padding:2px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
 .volc{font-family:var(--mono);font-size:11px;color:var(--tx2)}
@@ -2765,7 +2766,7 @@ tr.det b{color:var(--tx)}
         <button class="tbtn active" data-val="balanced">Balanced</button>
         <button class="tbtn" data-val="strict">Strict</button>
       </div>
-      <div class="hint" id="strHint">MACD pivot must align with the price pivot, the divergence line must be unbroken, and the move must clear a minimum size.</div></div>
+      <div class="hint" id="strHint">Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.</div></div>
 
     <div class="ss"><div class="fl">Max pairs to scan</div>
       <div class="nw"><button class="nb" onclick="stepPairs(-25)">-</button><input type="number" id="maxPairs" value="__DEFAULT_MAX_PAIRS__" min="10" max="600" step="25"><button class="nb" onclick="stepPairs(25)">+</button></div>
@@ -2825,13 +2826,15 @@ tr.det b{color:var(--tx)}
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. ENTER: second pivot is recent, price has not run more than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on whichever timeframe's signal is furthest along: Enter beats Wait beats Skip, 4H wins a tie. The highlighted timeframe tag shows which one. Default order: Yes, then Not yet, then No. Yes and Not yet put 4H+1H first; No rows are newest first.">Good to enter? &#8595;</th>
-          <th title="Regular bullish: price makes a lower low while the MACD line makes a higher low. Regular bearish: price makes a higher high while the MACD line makes a lower high. The tags show which timeframes diverge; 4H+1H agreeing sorts first.">Side &middot; TF</th>
-          <th title="Not part of the verdict. Movers tags describe the last completed day against this coin's own 20-day baseline. OI tags describe 7-day open-interest flow and funding. Hover a tag for its definition.">Context</th>
-          <th class="sortable" data-sort="vol" title="Rolling 7-day traded value in USD, measured from the 4H candles. The liquidity gate.">Weekly vol</th>
-          <th class="sortable" data-sort="age" title="Time of pivot B, the bar that completed the divergence, on the row's main timeframe.">Signal date</th>
-          <th title="Just past pivot B plus an ATR-sized buffer. Price trading through it means the divergence has failed. Risk = stop distance as a % of the entry reference.">Stop</th>
-          <th title="Multiples of the stop distance. Anchored to the signal price while the setup is still near it; re-anchored to the live price once it has run.">Targets (1R / 2R / 3R)</th>
+          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a market-mover print inside 24 hours, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
+          <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
+          <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
+          <th title="WITH TREND: BTC 4H RSI and this coin's 200 EMA both agree with the side. COUNTER TREND setups need grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
+          <th class="sortable" data-sort="age" title="Close of the signal bar: the MACD cross that ends the second wave.">Signal</th>
+          <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
+          <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
+          <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
+          <th title="Never part of the answer. Pattern tags (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS), then the daily-movers and open-interest tags. Hover a tag for its definition.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -2919,8 +2922,7 @@ tr.det b{color:var(--tx)}
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75;margin-bottom:18px">
       Regular divergence only &mdash; price and momentum disagreeing at a trend extreme, which is the
       classic <b style="color:var(--tx)">reversal</b> signature. Hidden (continuation) divergences are
-      not scanned. Between pivot A and pivot B the price line and the MACD line move in opposite
-      directions; that mismatch is the whole signal.
+      not scanned. It is read the way you would on a chart: the MACD/signal crossovers split the MACD line into waves, each wave below the signal line is one trough, and two neighbouring troughs A and B are compared with the price lows inside those same waves. Price lower, MACD trough higher: that mismatch is the whole signal.
     </div>
   </div>
 
@@ -2975,25 +2977,25 @@ tr.det b{color:var(--tx)}
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">The rules a signal has to pass (Balanced)</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so a scan at 14:05 and one at 15:55 agree about the same setup. Nothing repaints.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Real swing extremes.</b> Troughs come from the candle low and peaks from the high &mdash; not the close. Divergence lines get drawn from wicks, so pivots found on closes sit on the wrong bar.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>MACD has to be pivoting too.</b> A price pivot only counts if a MACD pivot sits within 3 bars of it, and the MACD value used is that pivot's own extreme. Momentum often turns a bar or two off price &mdash; demanding the same bar loses real setups, demanding nothing accepts bars where MACD was not swinging at all.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The line must be clean.</b> No bar between A and B may undercut B's low (bullish) or exceed B's high (bearish), and no bar's MACD may break past A's extreme. If either happens, the swing you would have drawn is not actually there.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be a meaningful share of the MACD range across the leg. This is what kills micro-divergences that look like nothing on the chart.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Every prior pivot is tested, not just the nearest.</b> The nearest prior swing is usually a shallow intermediate dip that does not diverge. Pivot B is compared against every pivot in the lookback window, and among those that pass, the deepest MACD extreme wins &mdash; the line you would draw by hand.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so two scans inside the same bar agree. The one exception is a row marked &ldquo;bar still forming&rdquo;: it is provisional and can disappear.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Waves come from the crossovers.</b> A bear wave runs from a bearish MACD/signal cross to the next bullish cross, a bull wave the other way. A cross only counts if the two lines separate by 5% of the recent MACD range within 3 bars, and a wave shorter than 3 bars is merged into its neighbours, so a tiny double dot cannot split one trough into two.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One trough per wave.</b> The MACD trough is the lowest MACD-line value in the wave. The price low is the lowest wick from the start of the wave to 2 bars after it ends, because price often bottoms just after momentum turns.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>A then B, with a real bump between.</b> Two neighbouring troughs, 8 to 80 bars apart. The MACD peak between them must rise at least 25% of the leg's MACD range above the higher trough: that is the middle of the W.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be at least 15% of the leg's MACD range. This is what kills micro-divergences.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Reported only when wave B is closed.</b> The cross that ends wave B is the signal bar and its close is the signal price. Before that cross there is no signal.</div></div>
       <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars.</div></div>
     </div>
   </div>
 
   <div class="dash-sec" style="margin-top:28px">
-    <div class="dash-sec-ttl">Entry verdict &mdash; a checklist, not a prediction</div>
+    <div class="dash-sec-ttl">Good to enter? &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>ENTER means five things are true at scan time.</b> The second pivot is within the last 12 bars, price has not run more than 2% past the signal price, the stop has not been touched, the MACD line has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. It does not mean the trade works.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>WAIT names the one thing missing.</b> A pullback to the signal price after price ran, the MACD cross, or a CPI / FOMC-class print that is too close. A divergence is listed as WAIT as soon as its second pivot is confirmed, so you see it before it is enterable.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>SKIP is history.</b> The stop was hit, the move already made 1R or more, or the second pivot is older than 12 bars. These rows only appear under the All filter.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The verdict ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old, one full 1H bar has closed since, the verdicts dim and the page asks for a re-run.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags, sorts first, and takes its verdict, stop and targets from whichever signal is furthest along (Enter beats Wait beats Skip, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's pivots and levels.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>When a divergence is listed, and when it leaves.</b> A pivot is confirmed once 3 closed bars follow it, so a 4H divergence appears about 12 hours after its second pivot and a 1H one after 3 hours. The two pivots are at most 60 bars apart. A divergence is never dropped for its age: each coin lists its most recent one per side and timeframe from the candles scanned (about 120 days of 4H, 21 days of 1H). Old ones stay listed and answer No.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a CPI / FOMC-class print inside 24 hours, or a signal bar that has not closed and has no lower-timeframe trigger.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> WITH TREND means BTC 4H RSI is on the signal's side of 50 and the coin is on the right side of its 200 EMA. Anything else is COUNTER TREND and needs grade A.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's levels and its chart.</div></div>
     </div>
   </div>
 
@@ -3016,23 +3018,22 @@ tr.det b{color:var(--tx)}
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Every row arrives with levels.</b> Prior-day high and low, the 7-day range boundaries, and where price sits inside that range right now. A watchlist without a level and a point where you are wrong is a list of names, not a plan &mdash; and that is the part these posts usually leave out.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Completed bars only.</b> The scan describes the last <b>closed</b> day, so it reads the same at 02:00 and at 22:00. It tells you what happened yesterday so you can plan today; it is not a live intraday tape.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>No stocks, ETFs or commodities.</b> Those perps are excluded from the universe entirely. Their underlying market closes at the weekend, leaving a thin book, funding-driven drift and a gap at the Monday cash open &mdash; quoting a weekend level on one is quoting a level on nothing.</div></div>
-      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>The standout score is a description, not an edge.</b> Volume anomaly (35), range expansion (30), proximity to a 7-day boundary (20), size of the move (15). It has no direction and has not been backtested &mdash; the same caveat as the setup score.</div></div>
+      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>The standout score is a description, not an edge.</b> Volume anomaly (35), range expansion (30), proximity to a 7-day boundary (20), size of the move (15). It has no direction and has not been backtested &mdash; it is not a win rate.</div></div>
     </div>
   </div>
 
   <div class="dash-sec">
-    <div class="dash-sec-ttl">Setup score &mdash; only used to order rows</div>
+    <div class="dash-sec-ttl">Quality score and grade</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
-      The table no longer shows this number; it only breaks ties in the row order. The score is a <b style="color:var(--tx)">description of the structure</b>, not a win rate and not a
-      backtested edge. It adds up: how large the momentum divergence is relative to the leg (30), how
-      decisive the price break is in ATR terms (15), whether the pivots are sensibly spaced (15), whether
-      they sit on the classic side of the MACD zero line (15), whether MACD has crossed its signal line
-      since the pivot (15), and how liquid the pair is (10).
+      0 to 100, graded <b style="color:var(--tx)">A</b> (70+), <b style="color:var(--tx)">B</b> (55-69) or
+      <b style="color:var(--tx)">C</b> (below 55). It adds up: the price difference A to B in ATR (15), the MACD
+      trough improvement (15), the height of the bump (10), both troughs on the classic side of zero (10), the
+      higher timeframe's MACD agreeing (15), volume drying up in wave B (10), a rejection wick at B (10), open
+      interest falling into B with funding not against it (10), a triple divergence (5). Open interest rising
+      more than 5% against the signal costs 10.
       <br><br>
-      A 90 means a clean textbook picture. It does not mean the trade works. The previous version quoted
-      win rates from a backtest of a different configuration &mdash; weekly regime filter on, hidden
-      divergences included, 22 fixed pairs &mdash; and none of that describes what you are looking at here,
-      so those numbers are gone rather than quietly repurposed.
+      The grade describes the setup. It is not a win rate. To see how each grade and regime has actually done on
+      the stored candles, run <b style="color:var(--tx)">python macd_divergence_screener_v5.py --backtest</b>.
     </div>
   </div>
 </div>
@@ -3056,6 +3057,12 @@ function qcell(q){
     '<span style="font-size:9px;opacity:.7;margin-left:3px">' + lbl + '</span></span>' +
     '<div class="qbar"><div class="qfill" style="width:' + q + '%;background:' + c + '"></div></div></div>';
 }
+function gradeCell(p){
+  var c = p.grade === 'A' ? 'var(--bull)' : p.grade === 'B' ? 'var(--fresh)' : 'var(--tx3)';
+  return '<div class="qc"><span class="qnum" style="color:' + c + '">' + p.grade +
+    '<span style="font-size:9px;opacity:.7;margin-left:3px">' + p.score + '</span></span>' +
+    '<div class="qbar"><div class="qfill" style="width:' + p.score + '%;background:' + c + '"></div></div></div>';
+}
 // Sub-cent tokens round to values like 9.8e-06, and JS stringifies anything
 // below 1e-6 with an exponent — an unusable price level. Force plain digits.
 function fmtPx(v){
@@ -3068,9 +3075,6 @@ function fmtVol(v){
   if(v >= 1e9) return '$' + (v/1e9).toFixed(2) + 'B';
   if(v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
   return '$' + Math.round(v).toLocaleString();
-}
-function volCell(d){
-  return '<div class="volc">' + fmtVol(d.weekly_volume) + '<small>7 days</small></div>';
 }
 function b2t(bars, tf){
   var m = bars * ((TFM[tf] && TFM[tf].minutes) || 240);
@@ -3107,8 +3111,11 @@ function evCell(r){
          '<span class="tsub">' + txt + '</span></div>';
 }
 function ctxCell(r){
-  if(r.context_error) return '<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>';
   var h = [];
+  (primary(r).tags || []).forEach(function(f){
+    h.push('<span class="wflag wf-hioi"' + tip(f) + '>' + f + '</span>');
+  });
+  if(r.context_error) h.push('<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>');
   ((r.mover || {}).flags || []).forEach(function(f){
     h.push('<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
   });
@@ -3180,7 +3187,11 @@ var TIP = {
   'AT RANGE HIGH':   'Within ' + TH.edge + '% of the 7-day high.',
   'ABOVE 7D HIGH':   'Price has traded through the 7-day high.',
   'AT RANGE LOW':    'Within ' + TH.edge + '% of the 7-day low.',
-  'BELOW 7D LOW':    'Price has traded through the 7-day low.'
+  'BELOW 7D LOW':    'Price has traded through the 7-day low.',
+  'TRIPLE':          'The trough before A also diverges from A: three troughs in a row, price lower each time, MACD higher each time.',
+  'W-PATTERN':       'The bump between A and B is at least half the MACD range of the leg: a clear W (M for bearish).',
+  'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
+  'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 
@@ -3359,8 +3370,8 @@ function startMovers(){
 
 /* ── Sidebar controls ─────────────────────────────────────────────────────── */
 var STR_HINTS = {
-  balanced: 'MACD pivot must align with the price pivot, the divergence line must be unbroken, and the move must clear a minimum size.',
-  strict:   'Balanced plus the zero-line condition: both bullish MACD pivots below zero, both bearish above. Fewer signals, higher conviction.'
+  balanced: 'Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.',
+  strict:   'Larger minimum size, and both troughs must sit below the zero line (both peaks above it for bearish).'
 };
 ['strG','spdG'].forEach(function(g){
   document.querySelectorAll('#' + g + ' .tbtn').forEach(function(b){
@@ -3504,12 +3515,13 @@ function pushBg(pair, isHit){
 function resetBg(){ var f = document.getElementById('sbgFeed'); if(f) f.innerHTML = ''; }
 
 function tgtHtml(d){
-  var tgt = d.targets || {}, fromCur = d.targets_from === 'current';
-  return '<div style="font-family:var(--mono);font-size:8px;color:' + (fromCur ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
-    (fromCur ? 'FROM CURRENT PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>' +
+  var tgt = d.targets || {}, trig = d.targets_from === 'trigger';
+  return '<div style="font-family:var(--mono);font-size:8px;color:' + (trig ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
+    (trig ? 'FROM TRIGGER PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>' +
     '<span style="color:var(--tx3)">' + fmtPx(tgt['1r']) + '</span>' +
     ' <span style="color:var(--tx3)">/</span> <span style="color:var(--tx2)">' + fmtPx(tgt['2r']) + '</span>' +
-    ' <span style="color:var(--tx3)">/</span> <span style="color:var(--bull);font-weight:600">' + fmtPx(tgt['3r']) + '</span>';
+    ' <span style="color:var(--tx3)">/</span> <span style="color:var(--bull);font-weight:600">' + fmtPx(tgt['3r']) + '</span>' +
+    '<div style="font-size:8px;color:var(--tx3);margin-top:2px">structure ' + fmtPx(tgt.structure) + '</div>';
 }
 function detailRow(r){
   var tr = document.createElement('tr');
@@ -3519,13 +3531,16 @@ function detailRow(r){
     return '<div><b>' + tfLabel(tf) + '</b> &nbsp;A ' + s.pivot1_time + ' @ ' + fmtPx(s.pivot1_price) +
       ' &rarr; B ' + s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price) +
       ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
+      ' &nbsp;&middot;&nbsp; grade ' + s.grade + ' (' + s.score + ') &middot; ' + s.regime +
       ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
-      ' &nbsp;&middot;&nbsp; ' + (s.macd_cross ? 'MACD crossed ' + s.macd_cross_at : 'no MACD cross yet') +
+      (s.trigger_price != null ? ' &nbsp;&middot;&nbsp; lower-timeframe trigger at ' + fmtPx(s.trigger_price) : '') +
       ' &nbsp;&middot;&nbsp; stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)' +
       ' &nbsp;&middot;&nbsp; 1R ' + fmtPx((s.targets || {})['1r']) + ' / 2R ' + fmtPx((s.targets || {})['2r']) +
-      ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>';
+      ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>' +
+      '<img class="chart" loading="lazy" alt="Chart needs a fresh scan" src="/chart?pair=' +
+      encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '">';
   }).join('');
-  tr.innerHTML = '<td colspan="8">' + h + '</td>';
+  tr.innerHTML = '<td colspan="10"><div>Weekly volume ' + fmtVol(r.weekly_volume) + ' (7 days)</div>' + h + '</td>';
   return tr;
 }
 function buildRow(r){
@@ -3537,11 +3552,14 @@ function buildRow(r){
     '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP</span></div></td>' +
     '<td>' + evCell(r) + '</td>' +
     '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + (bull ? 'BULLISH' : 'BEARISH') + '</span>' + tfs + '</td>' +
-    '<td>' + ctxCell(r) + '</td>' +
-    '<td>' + volCell(r) + '</td>' +
-    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.pivot2_time + '</div><div class="ptm">' + tfLabel(tf) + ' &middot; ' + b2t(p.bars_ago, tf) + '</div></td>' +
+    '<td>' + gradeCell(p) + '</td>' +
+    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.regime + '</div><div class="ptm">' + (SC[p.status] || SC.active).lbl + '</div></td>' +
+    '<td><span style="font-family:var(--mono);font-size:11px">' + fmtPx(p.signal_price) + '</span><div class="ptm">' +
+      (p.forming ? tfLabel(tf) + ' &middot; bar still forming' : p.signal_time + ' &middot; ' + b2t(p.bars_ago, tf)) + '</div></td>' +
     '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(p.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + p.risk_pct + '%</div></td>' +
-    '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>';
+    '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>' +
+    '<td><div class="ptm">A ' + p.pivot1_time + '</div><div class="ptm">B ' + p.pivot2_time + '</div></td>' +
+    '<td>' + ctxCell(r) + '</td>';
   tr.addEventListener('click', function(){
     var n = tr.nextSibling;
     if(n && n.className === 'det'){ n.parentNode.removeChild(n); return; }
@@ -3554,11 +3572,10 @@ function ageMin(r){ var tf = r.primary_tf || r.tfs[0]; return primary(r).bars_ag
 function renderAll(results){
   var rows = (results || []).filter(function(d){ return matches(d, af); });
   rows.sort(function(a, b){
-    if(sortKey === 'vol') return (b.weekly_volume || 0) - (a.weekly_volume || 0);
     if(sortKey === 'age') return ageMin(a) - ageMin(b);
     return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
            (verdict(a) === 'skip' ? ageMin(a) - ageMin(b) : 0) ||   /* played-out rows: newest first */
-           (b.tfs.length - a.tfs.length) || (b.score - a.score);
+           (b.score - a.score);
   });
   var tb = document.getElementById('resB'); tb.innerHTML = '';
   var st = rows.length > 1 ? Math.min(60, 800 / rows.length) : 0;

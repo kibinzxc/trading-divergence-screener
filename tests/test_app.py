@@ -118,8 +118,13 @@ class Page(unittest.TestCase):
 
     def test_new_table_and_filters(self):
         for want in ('data-f="enter"', 'data-f="both"', "function evCell", "function ctxCell",
-                     'id="scan-age"', 'id="dash-cal"'):
+                     'id="scan-age"', 'id="dash-cal"',
+                     "function gradeCell", "/chart?pair=", "'W-PATTERN'", "'LTF TRIGGER'"):
             self.assertIn(want, self.html, want)
+
+    def test_pivot_era_ui_is_gone(self):
+        for gone in ("macd_cross", "volCell", "FROM CURRENT PRICE", "MACD pivot must align"):
+            self.assertNotIn(gone, self.html, gone)
 
 
 if __name__ == "__main__":

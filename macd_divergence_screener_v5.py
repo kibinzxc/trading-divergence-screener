@@ -1661,6 +1661,32 @@ def dedupe(sigs):
     return sorted(best.values(), key=lambda s: s["bars_ago"])
 
 
+def build_rows(sigs, mover=None, flow=None, context_error=None,
+               hours_to_event=None, event_title=""):
+    """One row per side for ONE pair's signals across timeframes.
+
+    The primary signal — the one whose status, levels and entry verdict the
+    table shows — is the highest timeframe present (TF_CFG order).
+    """
+    order = list(TF_CFG)
+    rows = {}
+    for s in sorted(sigs, key=lambda s: order.index(s["tf"])):
+        r = rows.setdefault(s["side"], {
+            "pair": s["pair"], "base": s["base"], "side": s["side"],
+            "current_price": s["current_price"], "weekly_volume": s["weekly_volume"],
+            "tfs": [], "signals": {},
+            "mover": mover, "flow": flow, "context_error": context_error})
+        r["tfs"].append(s["tf"])
+        r["signals"][s["tf"]] = s
+    for r in rows.values():
+        primary = r["signals"][r["tfs"][0]]
+        r["score"]  = max(s["score"] for s in r["signals"].values())
+        r["fresh"]  = any(s["fresh"] for s in r["signals"].values())
+        r["status"] = primary["status"]
+        r["entry"]  = entry_verdict(primary, hours_to_event, event_title)
+    return list(rows.values())
+
+
 # ── State persistence ──────────────────────────────────────────────────────────
 def save_state():
     try:

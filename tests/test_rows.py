@@ -111,5 +111,40 @@ class FlowContext(unittest.TestCase):
         self.assertIsNone(m.flow_context(None, daily(self.UP), 11.5, 0.0, 7e9))
 
 
+def full_sig(tf, side, **kw):
+    base = dict(SIG, tf=tf, side=side, pair="ENS/USDT:USDT", base="ENS",
+                current_price=100.5, weekly_volume=9e7, score=60)
+    return dict(base, **kw)
+
+
+class BuildRows(unittest.TestCase):
+    def test_same_side_on_both_timeframes_is_one_row_4h_first(self):
+        rows = m.build_rows([full_sig("1h", "bullish", score=80),
+                             full_sig("4h", "bullish", score=70)])
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["tfs"], r["score"], sorted(r["signals"])),
+                         (["4h", "1h"], 80, ["1h", "4h"]))
+
+    def test_opposite_sides_are_two_rows(self):
+        rows = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bearish")])
+        self.assertEqual(sorted((r["side"], r["tfs"][0]) for r in rows),
+                         [("bearish", "1h"), ("bullish", "4h")])
+
+    def test_verdict_and_status_come_from_the_4h_signal(self):
+        rows = m.build_rows([full_sig("4h", "bullish", status="invalidated"),
+                             full_sig("1h", "bullish")])
+        self.assertEqual((rows[0]["status"], rows[0]["entry"]["verdict"], rows[0]["fresh"]),
+                         ("invalidated", "skip", True))
+
+    def test_context_and_event_are_carried_onto_the_row(self):
+        rows = m.build_rows([full_sig("1h", "bearish")], mover={"flags": ["VOLUME SPIKE"]},
+                            flow=None, context_error=None,
+                            hours_to_event=3.0, event_title="FOMC Statement")
+        r = rows[0]
+        self.assertEqual((r["mover"], r["flow"], r["entry"]["reason"]),
+                         ({"flags": ["VOLUME SPIKE"]}, None, "FOMC Statement in 3h"))
+
+
 if __name__ == "__main__":
     unittest.main()

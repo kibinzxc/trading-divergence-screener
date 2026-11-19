@@ -13,8 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import macd_divergence_screener_v5 as m  # noqa: E402
 
 SIG = {"status": "active", "fresh": True, "bars_ago": 2, "r_reached": 0.0,
-       "pct_chg": 0.4, "signal_price": 100.0, "macd_cross": True,
-       "stop_price": 97.0, "risk_pct": 3.0}
+       "pct_chg": 0.4, "signal_price": 100.0, "stop_price": 97.0, "risk_pct": 3.0,
+       "grade": "A", "score": 74, "regime": "WITH TREND",
+       "forming": False, "trigger_first": False}
 
 
 def sig(**kw):
@@ -25,33 +26,42 @@ class EntryVerdict(unittest.TestCase):
     def verdict(self, s, *a):
         return m.entry_verdict(s, *a)["verdict"]
 
-    def test_enter_when_every_check_passes(self):
+    def test_confirmed_yes_when_every_check_passes(self):
         v = m.entry_verdict(sig())
         self.assertEqual((v["verdict"], v["level"]), ("enter", 97.0))
+        self.assertTrue(v["reason"].startswith("Yes (confirmed)."))
         self.assertIn("Risk 3.0%", v["reason"])
 
-    def test_invalidated_is_skip(self):
+    def test_invalidated_is_no(self):
         v = m.entry_verdict(sig(status="invalidated"))
         self.assertEqual(v["verdict"], "skip")
         self.assertIn("hit the stop", v["reason"])
 
-    def test_ran_is_skip(self):
+    def test_ran_is_no(self):
         v = m.entry_verdict(sig(status="ran", r_reached=2.5))
         self.assertEqual(v["verdict"], "skip")
         self.assertIn("2.5x the risk", v["reason"])
 
-    def test_not_fresh_is_skip(self):
+    def test_old_signal_bar_is_no(self):
         v = m.entry_verdict(sig(fresh=False, bars_ago=20))
         self.assertEqual(v["verdict"], "skip")
         self.assertIn("20 bars ago", v["reason"])
+
+    def test_grade_c_is_no(self):
+        v = m.entry_verdict(sig(grade="C", score=41))
+        self.assertEqual(v["verdict"], "skip")
+        self.assertIn("grade C", v["reason"])
+
+    def test_counter_trend_needs_grade_a(self):
+        v = m.entry_verdict(sig(regime="COUNTER TREND", grade="B"))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("Watch only", v["reason"])
+        self.assertEqual(self.verdict(sig(regime="COUNTER TREND", grade="A")), "enter")
 
     def test_extended_waits_for_a_pullback_to_the_signal_price(self):
         v = m.entry_verdict(sig(status="extended", pct_chg=3.1))
         self.assertEqual((v["verdict"], v["level"]), ("wait", 100.0))
         self.assertIn("3.1%", v["reason"])
-
-    def test_no_macd_cross_is_wait(self):
-        self.assertEqual(self.verdict(sig(macd_cross=False)), "wait")
 
     def test_event_inside_24h_is_wait_and_names_the_event(self):
         v = m.entry_verdict(sig(), 14.2, "CPI m/m")
@@ -62,8 +72,19 @@ class EntryVerdict(unittest.TestCase):
         self.assertEqual(self.verdict(sig(), 30.0, "CPI m/m"), "enter")
         self.assertEqual(self.verdict(sig(), None), "enter")
 
-    def test_skip_outranks_wait(self):
+    def test_forming_bar_is_early_only_with_the_trigger(self):
+        v = m.entry_verdict(sig(forming=True, trigger_first=True))
+        self.assertEqual(v["verdict"], "enter")
+        self.assertTrue(v["reason"].startswith("Yes (early)."))
+        v = m.entry_verdict(sig(forming=True))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("still forming", v["reason"])
+
+    def test_rules_apply_in_order(self):
         self.assertEqual(self.verdict(sig(status="invalidated"), 2.0, "FOMC"), "skip")
+        self.assertEqual(self.verdict(sig(grade="C", regime="COUNTER TREND")), "skip")
+        self.assertIn("Watch only", m.entry_verdict(
+            sig(grade="B", regime="COUNTER TREND", status="extended"))["reason"])
 
 
 class NextMover(unittest.TestCase):
@@ -128,7 +149,7 @@ class BuildRows(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         r = rows[0]
         self.assertEqual((r["tfs"], r["score"], sorted(r["signals"]), r["primary_tf"]),
-                         (["4h", "1h"], 80, ["1h", "4h"], "4h"))
+                         (["4h", "1h"], 70, ["1h", "4h"], "4h"))
 
     def test_opposite_sides_are_two_rows(self):
         rows = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bearish")])
@@ -147,8 +168,14 @@ class BuildRows(unittest.TestCase):
 
     def test_wait_beats_skip(self):
         r = m.build_rows([full_sig("4h", "bullish", fresh=False),
-                          full_sig("1h", "bullish", macd_cross=False)])[0]
+                          full_sig("1h", "bullish", status="extended")])[0]
         self.assertEqual((r["primary_tf"], r["entry"]["verdict"]), ("1h", "wait"))
+
+    def test_row_takes_grade_and_regime_from_the_primary_signal(self):
+        r = m.build_rows([full_sig("4h", "bullish", status="invalidated", grade="A"),
+                          full_sig("1h", "bullish", grade="B", score=61)])[0]
+        self.assertEqual((r["primary_tf"], r["grade"], r["score"], r["regime"]),
+                         ("1h", "B", 61, "WITH TREND"))
 
     def test_context_and_event_are_carried_onto_the_row(self):
         rows = m.build_rows([full_sig("1h", "bearish")], mover={"flags": ["VOLUME SPIKE"]},

@@ -28,19 +28,22 @@ class EntryVerdict(unittest.TestCase):
     def test_enter_when_every_check_passes(self):
         v = m.entry_verdict(sig())
         self.assertEqual((v["verdict"], v["level"]), ("enter", 97.0))
-        self.assertIn("risk 3.0%", v["reason"])
+        self.assertIn("Risk 3.0%", v["reason"])
 
     def test_invalidated_is_skip(self):
         v = m.entry_verdict(sig(status="invalidated"))
-        self.assertEqual((v["verdict"], v["reason"]), ("skip", "Stop was hit"))
+        self.assertEqual(v["verdict"], "skip")
+        self.assertIn("hit the stop", v["reason"])
 
     def test_ran_is_skip(self):
         v = m.entry_verdict(sig(status="ran", r_reached=2.5))
-        self.assertEqual((v["verdict"], v["reason"]), ("skip", "Already ran 2.5R"))
+        self.assertEqual(v["verdict"], "skip")
+        self.assertIn("2.5x the risk", v["reason"])
 
     def test_not_fresh_is_skip(self):
         v = m.entry_verdict(sig(fresh=False, bars_ago=20))
-        self.assertEqual((v["verdict"], v["reason"]), ("skip", "Too old (20 bars)"))
+        self.assertEqual(v["verdict"], "skip")
+        self.assertIn("20 bars ago", v["reason"])
 
     def test_extended_waits_for_a_pullback_to_the_signal_price(self):
         v = m.entry_verdict(sig(status="extended", pct_chg=3.1))
@@ -52,7 +55,8 @@ class EntryVerdict(unittest.TestCase):
 
     def test_event_inside_24h_is_wait_and_names_the_event(self):
         v = m.entry_verdict(sig(), 14.2, "CPI m/m")
-        self.assertEqual((v["verdict"], v["reason"]), ("wait", "CPI m/m in 14h"))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("CPI m/m is due in 14h", v["reason"])
 
     def test_event_beyond_24h_or_unknown_does_not_block(self):
         self.assertEqual(self.verdict(sig(), 30.0, "CPI m/m"), "enter")
@@ -151,8 +155,8 @@ class BuildRows(unittest.TestCase):
                             flow=None, context_error=None,
                             hours_to_event=3.0, event_title="FOMC Statement")
         r = rows[0]
-        self.assertEqual((r["mover"], r["flow"], r["entry"]["reason"]),
-                         ({"flags": ["VOLUME SPIKE"]}, None, "FOMC Statement in 3h"))
+        self.assertEqual((r["mover"], r["flow"]), ({"flags": ["VOLUME SPIKE"]}, None))
+        self.assertIn("FOMC Statement is due in 3h", r["entry"]["reason"])
 
 
 if __name__ == "__main__":

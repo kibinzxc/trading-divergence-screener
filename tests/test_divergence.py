@@ -78,9 +78,10 @@ class Detection(unittest.TestCase):
         out = self.detect(70, 116, "bullish", "4h")     # 120 bars: 3 bars follow bar 116
         self.assertEqual([(s["bars_ago"], s["fresh"]) for s in out], [(3, True)])
 
-    def test_second_pivot_older_than_max_age_is_dropped(self):
+    def test_an_old_divergence_is_still_listed_but_not_fresh(self):
         for tf in ("4h", "1h"):
-            self.assertEqual(self.detect(20, 60, "bullish", tf), [])   # 59 bars old
+            out = self.detect(20, 60, "bullish", tf)                   # 59 bars old
+            self.assertEqual([(s["bars_ago"], s["fresh"]) for s in out], [(59, False)])
 
     def test_pivots_further_apart_than_max_dist_are_dropped(self):
         for tf in ("4h", "1h"):

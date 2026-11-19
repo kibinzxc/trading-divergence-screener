@@ -116,9 +116,9 @@ PIVOT_SYNC  = 3      # bars of slack allowed between a price pivot and its MACD 
 # (5 bars on 4H is 20 hours), and a divergence listed a day late is not usable.
 TF_CFG = {
     "4h": {"label": "4H", "minutes": 240, "bars": 720, "pivot_lb": 5, "pivot_rb": 3,
-           "min_dist": 5, "max_dist": 60, "max_age": 30, "fresh": 12},
+           "min_dist": 5, "max_dist": 60, "fresh": 12},
     "1h": {"label": "1H", "minutes": 60,  "bars": 500, "pivot_lb": 5, "pivot_rb": 3,
-           "min_dist": 5, "max_dist": 60, "max_age": 24, "fresh": 12},
+           "min_dist": 5, "max_dist": 60, "fresh": 12},
 }
 
 # Strictness presets — see the module docstring for what each rule does.
@@ -417,7 +417,7 @@ def detect_divergences(df, cfg, rules):
     n = len(df)
 
     lb, rb = cfg["pivot_lb"], cfg["pivot_rb"]
-    mn, mx, age = cfg["min_dist"], cfg["max_dist"], cfg["max_age"]
+    mn, mx = cfg["min_dist"], cfg["max_dist"]
 
     price_h, price_l = swing_pivots(high, low, lb, rb)
     macd_h,  macd_l  = find_pivots(macd, lb, rb)
@@ -433,7 +433,7 @@ def detect_divergences(df, cfg, rules):
             anchors[i] = a
 
     for b in price_l:
-        if n - 1 - b > age or b not in anchors:
+        if b not in anchors:
             continue
         mb_bar, mb_val = anchors[b]
         atr_pct = (atrv[b] / close[b] * 100) if close[b] else 0.0
@@ -491,7 +491,7 @@ def detect_divergences(df, cfg, rules):
             anchors[i] = a
 
     for b in price_h:
-        if n - 1 - b > age or b not in anchors:
+        if b not in anchors:
             continue
         mb_bar, mb_val = anchors[b]
         atr_pct = (atrv[b] / close[b] * 100) if close[b] else 0.0
@@ -761,19 +761,25 @@ def entry_verdict(sig, hours_to_event=None, event_title=""):
 
     st = sig["status"]
     if st == "invalidated":
-        return out("skip", "Stop was hit")
+        return out("skip", "No. Price already hit the stop, so this divergence failed.")
     if st == "ran":
-        return out("skip", f"Already ran {sig['r_reached']:g}R")
+        return out("skip", f"No. Price already moved {sig['r_reached']:g}x the risk toward the "
+                           "target. The move has happened; entering now is chasing it.")
     if not sig["fresh"]:
-        return out("skip", f"Too old ({sig['bars_ago']} bars)")
+        return out("skip", f"No. The divergence finished {sig['bars_ago']} bars ago, "
+                           "too long ago to act on.")
     if st == "extended":
-        return out("wait", f"Moved {sig['pct_chg']:g}% from signal, wait for a pullback to",
+        return out("wait", f"Not yet. Price has already moved {sig['pct_chg']:g}% away from the "
+                           "signal. Wait for it to pull back to",
                    sig["signal_price"])
     if not sig["macd_cross"]:
-        return out("wait", "Momentum has not turned, wait for the MACD cross")
+        return out("wait", "Not yet. MACD has not crossed its signal line, so momentum "
+                           "has not turned. Wait for the cross.")
     if hours_to_event is not None and hours_to_event <= EVENT_WAIT_H:
-        return out("wait", f"{event_title} in {hours_to_event:.0f}h")
-    return out("enter", f"Near signal, MACD crossed, risk {sig['risk_pct']}%, stop",
+        return out("wait", f"Not yet. {event_title} is due in {hours_to_event:.0f}h and can "
+                           "whip price. Wait until it has passed.")
+    return out("enter", "Yes. Price is still near the signal, MACD has crossed and the stop "
+                            f"is untouched. Risk {sig['risk_pct']}% to the stop at",
                sig["stop_price"])
 
 
@@ -2428,8 +2434,8 @@ th.sortable:hover{color:var(--tx2)}
 th.sorted{color:var(--acc)}
 td{padding:10px 12px;border-bottom:1px solid var(--bd);vertical-align:middle;transition:background .2s}
 tr.rb{background:#0D201018}tr.rr{background:#2D0F1818}
-tr.dim td{opacity:.45}
-tr.dim td:nth-child(2){opacity:1}
+tr.dim td{opacity:.6}
+tr.dim td:nth-child(-n+3){opacity:1}
 tr:hover td{background:var(--sf2)}
 @keyframes ri{from{opacity:0;transform:translateX(-5px)}to{opacity:1;transform:translateX(0)}}
 tbody tr{animation:ri .3s var(--eout) both}
@@ -2460,8 +2466,8 @@ tbody tr{animation:ri .3s var(--eout) both}
 .qfill{height:100%;border-radius:2px;transition:width .4s}
 .tlbl{font-size:11px;font-weight:700;white-space:nowrap}
 .tsub{font-size:9px;font-weight:400;opacity:.8;margin-top:1px;white-space:normal;line-height:1.3}
-.ev{display:inline-flex;flex-direction:column;gap:1px;padding:5px 9px;border-radius:5px;font-family:var(--mono);min-width:150px;max-width:260px}
-.ev .tsub{white-space:normal;line-height:1.35}
+.ev{display:inline-flex;flex-direction:column;gap:2px;padding:6px 10px;border-radius:5px;font-family:var(--mono);min-width:220px;max-width:340px}
+.ev .tsub{white-space:normal;line-height:1.45;font-size:10.5px;font-family:var(--sans);opacity:.95}
 .ev-enter{background:#0D2E1F;color:#34D399;border:1px solid #1a4020}
 .ev-wait{background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500}
 .ev-skip{background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2)}
@@ -2669,12 +2675,12 @@ tr.det b{color:var(--tx)}
       <span class="spill sbear" id="stBear">&#9660; <span class="num" id="cBear">0</span> bearish</span>
       <span class="spill sfresh" id="stEnter">&#9889; <span class="num" id="cEnter">0</span> enter now</span>
       <div class="fbar">
-        <button class="ftab active" data-f="live" onclick="setF(this)" title="Everything still worth watching: verdict Enter or Wait.">Live</button>
+        <button class="ftab" data-f="live" onclick="setF(this)" title="Everything still worth watching: verdict Enter or Wait.">Live</button>
         <button class="ftab" data-f="enter" onclick="setF(this)" title="Only rows whose verdict is Enter.">Enter now</button>
         <button class="ftab" data-f="bull" onclick="setF(this)">Bullish</button>
         <button class="ftab" data-f="bear" onclick="setF(this)">Bearish</button>
         <button class="ftab" data-f="both" onclick="setF(this)" title="The same side diverging on 4H and 1H at once.">4H+1H</button>
-        <button class="ftab" data-f="all" onclick="setF(this)" title="Includes Skip rows: stopped out, already ran, or too old.">All</button>
+        <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence found, including ones that already played out, were stopped, or are too old.">All</button>
       </div>
     </div>
     <div id="scan-age" class="audit" style="margin:8px 16px 0"></div>
@@ -2686,10 +2692,9 @@ tr.det b{color:var(--tx)}
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th title="A checklist, not a prediction. ENTER: second pivot is recent, price has not run more than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on whichever timeframe's signal is furthest along: Enter beats Wait beats Skip, 4H wins a tie. The highlighted timeframe tag shows which one.">Entry</th>
+          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. ENTER: second pivot is recent, price has not run more than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on whichever timeframe's signal is furthest along: Enter beats Wait beats Skip, 4H wins a tie. The highlighted timeframe tag shows which one. Default order: Yes, then Not yet, then No. Yes and Not yet put 4H+1H first; No rows are newest first.">Good to enter? &#8595;</th>
           <th title="Regular bullish: price makes a lower low while the MACD line makes a higher low. Regular bearish: price makes a higher high while the MACD line makes a lower high. The tags show which timeframes diverge; 4H+1H agreeing sorts first.">Side &middot; TF</th>
           <th title="Not part of the verdict. Movers tags describe the last completed day against this coin's own 20-day baseline. OI tags describe 7-day open-interest flow and funding. Hover a tag for its definition.">Context</th>
-          <th class="sortable sorted" data-sort="score" title="Default order: Enter, then Wait, then Skip; within each, 4H+1H first, then setup score. The score is how textbook the structure is, 0-100. Not a win rate, not backtested.">Setup score &#8595;</th>
           <th class="sortable" data-sort="vol" title="Rolling 7-day traded value in USD, measured from the 4H candles. The liquidity gate.">Weekly vol</th>
           <th class="sortable" data-sort="age" title="Time of pivot B, the bar that completed the divergence, on the row's main timeframe.">Signal date</th>
           <th title="Just past pivot B plus an ATR-sized buffer. Price trading through it means the divergence has failed. Risk = stop distance as a % of the entry reference.">Stop</th>
@@ -2855,7 +2860,7 @@ tr.det b{color:var(--tx)}
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>SKIP is history.</b> The stop was hit, the move already made 1R or more, or the second pivot is older than 12 bars. These rows only appear under the All filter.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The verdict ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old, one full 1H bar has closed since, the verdicts dim and the page asks for a re-run.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags, sorts first, and takes its verdict, stop and targets from whichever signal is furthest along (Enter beats Wait beats Skip, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's pivots and levels.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>When a divergence is listed, and when it leaves.</b> A pivot is confirmed once 3 closed bars follow it, so a 4H divergence appears about 12 hours after its second pivot and a 1H one after 3 hours. The two pivots are at most 60 bars apart. A row is dropped once its second pivot is 30 bars old on 4H (5 days) or 24 bars old on 1H (1 day).</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>When a divergence is listed, and when it leaves.</b> A pivot is confirmed once 3 closed bars follow it, so a 4H divergence appears about 12 hours after its second pivot and a 1H one after 3 hours. The two pivots are at most 60 bars apart. A divergence is never dropped for its age: each coin lists its most recent one per side and timeframe from the candles scanned (about 120 days of 4H, 21 days of 1H). Old ones stay listed and answer No.</div></div>
     </div>
   </div>
 
@@ -2883,9 +2888,9 @@ tr.det b{color:var(--tx)}
   </div>
 
   <div class="dash-sec">
-    <div class="dash-sec-ttl">Setup score &mdash; read this before trusting it</div>
+    <div class="dash-sec-ttl">Setup score &mdash; only used to order rows</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
-      The score is a <b style="color:var(--tx)">description of the structure</b>, not a win rate and not a
+      The table no longer shows this number; it only breaks ties in the row order. The score is a <b style="color:var(--tx)">description of the structure</b>, not a win rate and not a
       backtested edge. It adds up: how large the momentum divergence is relative to the leg (30), how
       decisive the price break is in ATR terms (15), whether the pivots are sensibly spaced (15), whether
       they sit on the classic side of the MACD zero line (15), whether MACD has crossed its signal line
@@ -3272,7 +3277,7 @@ function resetStats(){
   ['cBull','cBear','cEnter'].forEach(function(i){ document.getElementById(i).textContent = '0'; });
 }
 
-var af = 'live', sortKey = 'score', pendR = [], hasScanned = false, seenSig = {};
+var af = 'all', sortKey = 'score', pendR = [], hasScanned = false, seenSig = {};
 function setF(btn){
   document.querySelectorAll('.ftab').forEach(function(b){ b.classList.remove('active'); });
   btn.classList.add('active'); af = btn.dataset.f;
@@ -3383,12 +3388,11 @@ function detailRow(r){
       ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
       ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
       ' &nbsp;&middot;&nbsp; ' + (s.macd_cross ? 'MACD crossed ' + s.macd_cross_at : 'no MACD cross yet') +
-      ' &nbsp;&middot;&nbsp; score ' + s.score +
       ' &nbsp;&middot;&nbsp; stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)' +
       ' &nbsp;&middot;&nbsp; 1R ' + fmtPx((s.targets || {})['1r']) + ' / 2R ' + fmtPx((s.targets || {})['2r']) +
       ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>';
   }).join('');
-  tr.innerHTML = '<td colspan="9">' + h + '</td>';
+  tr.innerHTML = '<td colspan="8">' + h + '</td>';
   return tr;
 }
 function buildRow(r){
@@ -3401,7 +3405,6 @@ function buildRow(r){
     '<td>' + evCell(r) + '</td>' +
     '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + (bull ? 'BULLISH' : 'BEARISH') + '</span>' + tfs + '</td>' +
     '<td>' + ctxCell(r) + '</td>' +
-    '<td>' + qcell(r.score || 0) + '</td>' +
     '<td>' + volCell(r) + '</td>' +
     '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.pivot2_time + '</div><div class="ptm">' + tfLabel(tf) + ' &middot; ' + b2t(p.bars_ago, tf) + '</div></td>' +
     '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(p.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + p.risk_pct + '%</div></td>' +
@@ -3421,6 +3424,7 @@ function renderAll(results){
     if(sortKey === 'vol') return (b.weekly_volume || 0) - (a.weekly_volume || 0);
     if(sortKey === 'age') return ageMin(a) - ageMin(b);
     return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
+           (verdict(a) === 'skip' ? ageMin(a) - ageMin(b) : 0) ||   /* played-out rows: newest first */
            (b.tfs.length - a.tfs.length) || (b.score - a.score);
   });
   var tb = document.getElementById('resB'); tb.innerHTML = '';

@@ -21,12 +21,13 @@ serves both the API and a browser dashboard.
 - **Divergence detection**: price pivots are found on real swing highs/lows
   (not closes), matched to a MACD pivot within a few bars, confirmed once 3 closed bars follow it (5 bars before, 3 after), required to have a
   "clean" line between the two pivots, and sized against both a percentage
-  floor and ATR/MACD-range fractions to filter out micro-divergences. The two pivots are at most 60 bars apart, and a divergence is dropped once its second pivot is 30 bars old on 4H or 24 bars old on 1H. The
+  floor and ATR/MACD-range fractions to filter out micro-divergences. The two pivots are at most 60 bars apart, and a divergence is never dropped for its age: each coin lists its most recent one per side and timeframe from the candles scanned (about 120 days of 4H, 21 days of 1H). The
   still-forming candle is always dropped so nothing repaints between scans.
 - **Strictness presets**: `balanced` (default) and `strict`. Strict adds the
   zero-line condition and a larger minimum divergence.
-- **Setup score, not a win-rate**: each signal gets a score describing how
-  textbook the divergence structure is. It is not a backtested probability.
+- **Setup score, only for ordering**: each signal gets a score describing how
+  textbook the divergence structure is. The table does not show it; it only
+  breaks ties in the row order. It is not a backtested probability.
 - **Transparent scan accounting**: every run reports pairs dispatched,
   analysed, rejected on volume, errored, or missing volume data, and whether
   the scan actually completed — so a quiet-looking result can't be mistaken
@@ -35,7 +36,9 @@ serves both the API and a browser dashboard.
   share a row, which sorts first and takes its verdict, stop and targets
   from whichever signal is furthest along (Enter beats Wait beats Skip, 4H
   wins a tie); the highlighted tag shows which.
-- **Entry verdict**: every row is `ENTER`, `WAIT` or `SKIP` with the reason.
+- **Entry verdict**: every row is `ENTER`, `WAIT` or `SKIP` with a plain-language
+  answer to "is it good to enter now?". The table opens on All, so divergences
+  that already played out stay listed (dimmed) under their 4H / 1H tags.
   `ENTER` means the second pivot is within 12 bars, price has not run more
   than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since
   the pivot, and no market-mover print is due inside 24 hours. It is a

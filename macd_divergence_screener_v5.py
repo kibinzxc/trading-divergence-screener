@@ -726,6 +726,58 @@ def setup_score(sig, weekly_vol):
     return int(max(0, min(100, s)))
 
 
+# ── Entry verdict ──────────────────────────────────────────────────────────────
+EVENT_WAIT_H = 24     # a curated macro print inside this many hours means wait
+
+
+def entry_verdict(sig, hours_to_event=None, event_title=""):
+    """Is this setup enterable as of the scan? A CHECKLIST, not a prediction.
+
+    First matching rule wins, dead setups before waiting ones:
+      skip   stop hit · already ran 1R+ · second pivot outside the fresh window
+      wait   price ran >MOVED_PCT from the signal · MACD has not crossed since
+             the pivot · a market-mover print is inside EVENT_WAIT_H
+      enter  none of the above
+
+    `level` is a price the dashboard prints after the reason, so it is
+    formatted in one place (sub-cent prices need plain digits).
+    """
+    def out(verdict, reason, level=None):
+        return {"verdict": verdict, "reason": reason, "level": level}
+
+    st = sig["status"]
+    if st == "invalidated":
+        return out("skip", "Stop was hit")
+    if st == "ran":
+        return out("skip", f"Already ran {sig['r_reached']:g}R")
+    if not sig["fresh"]:
+        return out("skip", f"Too old ({sig['bars_ago']} bars)")
+    if st == "extended":
+        return out("wait", f"Moved {sig['pct_chg']:g}% from signal, wait for a pullback to",
+                   sig["signal_price"])
+    if not sig["macd_cross"]:
+        return out("wait", "Momentum has not turned, wait for the MACD cross")
+    if hours_to_event is not None and hours_to_event <= EVENT_WAIT_H:
+        return out("wait", f"{event_title} in {hours_to_event:.0f}h")
+    return out("enter", f"Near signal, MACD crossed, risk {sig['risk_pct']}%, stop",
+               sig["stop_price"])
+
+
+def next_mover(events, now):
+    """(hours until the next curated market mover, its title), or (None, "")."""
+    best = (None, "")
+    for e in events:
+        if not e.get("mover"):
+            continue
+        ts = _cal_parse_ts("iso", e.get("ts"))
+        if ts is None or ts <= now:
+            continue
+        h = (ts - now).total_seconds() / 3600.0
+        if best[0] is None or h < best[0]:
+            best = (h, e.get("title", ""))
+    return best
+
+
 # ── Exchange helpers ───────────────────────────────────────────────────────────
 def make_exchange(exid, rate_limit=True):
     """Build a ccxt exchange from an allowlisted id — never getattr on raw user

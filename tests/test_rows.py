@@ -127,9 +127,10 @@ class FlowContext(unittest.TestCase):
         f = m.flow_context(oi_hist(self.RISING), daily(self.UP), 11.5, None, 70.0)
         self.assertEqual(f["flags"], ["HIGH OI/VOL"])      # OI 130 vs $10/day volume
 
-    def test_quiet_oi_gives_no_context(self):
+    def test_quiet_oi_keeps_the_number_but_no_tags(self):
         flat = [100, 100, 101, 100, 101, 100, 101, 102]
-        self.assertIsNone(m.flow_context(oi_hist(flat), daily(self.UP), 11.5, 0.0, 7e9))
+        self.assertEqual(m.flow_context(oi_hist(flat), daily(self.UP), 11.5, 0.0, 7e9),
+                         {"quadrant": None, "flags": [], "oi_chg_pct": 2.0})
 
     def test_short_history_gives_no_context(self):
         self.assertIsNone(m.flow_context(oi_hist([100, 130]), daily(self.UP), 11.5, 0.0, 7e9))

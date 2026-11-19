@@ -1032,8 +1032,8 @@ def flow_context(hist, df, live_price, fund_day, wk_vol):
     """OI-flow read for one pair from its daily OI history and daily candles.
 
     None means "nothing to say": too little history (a fresh listing's OI
-    always ramps from zero), no baseline point near the lookback, or OI that
-    moved less than OI_MIN_CHANGE_PCT.
+    always ramps from zero) or no baseline point near the lookback. OI that
+    moved less than OI_MIN_CHANGE_PCT comes back with the change but no tags.
     """
     hist = sorted((p for p in (hist or []) if p.get("timestamp")),
                   key=lambda p: p["timestamp"])
@@ -1059,8 +1059,8 @@ def flow_context(hist, df, live_price, fund_day, wk_vol):
         return None
 
     oi_chg = (oi_now - oi_then) / oi_then * 100.0
-    if abs(oi_chg) < OI_MIN_CHANGE_PCT:
-        return None
+    if abs(oi_chg) < OI_MIN_CHANGE_PCT:    # quiet: a number for the 7d OI column, no tags
+        return {"quadrant": None, "flags": [], "oi_chg_pct": round(oi_chg, 1)}
     span = min(OI_LOOKBACK_D + 1, len(df))
     price_chg = (float(df["close"].iloc[-1]) / float(df["close"].iloc[-span]) - 1) * 100.0
 
@@ -2893,6 +2893,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     <button class="nav-btn active" data-pg="scan">Scan</button>
     <button class="nav-btn" data-pg="movers">Movers</button>
     <button class="nav-btn" data-pg="calendar">Calendar</button>
+    <button class="nav-btn" data-pg="tags">Tags</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
   <div class="t-right">
@@ -2985,7 +2986,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
           <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
           <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
           <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
-          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 5 score points and LTF TRIGGER is what allows Yes (early). Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition.">Tags</th>
+          <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. Click to sort, biggest build-up first.">7d OI</th>
+          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 5 score points and LTF TRIGGER is what allows Yes (early). Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -3065,6 +3067,17 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <div class="no-sig" id="calEmpty">Nothing scheduled.</div>
     </div>
   </div>
+</div>
+
+<div id="pg-tags" class="page" style="overflow-y:auto;padding:24px">
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">What every tag means</div>
+    <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
+      Each tag as it appears in the table, with the same wording as its hover text. Only the pattern
+      tags TRIPLE and LTF TRIGGER feed the answer; every other tag is context for you to weigh.
+    </div>
+  </div>
+  <div id="tagsBody"></div>
 </div>
 
 <div id="pg-learn" class="page" style="overflow-y:auto;padding:24px">
@@ -3270,7 +3283,7 @@ function ctxCell(r){
   ((r.mover || {}).flags || []).forEach(function(f){
     h.push('<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
   });
-  if(r.flow){
+  if(r.flow && r.flow.quadrant){
     h.push('<span class="' + (WQ[r.flow.quadrant] || {cls:'wq'}).cls + '"' + tip(r.flow.quadrant) + '>' + r.flow.quadrant + '</span>');
     (r.flow.flags || []).forEach(function(f){
       h.push('<span class="wflag ' + (WFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
@@ -3342,7 +3355,10 @@ var TIP = {
   'TRIPLE':          'The trough before A also diverges from A: three troughs in a row, price lower each time, MACD higher each time.',
   'W-PATTERN':       'The bump between A and B is at least half the MACD range of the leg: a clear W (M for bearish).',
   'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
-  'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.'
+  'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.',
+  'WITH TREND':      'BTC 4H RSI is on the signal\'s side of 50 and the coin is on the right side of its own 200 EMA. Grade B is enough for Yes.',
+  'COUNTER TREND':   'BTC or the coin\'s 200 EMA disagrees with the signal. Needs grade A for Yes; otherwise watch only.',
+  '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags above are exactly that combination. n/a = too little OI history.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 
@@ -3350,6 +3366,32 @@ function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-move',
              'AT RANGE HIGH':'mf-hi','ABOVE 7D HIGH':'mf-hi',
              'AT RANGE LOW':'mf-lo','BELOW 7D LOW':'mf-lo'};
+
+/* ── Tags page: built from TIP so it cannot drift from the hover text ─────── */
+var TAG_GROUPS = [
+  ['Pattern tags (about the divergence itself)', ['TRIPLE','W-PATTERN','LTF TRIGGER','ZERO-LINE CROSS']],
+  ['Regime (sets how high the grade must be)', ['WITH TREND','COUNTER TREND']],
+  ['Open interest: 7-day positioning', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
+  ['Open interest: funding and crowding', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
+  ['Daily movers (the last completed day)', ['VOLUME SPIKE','RANGE EXPANSION','BIG MOVE','AT RANGE HIGH','ABOVE 7D HIGH','AT RANGE LOW','BELOW 7D LOW']]
+];
+function tagChip(k){
+  var cls = WQ[k] ? WQ[k].cls : 'wflag ' + (MFLAG[k] || WFLAG[k] || 'wf-hioi');
+  return '<span class="' + cls + '">' + k + '</span>';
+}
+document.getElementById('tagsBody').innerHTML = TAG_GROUPS.map(function(g){
+  return '<div class="dash-sec" style="margin-top:28px"><div class="dash-sec-ttl">' + g[0] + '</div><div class="rules">' +
+    g[1].map(function(k){
+      return '<div class="rule"><div style="flex-shrink:0;width:150px">' + tagChip(k) + '</div><div class="rule-b">' + TIP[k] + '</div></div>';
+    }).join('') + '</div></div>';
+}).join('');
+function oiVal(r){ return r.flow && r.flow.oi_chg_pct != null ? r.flow.oi_chg_pct : null; }
+function oiCell(r){
+  var v = oiVal(r);
+  if(v == null) return '<span class="ptm">n/a</span>';
+  return '<span style="font-family:var(--mono);font-size:11px;color:' +
+    (v >= 5 ? 'var(--bull)' : v <= -5 ? 'var(--bear)' : 'var(--tx3)') + '">' + (v > 0 ? '+' : '') + v + '%</span>';
+}
 
 function fmtPct(v){
   if(v === null || v === undefined) return '&mdash;';
@@ -3693,7 +3735,7 @@ function detailRow(r){
       '<img class="chart" loading="lazy" alt="Chart needs a fresh scan" src="/chart?pair=' +
       encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '">';
   }).join('');
-  tr.innerHTML = '<td colspan="10"><div>Weekly volume ' + fmtVol(r.weekly_volume) + ' (7 days)</div>' + h + '</td>';
+  tr.innerHTML = '<td colspan="11"><div>Weekly volume ' + fmtVol(r.weekly_volume) + ' (7 days)</div>' + h + '</td>';
   return tr;
 }
 function buildRow(r){
@@ -3712,6 +3754,7 @@ function buildRow(r){
     '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(p.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + p.risk_pct + '%</div></td>' +
     '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>' +
     '<td><div class="ptm">A ' + p.pivot1_time + '</div><div class="ptm">B ' + p.pivot2_time + '</div></td>' +
+    '<td>' + oiCell(r) + '</td>' +
     '<td>' + ctxCell(r) + '</td>';
   tr.addEventListener('click', function(){
     var n = tr.nextSibling;
@@ -3726,6 +3769,7 @@ function renderAll(results){
   var rows = (results || []).filter(function(d){ return matches(d, af); });
   rows.sort(function(a, b){
     if(sortKey === 'age') return ageMin(a) - ageMin(b);
+    if(sortKey === 'oi'){ var x = oiVal(a), y = oiVal(b); return (y == null ? -1e9 : y) - (x == null ? -1e9 : x); }
     return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
            (verdict(a) === 'skip' ? ageMin(a) - ageMin(b) : 0) ||   /* played-out rows: newest first */
            (b.score - a.score);

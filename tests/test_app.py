@@ -104,11 +104,21 @@ class Page(unittest.TestCase):
     def setUp(self):
         self.html = m.app.test_client().get("/").get_data(as_text=True)
 
-    def test_four_pages(self):
+    def test_five_pages(self):
         self.assertEqual(re.findall(r'class="nav-btn[^"]*" data-pg="(\w+)"', self.html),
-                         ["scan", "movers", "calendar", "learn"])
+                         ["scan", "movers", "calendar", "tags", "learn"])
         self.assertEqual(sorted(re.findall(r'<div id="pg-(\w+)"', self.html)),
-                         ["calendar", "learn", "movers", "scan"])
+                         ["calendar", "learn", "movers", "scan", "tags"])
+
+    def test_oi_column_and_tags_page(self):
+        for want in ('data-sort="oi"', "function oiCell", 'id="tagsBody"', 'colspan="11"'):
+            self.assertIn(want, self.html, want)
+        # every tag the Tags page lists has a definition
+        groups = re.search(r"var TAG_GROUPS = \[(.*?)\n\];", self.html, re.S).group(1)
+        tip = re.search(r"var TIP = \{(.*?)\n\};", self.html, re.S).group(1)
+        for line in groups.splitlines():
+            for k in re.findall(r"'([^']+)'", line.split(", [", 1)[-1]):
+                self.assertIn("'" + k + "':", tip, k)
 
     def test_no_unfilled_template_placeholders(self):
         self.assertEqual(re.findall(r"__[A-Z][A-Z_]+__", self.html), [])

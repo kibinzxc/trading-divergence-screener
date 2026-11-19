@@ -24,6 +24,16 @@ class ClassifyMover(unittest.TestCase):
         flags = m.classify_mover(self.row(vol_mult=3.0, range_mult=2.0, to_r_hi_pct=1.0))[1]
         self.assertEqual(flags, ["VOLUME SPIKE", "RANGE EXPANSION", "AT RANGE HIGH"])
 
+    def test_thin_coin_needs_volume_and_range_together(self):
+        self.assertFalse(m.classify_mover(self.row(vol_mult=3.0, range_mult=1.0), thin=True)[0])
+        self.assertTrue(m.classify_mover(self.row(vol_mult=3.0, range_mult=2.0), thin=True)[0])
+
+
+class MoverSignals(unittest.TestCase):
+    def test_returns_the_cached_movers_scan(self):
+        d = m.app.test_client().get("/mover_signals").get_json()
+        self.assertEqual(sorted(d), ["meta", "rows", "ts"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,22 +23,30 @@ serves both the API and a browser dashboard.
   peak). Two neighbouring troughs A and B, 8 to 80 bars apart with a real
   bump between them, are compared with the lowest wicks inside those same
   waves: price lower, MACD trough higher is a regular bullish divergence
-  (bearish is the mirror). A cross that never opens a gap and a wave shorter
+  (bearish is the mirror). A cross that never opens a gap (5% of the 50-bar
+  MACD range and 0.05 ATR, within 3 bars) and a wave shorter
   than 3 bars are merged away, so a double dot cannot split a trough. A
   divergence is reported only once the cross that ends wave B has closed;
   that bar is the signal bar. The still-forming candle is dropped, with one
   labelled exception (see *Good to enter?*).
 - **Strictness presets**: `balanced` (default) and `strict`. Strict needs a
   larger divergence and both troughs below the zero line (peaks above it).
-- **Quality score and grade**: 0-100, graded A (70+), B (55-69) or C. Points
-  for the size of the price and MACD differences, the height of the bump,
-  the zero-line side, the higher timeframe's MACD agreeing (1D for a 4H
-  signal, 4H for a 1H signal), volume drying up in wave B, a rejection wick
-  at B, open interest falling into B, and a triple divergence. It describes
-  the setup; the backtest below is what measures it.
-- **Regime tag**: `WITH TREND` when BTC 4H RSI is on the signal's side of 50
-  and the coin is on the right side of its 200 EMA, else `COUNTER TREND`. It
-  never hides a row; a counter-trend setup needs grade A to answer Yes.
+- **Quality score and grade**: 0-100, graded A (70+), B (55-69) or C.
+  Pattern points (up to 70) for the size of the price and MACD differences,
+  the height of the bump, the zero-line side, volume drying up in wave B, a
+  rejection wick at B and a triple divergence. Context points (10 each) for
+  the higher timeframe's MACD agreeing (1D for a 4H signal, 4H for a 1H
+  signal), open interest falling into B with funding against the crowd, and
+  the BTC 4H state on the signal's side; OI rising more than 5% against the
+  signal costs 10. Context the data cannot check is left out and the score
+  rescaled to 100 (tag `PARTIAL DATA`). It describes the setup; the backtest
+  below is what measures it.
+- **Regime tag**: BTC 4H is BULL (RSI > 55 and close above its 200 EMA),
+  BEAR (RSI < 45 and close below it) or CHOP. `WITH TREND` when the BTC state
+  and the coin's own 200 EMA both agree with the side, `CHOP` when BTC is
+  CHOP, else `COUNTER TREND` (also when BTC data is missing). It never hides
+  a row; a counter-trend setup needs grade A to answer Yes, a CHOP reversal
+  keeps the normal cutoff.
 - **Transparent scan accounting**: every run reports pairs dispatched,
   analysed, rejected on volume, errored, or missing volume data, and whether
   the scan actually completed — so a quiet-looking result can't be mistaken
@@ -130,7 +138,9 @@ the stop and the average R of exiting there. Use it to check whether grade A
 actually beats grade B before trusting the cutoffs.
 
 Limits: open interest and the lower-timeframe trigger are not replayed (no
-bar-by-bar history), so a backtest score can differ from the live one by up to 10 points either way; when one bar touches both the stop and a target, the stop is counted.
+bar-by-bar history); the OI component is left out of the backtest score and
+the rest rescaled, as the live scan does when OI is missing. When one bar
+touches both the stop and a target, the stop is counted.
 
 ## API
 

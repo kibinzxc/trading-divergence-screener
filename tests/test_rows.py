@@ -58,6 +58,9 @@ class EntryVerdict(unittest.TestCase):
         self.assertIn("Watch only", v["reason"])
         self.assertEqual(self.verdict(sig(regime="COUNTER TREND", grade="A")), "enter")
 
+    def test_chop_keeps_the_normal_cutoff_for_a_reversal(self):
+        self.assertEqual(self.verdict(sig(regime="CHOP", grade="B")), "enter")
+
     def test_extended_waits_for_a_pullback_to_the_signal_price(self):
         v = m.entry_verdict(sig(status="extended", pct_chg=3.1))
         self.assertEqual((v["verdict"], v["level"]), ("wait", 100.0))

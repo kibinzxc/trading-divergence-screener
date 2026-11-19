@@ -44,7 +44,8 @@ class Replay(unittest.TestCase):
         self.assertEqual((t[0]["side"], t[0]["tf"], t[0]["time"]),
                          ("bullish", "1h", str(wave_df(REPLAY).index[126])))
         self.assertEqual((t[0]["hit"], t[0]["stopped"], t[0]["bars"]), (0, False, None))
-        self.assertEqual((t[0]["score"], t[0]["grade"], t[0]["regime"]), (53, "C", "COUNTER TREND"))
+        # no HTF, OI or BTC here: the pattern points alone, rescaled (46.5 / 70)
+        self.assertEqual((t[0]["score"], t[0]["grade"], t[0]["regime"]), (66, "B", "COUNTER TREND"))
 
     def test_outcome_follows_the_bars_after_entry(self):
         win = m.backtest_pair(frame(high=130.0), "1h", RULES)[0]
@@ -67,10 +68,10 @@ class SameMomentAsLive(unittest.TestCase):
         hi = pd.date_range("2026-01-04 18:00", periods=20, freq="4h")
         htf = pd.DataFrame({"macd": [float(i) if t < pd.Timestamp("2026-01-06 02:00") else -100.0
                                      for i, t in enumerate(hi)]}, index=hi)
-        # BTC 4H RSI is read 4h before the close: 01:00 vs 03:00. Above 50 only up to 01:00.
+        # BTC 4H is read 4h before the close: 01:00 vs 03:00. BULL up to 01:00, CHOP after.
         bi = pd.date_range("2026-01-05", periods=72, freq="h")
         btc = pd.DataFrame({"rsi": [60.0 if t <= pd.Timestamp("2026-01-06 01:00") else 40.0
-                                    for t in bi]}, index=bi)
+                                    for t in bi], "close": 110.0, "ema200": 100.0}, index=bi)
         sig = m.signals_for_tf(df, "1h", RULES, 100.5, "X/USDT:USDT", 9e7)[0]
         m.add_context(sig, htf, None, None, None, btc)
         t = m.backtest_pair(df, "1h", RULES, htf, btc)[0]

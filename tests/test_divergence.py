@@ -58,8 +58,9 @@ class SignalsForTf(unittest.TestCase):
                          (7, True, False, "active"))
         self.assertEqual((s["signal_price"], s["stop_price"], s["pivot2_price"]),
                          (100.5, 91.8184, 92.0684))     # stop = low B - 0.25 ATR
-        self.assertEqual((s["score"], s["grade"], s["regime"], s["tags"]),
-                         (53, "C", "COUNTER TREND", ["W-PATTERN"]))
+        # no context yet: scored on the 70 pattern points alone (46.5 / 70)
+        self.assertEqual((s["score"], s["grade"], s["regime"], s["partial"], s["tags"]),
+                         (66, "B", "COUNTER TREND", True, ["W-PATTERN", "PARTIAL DATA"]))
         self.assertEqual((s["targets_from"], s["targets"]["structure"]), ("signal", 101.0))
         for k in ("targets", "risk_pct", "current_price", "signal_time", "pivot1_time"):
             self.assertIn(k, s)
@@ -86,34 +87,61 @@ BARE = dict(FULL, zero_ok=False, vol_dry=False, wick=False, triple=False)
 
 class Score(unittest.TestCase):
     def test_everything_true_is_100(self):
-        self.assertEqual(m.score_signal(FULL, True, -3.0, 0.0), (100, "A"))
+        self.assertEqual(m.score_signal(FULL, True, -3.0, 0.0, "BULL"), (100, "A", False))
 
-    def test_structure_alone_tops_out_at_40(self):
-        self.assertEqual(m.score_signal(BARE), (40, "C"))
+    def test_pattern_size_points_top_out_at_32_of_70(self):
+        self.assertEqual(m.score_signal(BARE, False, 1.0, 0.0, "CHOP"), (32, "C", False))
+
+    def test_unavailable_context_is_removed_and_the_rest_rescaled(self):
+        self.assertEqual(m.score_signal(BARE), (46, "C", True))                         # 32 / 70
+        self.assertEqual(m.score_signal(BARE, True, -3.0, 0.0), (58, "B", True))        # 52 / 90
+        self.assertEqual(m.score_signal(BARE, True, -3.0, 0.0, "BEAR"), (52, "C", False))  # 52 / 100
+        self.assertEqual(m.score_signal(FULL, None, None, None, "BULL"), (100, "A", True))
+
+    def test_btc_points_need_the_btc_state_on_the_signal_side(self):
+        self.assertEqual(m.score_signal(FULL, True, -3.0, 0.0, "CHOP")[0], 90)
+        self.assertEqual(m.score_signal(FULL, True, -3.0, 0.0, "BEAR")[0], 90)
+        self.assertEqual(m.score_signal(dict(FULL, side="bearish"), True, -3.0, 0.0, "BEAR")[0], 100)
 
     def test_oi_rising_against_the_signal_costs_10(self):
-        self.assertEqual(m.score_signal(FULL, True, 9.0, 0.02)[0], 80)      # 90 without OI
-        self.assertEqual(m.score_signal(dict(FULL, side="bearish"), True, 9.0, -0.02)[0], 80)
-        self.assertEqual(m.score_signal(FULL, True, 3.0, 0.02)[0], 90)      # under 5%: no penalty
+        self.assertEqual(m.score_signal(FULL, True, 9.0, 0.02, "BULL")[0], 80)      # 90 without OI
+        self.assertEqual(m.score_signal(dict(FULL, side="bearish"), True, 9.0, -0.02, "BEAR")[0], 80)
+        self.assertEqual(m.score_signal(FULL, True, 3.0, 0.02, "BULL")[0], 90)      # under 5%: no penalty
+        flat = dict(BARE, price_atr=0.0, macd_frac=0.0, bump_frac=0.25)
+        self.assertEqual(m.score_signal(flat, False, 9.0, 0.02, "CHOP")[0], 0)      # clipped at 0
 
     def test_bearish_oi_bonus_needs_funding_at_or_above_zero(self):
         bear = dict(FULL, side="bearish")
-        self.assertEqual(m.score_signal(bear, True, -3.0, 0.01)[0], 100)
-        self.assertEqual(m.score_signal(bear, True, -3.0, -0.01)[0], 90)
+        self.assertEqual(m.score_signal(bear, True, -3.0, 0.01, "BEAR")[0], 100)
+        self.assertEqual(m.score_signal(bear, True, -3.0, -0.01, "BEAR")[0], 90)
 
     def test_grade_cutoffs(self):
-        self.assertEqual(m.score_signal(dict(BARE, zero_ok=True, wick=True), True)[1], "A")   # 75
-        self.assertEqual(m.score_signal(BARE, True)[1], "B")                                  # 55
-        self.assertEqual(m.score_signal(dict(BARE, zero_ok=True))[1], "C")                    # 50
+        self.assertEqual(m.score_signal(dict(BARE, zero_ok=True, wick=True), True, 1.0, 0.0, "BULL")[1], "A")  # 72
+        self.assertEqual(m.score_signal(dict(BARE, zero_ok=True), True, -3.0, 0.0, "CHOP")[1], "B")          # 62
+        self.assertEqual(m.score_signal(BARE, True, -3.0, 0.0, "CHOP")[1], "C")                              # 52
 
 
 class Regime(unittest.TestCase):
+    def test_btc_state_needs_rsi_and_the_200_ema_to_agree(self):
+        self.assertEqual(m.btc_state(60.0, 110.0, 100.0), "BULL")
+        self.assertEqual(m.btc_state(40.0, 90.0, 100.0), "BEAR")
+        for args in ((60.0, 90.0, 100.0), (40.0, 110.0, 100.0), (55.0, 110.0, 100.0), (50.0, 90.0, 100.0)):
+            self.assertEqual(m.btc_state(*args), "CHOP", args)
+
+    def test_btc_state_is_none_when_any_input_is_missing(self):
+        self.assertIsNone(m.btc_state(None, 110.0, 100.0))
+        self.assertIsNone(m.btc_state(60.0, 110.0, float("nan")))
+
     def test_with_trend_needs_btc_and_the_coin_to_agree(self):
-        self.assertEqual(m.regime_tag("bullish", True, 60.0), "WITH TREND")
-        self.assertEqual(m.regime_tag("bullish", False, 60.0), "COUNTER TREND")
-        self.assertEqual(m.regime_tag("bullish", True, 40.0), "COUNTER TREND")
-        self.assertEqual(m.regime_tag("bearish", False, 40.0), "WITH TREND")
-        self.assertEqual(m.regime_tag("bearish", True, 40.0), "COUNTER TREND")
+        self.assertEqual(m.regime_tag("bullish", True, "BULL"), "WITH TREND")
+        self.assertEqual(m.regime_tag("bullish", False, "BULL"), "COUNTER TREND")
+        self.assertEqual(m.regime_tag("bullish", True, "BEAR"), "COUNTER TREND")
+        self.assertEqual(m.regime_tag("bearish", False, "BEAR"), "WITH TREND")
+        self.assertEqual(m.regime_tag("bearish", True, "BEAR"), "COUNTER TREND")
+
+    def test_btc_chop_is_chop(self):
+        self.assertEqual(m.regime_tag("bullish", True, "CHOP"), "CHOP")
+        self.assertEqual(m.regime_tag("bearish", True, "CHOP"), "CHOP")
 
     def test_unknown_btc_is_counter_trend(self):
         self.assertEqual(m.regime_tag("bullish", True, None), "COUNTER TREND")

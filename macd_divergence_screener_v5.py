@@ -9,7 +9,8 @@ split the MACD line into waves; each wave below the signal line is one trough
 price lows inside those same waves (detect_wave_divergence). A signal exists
 only once the cross that ends wave B has printed: that bar is the signal bar.
 Each signal gets a 0-100 quality score and an A/B/C grade (score_signal), a
-WITH TREND / COUNTER TREND tag from BTC 4H RSI and the coin's 200 EMA, and an
+WITH TREND / CHOP / COUNTER TREND tag from the BTC 4H state (RSI and 200 EMA,
+btc_state) and the coin's 200 EMA, and an
 optional early entry from the lower timeframe (ltf_trigger). `--backtest`
 replays the same detector bar by bar (backtest_pair) and reports win rate and
 R per grade and regime. Everything below about pivots, PIVOT_SYNC, the clean
@@ -132,6 +133,7 @@ MIN_WAVE    = 3        # bars; a shorter wave is merged into its neighbours
 WHIP_FRAC   = 0.05     # a cross counts once |MACD - signal| reaches this share...
 WHIP_RANGE  = 50       # ...of the MACD range over this many bars...
 WHIP_BARS   = 3        # ...within this many bars, the cross bar being the first
+WHIP_ATR    = 0.05     # ...and also reaches this many ATR (a tiny range is not a real gap)
 SPACING     = (8, 80)  # bars allowed between MACD trough A and MACD trough B
 BUMP_MIN    = 0.25     # height of the middle of the W, as a share of the leg's MACD range
 PRICE_TAIL  = 2        # a wave's price extreme may print up to 2 bars after the wave ends
@@ -290,7 +292,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # divergence scan's saved state, and vice versa.
 MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
-STATE_VERSION = 2     # scan_state.json written by an older row shape is ignored
+STATE_VERSION = 3    # scan_state.json written by an older row shape is ignored
 HTF_BARS_1D   = 200   # daily history, for the 4H signal's higher-timeframe check
 LTF_BARS_15M  = 300   # 15m history, for the 1H signal's early-entry trigger
 
@@ -358,7 +360,8 @@ def ema(s, p):
 
 
 def compute_indicators(df):
-    """MACD line / signal / histogram, ATR14 (Wilder) and EMA 200, on completed bars."""
+    """MACD line / signal / histogram, ATR14 (Wilder), MACD in ATR units and EMA 200,
+    on completed bars."""
     close = df["close"]
     ml = ema(close, MACD_FAST) - ema(close, MACD_SLOW)
     sl = ema(ml, MACD_SIG)
@@ -370,6 +373,8 @@ def compute_indicators(df):
     atr = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean()
 
     return pd.DataFrame({"macd": ml, "signal": sl, "hist": ml - sl, "atr": atr,
+                         # zero ATR (flat opening bars) gives 0, not NaN, so dropna keeps the row
+                         "macd_atr": (ml / atr.where(atr > 0)).fillna(0.0),
                          "ema200": ema(close, EMA_TREND)}, index=df.index)
 
 
@@ -407,11 +412,12 @@ def find_pivots(vals, lb, rb=None):
 
 
 # ── Wave divergence (spec v2) ─────────────────────────────────────────────────
-def macd_crosses(macd, signal):
+def macd_crosses(macd, signal, atr=None):
     """Confirmed MACD/signal crossovers as [(bar, +1 bullish | -1 bearish)].
 
     The list alternates direction, so consecutive entries bound one wave. A
-    cross that never opens a real gap (the whipsaw filter) is dropped, and a
+    cross that never opens a real gap (the whipsaw filter: WHIP_FRAC of the
+    MACD range AND, when `atr` is given and positive, WHIP_ATR x ATR) is dropped, and a
     wave shorter than MIN_WAVE bars is removed together with the two crosses
     around it. Either way the waves on both sides join into one, which is what
     stops a tiny double dot from splitting one trough into two.
@@ -427,7 +433,8 @@ def macd_crosses(macd, signal):
         s = 1 if d[i] > 0 else -1
         if out and out[-1][1] == s:
             continue                                   # already on that side
-        if (s * d[i:i + WHIP_BARS]).max() < WHIP_FRAC * rng[i]:
+        gap = (s * d[i:i + WHIP_BARS]).max()
+        if gap < WHIP_FRAC * rng[i] or (atr is not None and atr[i] > 0 and gap < WHIP_ATR * atr[i]):
             continue                                   # whipsaw
         if out and i - out[-1][0] < MIN_WAVE:
             out.pop()                                  # the wave it would close is too short
@@ -456,7 +463,7 @@ def detect_wave_divergence(df, side, preset):
     o, c, h, l = (df[k].values for k in ("open", "close", "high", "low"))
     vol, atr = df["volume"].values, df["atr"].values
     n = len(df)
-    crosses = macd_crosses(df["macd"].values, df["signal"].values)
+    crosses = macd_crosses(df["macd"].values, df["signal"].values, atr)
 
     waves = []                                         # closed waves on the trough side
     for (c0, d0), (c1, _) in zip(crosses, crosses[1:]):
@@ -649,54 +656,80 @@ def build_targets(sig):
 
 
 # ── Quality score, regime, tags ────────────────────────────────────────────────
-def score_signal(sig, htf_ok=False, oi_chg=None, fund=None):
-    """(0-100 score, grade). A description of the setup, not a win rate.
+def score_signal(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None):
+    """(0-100 score, grade, partial). A description of the setup, not a win rate.
 
-    oi_chg is the % change in open interest into B, fund the funding rate
-    (only its sign is used). Either one unknown: no OI points, no penalty.
+    Pattern points 0-70, context 10 each: higher timeframe agrees, OI falling
+    into B with funding against the crowd, BTC state on the signal's side.
+    OI rising more than OI_AGAINST_PCT into B with funding on the crowded side
+    costs 10. A context input that is None (htf_ok, oi_chg or fund, btc_state)
+    is unavailable: that component leaves the denominator and `partial` is True.
     """
-    s = min(sig["price_atr"], 1.0) * 15                                   # 0-15
-    s += min(sig["macd_frac"] / 0.5, 1.0) * 15                            # 0-15
-    s += float(np.clip((sig["bump_frac"] - BUMP_MIN) / 0.5, 0, 1)) * 10   # 0-10
-    s += 10 * sig["zero_ok"] + 15 * bool(htf_ok) + 10 * sig["vol_dry"] + 10 * sig["wick"]
-    s += 5 * sig["triple"]
+    bull = sig["side"] == "bullish"
+    s = min(sig["price_atr"], 1.0) * 12                                   # 0-12
+    s += min(sig["macd_frac"] / 0.5, 1.0) * 12                            # 0-12
+    s += float(np.clip((sig["bump_frac"] - BUMP_MIN) / 0.5, 0, 1)) * 8    # 0-8
+    s += 10 * sig["zero_ok"] + 10 * sig["vol_dry"] + 10 * sig["wick"] + 8 * sig["triple"]
+    avail = 70
+    if htf_ok is not None:
+        avail += 10
+        s += 10 * bool(htf_ok)
     if oi_chg is not None and fund is not None:
-        f = fund if sig["side"] == "bullish" else -fund
+        avail += 10
+        f = fund if bull else -fund
         if oi_chg < 0 and f <= 0:
             s += 10
         elif oi_chg > OI_AGAINST_PCT and f > 0:
             s -= 10
-    score = int(max(0, min(100, round(s))))
-    return score, ("A" if score >= GRADE_A else "B" if score >= GRADE_B else "C")
+    if btc_state is not None:
+        avail += 10
+        s += 10 * (btc_state == ("BULL" if bull else "BEAR"))
+    score = int(max(0, min(100, round(s / avail * 100))))
+    return score, ("A" if score >= GRADE_A else "B" if score >= GRADE_B else "C"), avail < 100
 
 
-def regime_tag(side, above_ema200, btc_rsi):
-    """WITH TREND when BTC 4H RSI and the coin's 200 EMA both agree with the side."""
-    if btc_rsi is None:
-        return "COUNTER TREND"
-    ok = (btc_rsi > 50 and above_ema200) if side == "bullish" \
-        else (btc_rsi < 50 and not above_ema200)
+def btc_state(rsi, close, ema200):
+    """BTC 4H: BULL (RSI > 55 and close above the 200 EMA), BEAR (RSI < 45 and
+    close below it), else CHOP. None when any input is missing."""
+    if any(pd.isna(v) for v in (rsi, close, ema200)):
+        return None
+    if rsi > 55 and close > ema200:
+        return "BULL"
+    if rsi < 45 and close < ema200:
+        return "BEAR"
+    return "CHOP"
+
+
+def regime_tag(side, above_ema200, state):
+    """CHOP when BTC is CHOP; WITH TREND when the BTC state and the coin's 200 EMA
+    both agree with the side; else (BTC unknown included) COUNTER TREND."""
+    if state == "CHOP":
+        return "CHOP"
+    bull = side == "bullish"
+    ok = state == ("BULL" if bull else "BEAR") and above_ema200 == bull
     return "WITH TREND" if ok else "COUNTER TREND"
 
 
-def finish_signal(sig, htf_ok=False, oi_chg=None, fund=None, btc_rsi=None, trigger=None):
+def finish_signal(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None, trigger=None):
     """Score, grade, regime, trigger, tags and targets.
 
     Called once without context so a signal is always complete, and again by
     add_context() once the scan has fetched the outside data. `trigger` is
     (price, close time in ms of the trigger bar) or None.
     """
-    sig["score"], sig["grade"] = score_signal(sig, htf_ok, oi_chg, fund)
-    sig["htf_ok"] = bool(htf_ok)
+    sig["score"], sig["grade"], sig["partial"] = score_signal(sig, htf_ok, oi_chg, fund, btc_state)
+    sig["htf_ok"] = htf_ok
     sig["oi_chg_pct"] = None if oi_chg is None else round(oi_chg, 1)
-    sig["regime"] = regime_tag(sig["side"], sig["above_ema200"], btc_rsi)
+    sig["btc_state"] = btc_state
+    sig["regime"] = regime_tag(sig["side"], sig["above_ema200"], btc_state)
     sig["trigger_price"] = px(trigger[0]) if trigger else None
     # "first" = the trigger bar closed before the signal bar did
     sig["trigger_first"] = bool(trigger and (sig["forming"] or trigger[1] < sig["signal_close_ms"]))
     sig["tags"] = [t for t, on in (("TRIPLE", sig["triple"]),
                                    ("W-PATTERN", sig["bump_frac"] >= 0.5),
                                    ("LTF TRIGGER", bool(trigger)),
-                                   ("ZERO-LINE CROSS", sig["zero_cross"])) if on]
+                                   ("ZERO-LINE CROSS", sig["zero_cross"]),
+                                   ("PARTIAL DATA", sig["partial"])) if on]
     sig.update(build_targets(sig))
     return sig
 
@@ -711,12 +744,13 @@ def asof(series, ts):
 def htf_agrees(htf, close_ts, htf_minutes, side):
     """Was the higher-timeframe MACD line rising (falling for bearish) on its
     last bar completed by close_ts? Frames are indexed by bar OPEN time, so a
-    bar is complete once open + htf_minutes <= close_ts."""
+    bar is complete once open + htf_minutes <= close_ts. None (unavailable)
+    without a frame or with fewer than 2 completed bars."""
     if htf is None:
-        return False
+        return None
     m = htf["macd"].loc[:close_ts - pd.Timedelta(minutes=htf_minutes)]
     if len(m) < 2:
-        return False
+        return None
     return bool(m.iloc[-1] > m.iloc[-2]) if side == "bullish" else bool(m.iloc[-1] < m.iloc[-2])
 
 
@@ -758,19 +792,27 @@ def oi_change_pct(hist, t0_ms, t1_ms):
     return None
 
 
+def btc_state_at(btc, close_ts):
+    """BTC state on the last 4H bar completed by close_ts (bars indexed by open
+    time), from the fetch_btc() frame. None when there is no frame."""
+    if btc is None:
+        return None
+    t = close_ts - pd.Timedelta(minutes=240)
+    return btc_state(*(asof(btc[k], t) for k in ("rsi", "close", "ema200")))
+
+
 def add_context(sig, htf, ltf, oi_hist, fund, btc):
     """Re-grade a signal with everything fetched for it. Any argument may be
-    None; that component then scores nothing."""
+    None; that component is then unavailable and leaves the score's denominator."""
     cfg = TF_CFG[sig["tf"]]
     close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
     trig = None
     if ltf is not None and sig["fresh"]:
         trig = ltf_trigger(ltf, sig["side"], pd.Timestamp(sig["b_ms"], unit="ms"),
                            pd.Timestamp(sig["signal_ms"], unit="ms"), cfg["ltf_minutes"])
-    btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) if btc is not None else None
     return finish_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], sig["side"]),
                          oi_change_pct(oi_hist, sig["b_start_ms"], sig["b_ms"]),
-                         fund, btc_rsi, trig)
+                         fund, btc_state_at(btc, close_ts), trig)
 
 
 def grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, fund, btc):
@@ -1712,13 +1754,15 @@ def usdt_perps(mkts):
             and s.split("/")[0] not in STABLE_BASES and not is_tradfi(mkts[s])]
 
 
-def fetch_btc_rsi(ex, limiter):
-    """BTC 4H RSI 14 on completed bars, for the regime tag. None when unavailable."""
+def fetch_btc(ex, limiter):
+    """BTC 4H RSI 14, close and 200 EMA on completed bars, for the BTC state.
+    None when unavailable."""
     df = drop_forming_candle(
         fetch_df_deep(ex, limiter, "BTC/USDT:USDT", "4h", TF_CFG["4h"]["bars"]), 240)
     if df is None or len(df) < 80:
         return None
-    return pd.DataFrame({"rsi": rsi(df["close"])}).dropna()
+    return pd.DataFrame({"rsi": rsi(df["close"]), "close": df["close"],
+                         "ema200": ema(df["close"], EMA_TREND)}).dropna()
 
 
 def pair_context(ex, limiter, sym, live_price, fund_day, wk_vol):
@@ -1914,9 +1958,8 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
     """Replay one pair bar by bar. Bar i sees df.iloc[:i + 1] and nothing else.
 
     A signal is taken the first time the detector reports it, at that bar's
-    close. Not replayed: open interest (no bar-by-bar history) and the
-    lower-timeframe trigger, so a score here can differ from the live one by up
-    to 10 points either way.
+    close. Not replayed: open interest (no bar-by-bar history), so that
+    component leaves the score's denominator, and the lower-timeframe trigger.
     """
     cfg, seen, trades = TF_CFG[tf], set(), []
     close = df["close"].values
@@ -1935,13 +1978,13 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
                     continue                       # already through the stop when first seen
                 # Graded as of the signal bar's close, exactly like add_context.
                 close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
-                btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) \
-                    if btc is not None else None
-                score, grade = score_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], side))
+                state = btc_state_at(btc, close_ts)
+                score, grade, _ = score_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], side),
+                                               btc_state=state)
                 trades.append(dict(
                     trade_outcome(df, i, side, entry, stop), tf=tf, side=side,
                     score=score, grade=grade, time=str(view.index[-1]),
-                    regime=regime_tag(side, sig["above_ema200"], btc_rsi)))
+                    regime=regime_tag(side, sig["above_ema200"], state)))
     return trades
 
 
@@ -1982,7 +2025,7 @@ def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
         df = drop_forming_candle(fetch_df_deep(ex, limiter, sym, tf, bars), minutes)
         return with_indicators(df) if df is not None and len(df) >= 80 else None
 
-    btc = fetch_btc_rsi(ex, limiter)
+    btc = fetch_btc(ex, limiter)
     trades = []
     for n, sym in enumerate(pairs, 1):
         d4 = load(sym, "4h", TF_CFG["4h"]["bars"], 240)
@@ -2005,8 +2048,8 @@ def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
     print("\nwin@NR = share of resolved trades that reached N x risk before the stop; "
           "avgR@NR = average result of exiting there.\n"
           "Entry is the close of the bar the signal first appears on. Open interest and the "
-          "lower-timeframe trigger are not replayed,\nso a score here can differ from the "
-          "live scan's by up to 10 points either way.")
+          "lower-timeframe trigger are not replayed;\nthe OI component is left out of the "
+          "score and the rest rescaled, as the live scan does when OI is missing.")
 
 
 # ── State persistence ──────────────────────────────────────────────────────────
@@ -2230,9 +2273,10 @@ def scan_route():
 
         spd = SPEED[speed]
         limiter = RateLimiter(spd["rps"].get(exid, 8))
-        btc = fetch_btc_rsi(main_ex, limiter)
+        btc = fetch_btc(main_ex, limiter)
         if btc is None:
-            yield sse("log", {"msg": "BTC 4H candles unavailable: every setup is tagged COUNTER TREND"})
+            yield sse("log", {"msg": "BTC 4H candles unavailable: every setup is tagged COUNTER TREND "
+                                     "and scored without the BTC component (PARTIAL DATA)"})
         _charts.clear()
         workers = spd["workers"]
         yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on 4H + 1H · "
@@ -2980,14 +3024,14 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
           <th>Pair</th>
           <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a market-mover print inside 24 hours, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
           <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
-          <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
-          <th title="WITH TREND: BTC 4H RSI and this coin's 200 EMA both agree with the side. COUNTER TREND setups need grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
+          <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
+          <th title="WITH TREND: the BTC 4H state (BULL or BEAR) and this coin's 200 EMA both agree with the side. CHOP: BTC is neither BULL nor BEAR; a reversal keeps the normal cutoff. COUNTER TREND (also when BTC data is missing) needs grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
           <th class="sortable" data-sort="age" title="The signal bar is the MACD cross that ends the second wave. Shown: its closing price, and the bar's time as a chart labels it (the bar's open).">Signal</th>
           <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
           <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
           <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
           <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. Click to sort, biggest build-up first.">7d OI</th>
-          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 5 score points and LTF TRIGGER is what allows Yes (early). Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
+          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 8 score points and LTF TRIGGER is what allows Yes (early). PARTIAL DATA means some score context could not be checked. Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -3157,7 +3201,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the signal bar is older than 6 bars on 4H or 12 on 1H, or the grade is C.</div></div>
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a CPI / FOMC-class print inside 24 hours, or a signal bar that has not closed and has no lower-timeframe trigger.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> WITH TREND means BTC 4H RSI is on the signal's side of 50 and the coin is on the right side of its 200 EMA. Anything else is COUNTER TREND and needs grade A.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's levels and its chart.</div></div>
     </div>
@@ -3190,11 +3234,16 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     <div class="dash-sec-ttl">Quality score and grade</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
       0 to 100, graded <b style="color:var(--tx)">A</b> (70+), <b style="color:var(--tx)">B</b> (55-69) or
-      <b style="color:var(--tx)">C</b> (below 55). It adds up: the price difference A to B in ATR (15), the MACD
-      trough improvement (15), the height of the bump (10), both troughs on the classic side of zero (10), the
-      higher timeframe's MACD agreeing (15), volume drying up in wave B (10), a rejection wick at B (10), open
-      interest falling into B with funding not against it (10), a triple divergence (5). Open interest rising
-      more than 5% against the signal costs 10.
+      <b style="color:var(--tx)">C</b> (below 55). Pattern points, up to 70: the price difference A to B in ATR
+      (12), the MACD trough improvement (12), the height of the bump (8), both troughs on the classic side of
+      zero (10), volume drying up in wave B (10), a rejection wick at B (10), a triple divergence (8). Context
+      points, 10 each: the higher timeframe's MACD agreeing, open interest falling into B with funding not
+      against it, and the BTC 4H state on the signal's side (BULL for bullish, BEAR for bearish; CHOP earns
+      nothing). Open interest rising more than 5% against the signal costs 10.
+      <br><br>
+      A context item the data cannot check (no higher-timeframe candles, no OI history or funding, no BTC
+      candles) is left out rather than scored as a miss: the score is what was earned out of what could be
+      checked, scaled to 100, and the signal is tagged <b style="color:var(--tx)">PARTIAL DATA</b>.
       <br><br>
       The grade describes the setup. It is not a win rate. To see how each grade and regime has actually done on
       the stored candles, run <b style="color:var(--tx)">python macd_divergence_screener_v5.py --backtest</b>.
@@ -3356,8 +3405,10 @@ var TIP = {
   'W-PATTERN':       'The bump between A and B is at least half the MACD range of the leg: a clear W (M for bearish).',
   'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
   'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.',
-  'WITH TREND':      'BTC 4H RSI is on the signal\'s side of 50 and the coin is on the right side of its own 200 EMA. Grade B is enough for Yes.',
-  'COUNTER TREND':   'BTC or the coin\'s 200 EMA disagrees with the signal. Needs grade A for Yes; otherwise watch only.',
+  'WITH TREND':      'The BTC 4H state agrees with the signal (BULL: RSI above 55 and close above its 200 EMA; BEAR: RSI below 45 and close below it) and so does the coin\'s own 200 EMA. Grade B is enough for Yes.',
+  'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
+  'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
+  'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100.',
   '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags above are exactly that combination. n/a = too little OI history.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
@@ -3370,7 +3421,8 @@ var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-m
 /* ── Tags page: built from TIP so it cannot drift from the hover text ─────── */
 var TAG_GROUPS = [
   ['Pattern tags (about the divergence itself)', ['TRIPLE','W-PATTERN','LTF TRIGGER','ZERO-LINE CROSS']],
-  ['Regime (sets how high the grade must be)', ['WITH TREND','COUNTER TREND']],
+  ['Regime (sets how high the grade must be)', ['WITH TREND','CHOP','COUNTER TREND']],
+  ['Score', ['PARTIAL DATA']],
   ['Open interest: 7-day positioning', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
   ['Open interest: funding and crowding', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
   ['Daily movers (the last completed day)', ['VOLUME SPIKE','RANGE EXPANSION','BIG MOVE','AT RANGE HIGH','ABOVE 7D HIGH','AT RANGE LOW','BELOW 7D LOW']]
@@ -3725,7 +3777,9 @@ function detailRow(r){
       ' &rarr; B ' + s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price) +
       ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
       ' &nbsp;&middot;&nbsp; grade ' + s.grade + ' (' + s.score + ') &middot; ' + s.regime +
-      ' &nbsp;&middot;&nbsp; HTF ' + (s.htf_ok ? 'agrees' : 'no') + ', OI ' + (s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
+      (s.partial ? ' (partial data)' : '') +
+      ' &nbsp;&middot;&nbsp; HTF ' + (s.htf_ok == null ? 'n/a' : s.htf_ok ? 'agrees' : 'no') + ', OI ' + (s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
+      ', BTC ' + (s.btc_state || 'n/a') +
       ', volume ' + (s.vol_dry ? 'drying' : 'not drying') + ', wick ' + (s.wick ? 'yes' : 'no') + (s.triple ? ', triple' : '') +
       ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
       (s.trigger_price != null ? ' &nbsp;&middot;&nbsp; lower-timeframe trigger at ' + fmtPx(s.trigger_price) : '') +

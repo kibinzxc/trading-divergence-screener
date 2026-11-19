@@ -62,14 +62,20 @@ class SavedState(unittest.TestCase):
 
     def test_row_state_round_trips(self):
         self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
-                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 2}})
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 3}})
         m.load_state()
         self.assertEqual(m._state["results"], [{"pair": "X", "tfs": ["4h"]}])
         m.save_state()
         with open(m.STATE_FILE) as f:
             saved = json.load(f)
         self.assertEqual(sorted(saved), ["meta", "results", "ts"])
-        self.assertEqual(saved["meta"]["v"], 2)
+        self.assertEqual(saved["meta"]["v"], 3)
+
+    def test_state_from_before_the_v3_score_is_ignored(self):
+        self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 2}})
+        m.load_state()
+        self.assertEqual(m._state["results"], [])
 
 
 import re  # noqa: E402
@@ -116,6 +122,8 @@ class Page(unittest.TestCase):
         # every tag the Tags page lists has a definition
         groups = re.search(r"var TAG_GROUPS = \[(.*?)\n\];", self.html, re.S).group(1)
         tip = re.search(r"var TIP = \{(.*?)\n\};", self.html, re.S).group(1)
+        for k in ("'CHOP'", "'PARTIAL DATA'"):
+            self.assertIn(k, groups, k)
         for line in groups.splitlines():
             for k in re.findall(r"'([^']+)'", line.split(", [", 1)[-1]):
                 self.assertIn("'" + k + "':", tip, k)

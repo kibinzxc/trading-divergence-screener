@@ -243,10 +243,6 @@ MOVER_THIN_MIN_WEEKLY_VOL = 20_000_000   # ≈ $3M/day
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "scan_state.json")
-# Own file on purpose: a movers scan must never be able to clobber the
-# divergence scan's saved state, and vice versa.
-MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "movers_state.json")
 
 # ── News calendar ──────────────────────────────────────────────────────────────
 # Scheduled macro prints, so a setup is never sized into a CPI or FOMC release
@@ -294,10 +290,8 @@ CAL_MOVERS = [
 _CAL_MOVERS_RE = [(c, re.compile(p, re.I)) for c, p in CAL_MOVERS]
 
 # ── Server state ───────────────────────────────────────────────────────────────
-_state = {"results": [], "ts": None, "meta": {},
-          "watch": {"rows": [], "ts": None, "meta": {}}}
+_state = {"results": [], "ts": None, "meta": {}}
 _lock  = threading.Lock()
-_movers_state = {"rows": [], "ts": None, "meta": {}}
 _cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
               "jb": {"events": [], "ts": None, "attempt": None}}
 
@@ -1050,15 +1044,12 @@ def analyse_mover(df, live_price):
     }
 
 
-def classify_mover(m, thin=False):
+def classify_mover(m):
     """(qualifies, flags, score) for one analysed pair.
 
     The score ranks how UNUSUAL the day was and how close price sits to a
     decision level. It carries NO direction and is NOT a win rate — the same
     caveat as setup_score, for the same reason: nothing here was backtested.
-
-    thin=True is the stricter test for the low-liquidity band: volume spike
-    AND range expansion, where a liquid pair needs any one trigger.
     """
     vm  = m.get("vol_mult") or 0.0
     rm  = m.get("range_mult") or 0.0
@@ -1081,11 +1072,8 @@ def classify_mover(m, thin=False):
     elif lo_d is not None and lo_d <= MOVER_EDGE_PCT:
         flags.append("AT RANGE LOW")
 
-    if thin:
-        qualifies = vm >= MOVER_VOL_MULT and rm >= MOVER_RANGE_MULT
-    else:
-        qualifies = (vm >= MOVER_VOL_MULT or rm >= MOVER_RANGE_MULT
-                     or chg >= MOVER_MIN_CHG_PCT)
+    qualifies = (vm >= MOVER_VOL_MULT or rm >= MOVER_RANGE_MULT
+                 or chg >= MOVER_MIN_CHG_PCT)
 
     # Distance to the NEARER 7-day boundary. Already through one → 0 → full marks.
     edge = min([d for d in (hi_d, lo_d) if d is not None] or [99.0])
@@ -1094,35 +1082,6 @@ def classify_mover(m, thin=False):
     score += float(np.clip(1.0 - max(edge, 0.0) / 6.0, 0, 1)) * 20  # near a level
     score += float(np.clip(chg / 12.0, 0, 1)) * 15                  # size of the move
     return qualifies, flags, int(max(0, min(100, round(score))))
-
-
-def save_movers():
-    try:
-        with _lock:
-            rows = list(_movers_state["rows"])
-            ts   = _movers_state["ts"]
-            meta = dict(_movers_state["meta"])
-        with open(MOVERS_STATE_FILE, "w") as f:
-            json.dump({"rows": rows, "ts": ts.isoformat() if ts else None,
-                       "meta": meta}, f)
-    except Exception as e:
-        print(f"[movers] save failed: {e}")
-
-
-def load_movers():
-    try:
-        with open(MOVERS_STATE_FILE) as f:
-            data = json.load(f)
-        ts = data.get("ts")
-        with _lock:
-            _movers_state["rows"] = data.get("rows", [])
-            _movers_state["ts"]   = datetime.datetime.fromisoformat(ts) if ts else None
-            _movers_state["meta"] = data.get("meta", {})
-        print(f"[movers] restored {len(_movers_state['rows'])} row(s) from last scan")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[movers] load failed: {e}")
 
 
 # ── News calendar ──────────────────────────────────────────────────────────────
@@ -1687,17 +1646,39 @@ def build_rows(sigs, mover=None, flow=None, context_error=None,
     return list(rows.values())
 
 
+def signals_for_tf(df, tf, rules, live_price, sym, wk_vol):
+    """Finished signals for one pair on one timeframe.
+
+    `df` must already carry the indicator columns. Fewer than 80 bars is not
+    enough for MACD to have settled, so that timeframe reports nothing.
+    """
+    if df is None or len(df) < 80:
+        return []
+    found = []
+    for sig in detect_divergences(df, TF_CFG[tf], rules):
+        sig.update(evaluate_status(df, sig, live_price))
+        found.append(sig)
+    out = []
+    for sig in dedupe(found):
+        sig.pop("_b", None)
+        sig.update(build_targets(sig, live_price))
+        sig.update({
+            "pair": sym, "base": sym.split("/")[0], "tf": tf,
+            "current_price": px(live_price),
+            "weekly_volume": round(wk_vol, 2) if wk_vol else None,
+            "score": setup_score(sig, wk_vol),
+        })
+        out.append(sig)
+    return out
+
+
 # ── State persistence ──────────────────────────────────────────────────────────
 def save_state():
     try:
         with _lock:
-            w = _state["watch"]
             data = {"results": list(_state["results"]),
                     "ts": _state["ts"].isoformat() if _state["ts"] else None,
-                    "meta": dict(_state["meta"]),
-                    "watch": {"rows": list(w["rows"]),
-                              "ts": w["ts"].isoformat() if w["ts"] else None,
-                              "meta": dict(w["meta"])}}
+                    "meta": dict(_state["meta"])}
         with open(STATE_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
@@ -1708,17 +1689,18 @@ def load_state():
     try:
         with open(STATE_FILE) as f:
             data = json.load(f)
+        meta = data.get("meta", {})
+        if "tfs" not in meta:
+            # Written before rows existed (flat signal list, single timeframe).
+            # The page cannot draw it, so start empty rather than broken.
+            print("[state] last scan is from an older version - ignored")
+            return
         with _lock:
             _state["results"] = data.get("results", [])
             ts = data.get("ts")
             _state["ts"] = datetime.datetime.fromisoformat(ts) if ts else None
-            _state["meta"] = data.get("meta", {})
-            w = data.get("watch") or {}
-            wts = w.get("ts")
-            _state["watch"] = {"rows": w.get("rows", []),
-                               "ts": datetime.datetime.fromisoformat(wts) if wts else None,
-                               "meta": w.get("meta", {})}
-        print(f"[state] restored {len(_state['results'])} signal(s) from last scan")
+            _state["meta"] = meta
+        print(f"[state] restored {len(_state['results'])} row(s) from last scan")
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -1768,229 +1750,9 @@ def index():
 @app.route("/signals")
 def signals_route():
     with _lock:
-        return jsonify({"signals": list(_state["results"]),
+        return jsonify({"rows": list(_state["results"]),
                         "meta": dict(_state["meta"]),
                         "ts": _state["ts"].isoformat() if _state["ts"] else None})
-
-
-@app.route("/watch_signals")
-def watch_signals_route():
-    with _lock:
-        w = _state["watch"]
-        return jsonify({"rows": list(w["rows"]), "meta": dict(w["meta"]),
-                        "ts": w["ts"].isoformat() if w["ts"] else None})
-
-
-@app.route("/watchlist")
-def watchlist_route():
-    """OI flow scan — the Sunday routine as one SSE stream.
-
-    Per pair: ~10 daily candles (price baseline + real 7-day volume gate) and
-    the daily OI history. Funding for the whole market is one bulk call.
-    Roughly half the API weight of a divergence scan.
-    """
-    exid      = request.args.get("exchange", "okx")
-    speed     = request.args.get("speed", "normal")
-    min_vol   = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
-    max_pairs = int(request.args.get("max_pairs", DEFAULT_MAX_PAIRS))
-    if speed not in SPEED:
-        speed = "normal"
-
-    def generate():
-        try:
-            main_ex = make_exchange(exid)
-        except ValueError as e:
-            yield sse("error", {"msg": str(e)}); return
-
-        yield sse("log", {"msg": "Loading markets..."})
-        try:
-            mkts = main_ex.load_markets()
-        except Exception as e:
-            yield sse("error", {"msg": f"load_markets failed: {e}"}); return
-
-        perps = [s for s in mkts
-                 if s.endswith("/USDT:USDT") and mkts[s].get("active")
-                 and s.split("/")[0] not in STABLE_BASES
-                 and not is_tradfi(mkts[s])]
-
-        yield sse("log", {"msg": "Fetching 24h volumes + funding rates (bulk)..."})
-        try:
-            tickers = main_ex.fetch_tickers()
-        except Exception as e:
-            yield sse("error", {"msg": f"volume fetch failed: {e}"}); return
-        funding = fetch_funding_map(main_ex)
-        if not funding:
-            yield sse("log", {"msg": "No bulk funding data — health flags will be blank"})
-
-        vol24 = {}
-        for s in perps:
-            v = usd_volume(tickers.get(s))
-            if v:
-                vol24[s] = v
-        pre_floor = (min_vol / 7.0) * PREGATE_SLACK
-        pairs = sorted([s for s in vol24 if vol24[s] >= pre_floor],
-                       key=lambda s: vol24[s], reverse=True)[:max_pairs]
-        yield sse("log", {"msg": f"{len(pairs)} candidates - measuring {OI_LOOKBACK_D}-day OI change"})
-
-        spd = SPEED[speed]
-        limiter = RateLimiter(spd["rps"].get(exid, 8))
-        yield sse("total", {"total": len(pairs)})
-
-        tls = threading.local()
-
-        def worker_ex():
-            ex = getattr(tls, "ex", None)
-            if ex is None:
-                ex = make_exchange(exid, rate_limit=False)
-                ex.set_markets(mkts)
-                tls.ex = ex
-            return ex
-
-        q = queue.Queue()
-        counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_oi": 0,
-                   "quiet": 0, "errors": 0}
-        clock = threading.Lock()
-
-        def scan_pair(sym):
-            base = sym.split("/")[0]
-            try:
-                ex = worker_ex()
-                raw = _to_df(fetch_ohlcv(ex, limiter, sym, "1d",
-                                         limit=OI_LOOKBACK_D + 5))
-                if raw is None or raw.empty:
-                    with clock:
-                        counter["no_oi"] += 1
-                    return
-                live_price = float(raw["close"].iloc[-1])
-                df = drop_forming_candle(raw, 1440)
-                if df is None or len(df) < 2:
-                    with clock:
-                        counter["no_oi"] += 1
-                    return
-
-                wk_vol = weekly_usd_volume(df, vol24.get(sym), 1440)
-                if wk_vol is None or wk_vol < min_vol:
-                    with clock:
-                        counter["vol_reject"] += 1
-                    return
-
-                hist = fetch_oi_history(ex, limiter, sym, OI_LOOKBACK_D + 4)
-                hist = [p for p in (hist or []) if p.get("timestamp")]
-                if len(hist) < OI_MIN_HISTORY:
-                    # fresh listing or venue gap — OI ramping from zero is the
-                    # method's classic false positive, so it is skipped loudly
-                    with clock:
-                        counter["no_oi"] += 1
-                    return
-                hist.sort(key=lambda p: p["timestamp"])
-
-                # Baseline = the OI point closest to (now − lookback). Daily
-                # points can be sparse on some venues, so "closest" with a
-                # ±36h tolerance beats indexing back a fixed count.
-                now_ms = hist[-1]["timestamp"]
-                target = now_ms - OI_LOOKBACK_D * 86_400_000
-                past = min(hist[:-1], key=lambda p: abs(p["timestamp"] - target))
-                if abs(past["timestamp"] - target) > 36 * 3_600_000:
-                    with clock:
-                        counter["no_oi"] += 1
-                    return
-
-                # price for amount→USD conversion at the baseline: the daily
-                # close of that same day, falling back to live price
-                day_close = {int(ts.timestamp() * 1000) // 86_400_000: float(c)
-                             for ts, c in df["close"].items()}
-                past_px = day_close.get(past["timestamp"] // 86_400_000, live_price)
-                oi_now  = oi_point_usd(hist[-1], live_price)
-                oi_then = oi_point_usd(past, past_px)
-                if not oi_now or not oi_then:
-                    with clock:
-                        counter["no_oi"] += 1
-                    return
-
-                oi_chg = (oi_now - oi_then) / oi_then * 100.0
-                span = min(OI_LOOKBACK_D + 1, len(df))
-                price_chg = (float(df["close"].iloc[-1]) / float(df["close"].iloc[-span]) - 1) * 100.0
-
-                with clock:
-                    counter["analysed"] += 1
-                if abs(oi_chg) < OI_MIN_CHANGE_PCT:
-                    with clock:
-                        counter["quiet"] += 1
-                    return
-
-                fund_day = funding.get(sym)
-                quad, flags = classify_flow(price_chg, oi_chg, fund_day)
-                avg_daily_vol = wk_vol / 7.0
-                oi_vol_ratio = oi_now / avg_daily_vol if avg_daily_vol > 0 else None
-                if oi_vol_ratio and oi_vol_ratio >= OI_VOL_RATIO_HIGH:
-                    flags.append("HIGH OI/VOL")
-
-                q.put(("result", {
-                    "pair": sym, "base": base,
-                    "oi_usd": round(oi_now, 0),
-                    "oi_chg_pct": round(oi_chg, 1),
-                    "price_chg_pct": round(price_chg, 1),
-                    "quadrant": quad, "flags": flags,
-                    "funding_day_pct": round(fund_day, 4) if fund_day is not None else None,
-                    "oi_vol_ratio": round(oi_vol_ratio, 2) if oi_vol_ratio else None,
-                    "weekly_volume": round(wk_vol, 2),
-                    "current_price": px(live_price),
-                }))
-            except Exception as e:
-                with clock:
-                    counter["errors"] += 1
-                q.put(("log", {"msg": f"[{base}] skipped: {e}"}))
-            finally:
-                with clock:
-                    counter["n"] += 1
-                    n_now = counter["n"]
-                q.put(("progress", {"current": n_now, "pair": sym}))
-
-        done = threading.Event()
-
-        def runner():
-            try:
-                with ThreadPoolExecutor(max_workers=spd["workers"]) as pool:
-                    list(pool.map(scan_pair, pairs))
-            finally:
-                done.set()
-
-        threading.Thread(target=runner, daemon=True).start()
-
-        rows = []
-
-        def persist():
-            with clock:
-                c = dict(counter)
-            meta = {"exchange": exid, "lookback_d": OI_LOOKBACK_D,
-                    "min_weekly_vol": min_vol, "dispatched": len(pairs),
-                    "analysed": c["analysed"], "vol_rejected": c["vol_reject"],
-                    "no_oi": c["no_oi"], "quiet": c["quiet"],
-                    "errors": c["errors"],
-                    "complete": done.is_set() and q.empty()}
-            with _lock:
-                _state["watch"] = {"rows": rows,
-                                   "ts": datetime.datetime.now(datetime.timezone.utc),
-                                   "meta": meta}
-            save_state()
-            return meta
-
-        try:
-            while not (done.is_set() and q.empty()):
-                try:
-                    kind, payload = q.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                if kind == "result":
-                    rows.append(payload)
-                yield sse(kind, payload)
-        finally:
-            meta = persist()
-
-        yield sse("done", {"hits": len(rows), "meta": meta})
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.route("/universe")
@@ -2034,21 +1796,17 @@ def universe_route():
 @app.route("/scan")
 def scan_route():
     exid       = request.args.get("exchange", "okx")
-    tf         = request.args.get("tf", "4h")
     strictness = request.args.get("strictness", "balanced")
     speed      = request.args.get("speed", "normal")
     min_vol    = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
     max_pairs  = int(request.args.get("max_pairs", DEFAULT_MAX_PAIRS))
     only_syms  = [s.strip().upper() for s in request.args.get("symbols", "").split(",") if s.strip()]
 
-    if tf not in TF_CFG:
-        tf = "4h"
     if strictness not in STRICTNESS:
         strictness = "balanced"
     if speed not in SPEED:
         speed = "normal"
 
-    cfg   = TF_CFG[tf]
     rules = STRICTNESS[strictness]
 
     def generate():
@@ -2074,6 +1832,21 @@ def scan_route():
             tickers = main_ex.fetch_tickers()
         except Exception as e:
             yield sse("error", {"msg": f"volume fetch failed: {e}"}); return
+
+        funding = fetch_funding_map(main_ex)
+        if not funding:
+            yield sse("log", {"msg": "No bulk funding data — OI-flow health flags will be blank"})
+
+        # Next curated macro print, for the entry verdict. A calendar failure
+        # must not stop a scan; the verdict then simply ignores the calendar.
+        ev_h, ev_title = None, ""
+        try:
+            refresh_calendar()
+            with _lock:
+                events = list(_cal_state["events"])
+            ev_h, ev_title = next_mover(events, datetime.datetime.now(datetime.timezone.utc))
+        except Exception as e:
+            yield sse("log", {"msg": f"Calendar unavailable for the entry verdict: {e}"})
 
         # Cheap pre-gate on the ticker's 24h volume. It exists only to avoid
         # fetching 700 bars for obviously dead coins — the REAL gate is the
@@ -2122,7 +1895,7 @@ def scan_route():
         spd = SPEED[speed]
         limiter = RateLimiter(spd["rps"].get(exid, 8))
         workers = spd["workers"]
-        yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on {cfg['label']} · "
+        yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on 4H + 1H · "
                                  f"{strictness} · {workers} workers"})
         yield sse("total", {"total": len(pairs)})
 
@@ -2140,61 +1913,61 @@ def scan_route():
         counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0}
         clock = threading.Lock()
 
+        def with_indicators(df):
+            return pd.concat([df, compute_indicators(df)], axis=1).dropna()
+
         def scan_pair(sym):
             base = sym.split("/")[0]
             try:
                 ex = worker_ex()
-                raw = fetch_df_deep(ex, limiter, sym, tf, cfg["bars"])
+                raw = fetch_df_deep(ex, limiter, sym, "4h", TF_CFG["4h"]["bars"])
                 if raw is None or len(raw) < 80:
                     with clock:
                         counter["no_data"] += 1
                     return
                 live_price = float(raw["close"].iloc[-1])
 
-                # Drop the open candle BEFORE measuring volume. Getting this
-                # order wrong is not cosmetic: weekly_usd_volume divides the
-                # 7-day notional by the last 24h of notional, and on the 1D
-                # timeframe "the last 24h" is a single bar. If that bar is the
-                # one still forming, the denominator is a fraction of a day's
-                # volume and the ratio blows up — a coin scanned at 02:00 UTC
-                # reported ~10x its real weekly volume and sailed through the
-                # liquidity gate it should have failed.
-                df = drop_forming_candle(raw, cfg["minutes"])
-                if df is None or len(df) < 80:
+                # Drop the open candle BEFORE measuring volume: weekly_usd_volume
+                # divides 7-day notional by the last 24h of notional, and a
+                # still-forming bar in that denominator inflates the ratio.
+                df4 = drop_forming_candle(raw, TF_CFG["4h"]["minutes"])
+                if df4 is None or len(df4) < 80:
                     with clock:
                         counter["no_data"] += 1
                     return
 
-                wk_vol = weekly_usd_volume(df, vol24.get(sym), cfg["minutes"])
+                # The volume gate runs on 4H alone, so a pair that fails it
+                # never costs a 1H fetch.
+                wk_vol = weekly_usd_volume(df4, vol24.get(sym), TF_CFG["4h"]["minutes"])
                 if not only_syms and (wk_vol is None or wk_vol < min_vol):
                     with clock:
                         counter["vol_reject"] += 1
                     return
 
-                df = pd.concat([df, compute_indicators(df)], axis=1).dropna()
-                if len(df) < 80:
+                df4 = with_indicators(df4)
+                if len(df4) < 80:
                     with clock:
                         counter["no_data"] += 1
                     return
 
+                df1 = None
+                raw1 = fetch_df_deep(ex, limiter, sym, "1h", TF_CFG["1h"]["bars"])
+                if raw1 is not None and len(raw1) >= 80:
+                    live_price = float(raw1["close"].iloc[-1])    # the newer tick
+                    df1 = drop_forming_candle(raw1, TF_CFG["1h"]["minutes"])
+                    df1 = with_indicators(df1) if df1 is not None else None
+
                 with clock:
                     counter["analysed"] += 1
 
-                found = []
-                for sig in detect_divergences(df, cfg, rules):
-                    sig.update(evaluate_status(df, sig, live_price))
-                    found.append(sig)
-
-                for sig in dedupe(found):
-                    sig.pop("_b", None)
-                    sig.update(build_targets(sig, live_price))
-                    sig.update({
-                        "pair": sym, "base": base, "tf": tf,
-                        "current_price": px(live_price),
-                        "weekly_volume": round(wk_vol, 2) if wk_vol else None,
-                        "score": setup_score(sig, wk_vol),
-                    })
-                    q.put(("result", sig))
+                sigs = (signals_for_tf(df4, "4h", rules, live_price, sym, wk_vol) +
+                        signals_for_tf(df1, "1h", rules, live_price, sym, wk_vol))
+                if not sigs:
+                    return
+                mover, flow, cerr = pair_context(ex, limiter, sym, live_price,
+                                                 funding.get(sym), wk_vol)
+                for row in build_rows(sigs, mover, flow, cerr, ev_h, ev_title):
+                    q.put(("result", row))
             except Exception as e:
                 with clock:
                     counter["errors"] += 1
@@ -2227,7 +2000,7 @@ def scan_route():
             # is reported alongside it instead of disappearing.
             with clock:
                 c = dict(counter)
-            meta = {"exchange": exid, "tf": tf, "strictness": strictness,
+            meta = {"exchange": exid, "tfs": list(TF_CFG), "strictness": strictness,
                     "min_weekly_vol": min_vol, "universe": len(perps),
                     "dispatched": len(pairs), "scanned": c["analysed"],
                     "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
@@ -2261,14 +2034,6 @@ def scan_route():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.route("/mover_signals")
-def mover_signals_route():
-    with _lock:
-        s = _movers_state
-        return jsonify({"rows": list(s["rows"]), "meta": dict(s["meta"]),
-                        "ts": s["ts"].isoformat() if s["ts"] else None})
-
-
 @app.route("/calendar")
 def calendar_route():
     refresh_calendar(force=request.args.get("refresh") == "1")
@@ -2277,204 +2042,6 @@ def calendar_route():
                         "meta": dict(_cal_state["meta"]),
                         "ts": _cal_state["ts"].isoformat() if _cal_state["ts"] else None,
                         "now": _iso_z(datetime.datetime.now(datetime.timezone.utc))})
-
-
-@app.route("/movers")
-def movers_route():
-    """Daily movers scan — one SSE stream, ~1 API call per pair.
-
-    Crypto only: is_tradfi() keeps stock / ETF / commodity perps out of the
-    universe entirely. A watchlist built at the weekend that quietly includes an
-    equity perp is quoting levels on an instrument whose underlying market is
-    shut — thin book, funding-driven drift, and a gap at the Monday cash open.
-    """
-    exid      = request.args.get("exchange", "okx")
-    speed     = request.args.get("speed", "normal")
-    min_vol   = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
-    max_pairs = int(request.args.get("max_pairs", DEFAULT_MAX_PAIRS))
-    thin      = request.args.get("thin") == "1"
-    # Never above the main floor: lowering the floor below $20M already lets
-    # those pairs in as ordinary rows, and the band is then simply empty.
-    thin_floor = min(MOVER_THIN_MIN_WEEKLY_VOL, min_vol)
-    if speed not in SPEED:
-        speed = "normal"
-
-    def generate():
-        try:
-            main_ex = make_exchange(exid)
-        except ValueError as e:
-            yield sse("error", {"msg": str(e)}); return
-
-        yield sse("log", {"msg": "Loading markets..."})
-        try:
-            mkts = main_ex.load_markets()
-        except Exception as e:
-            yield sse("error", {"msg": f"load_markets failed: {e}"}); return
-
-        all_perps = [s for s in mkts
-                     if s.endswith("/USDT:USDT") and mkts[s].get("active")
-                     and s.split("/")[0] not in STABLE_BASES]
-        perps = [s for s in all_perps if not is_tradfi(mkts[s])]
-        skipped_tradfi = len(all_perps) - len(perps)
-        yield sse("log", {"msg": f"{len(perps)} crypto perps on {exid.upper()} · "
-                                 f"{skipped_tradfi} stock/ETF/commodity perp(s) excluded"})
-
-        yield sse("log", {"msg": "Fetching 24h volumes (one bulk call)..."})
-        try:
-            tickers = main_ex.fetch_tickers()
-        except Exception as e:
-            yield sse("error", {"msg": f"volume fetch failed: {e}"}); return
-
-        vol24 = {}
-        for s in perps:
-            v = usd_volume(tickers.get(s))
-            if v:
-                vol24[s] = v
-        pre_floor = ((thin_floor if thin else min_vol) / 7.0) * PREGATE_SLACK
-        # Sorted most-liquid first, so the max_pairs cap can only ever cut
-        # into the thin end of the list, never the main one.
-        pairs = sorted([s for s in vol24 if vol24[s] >= pre_floor],
-                       key=lambda s: vol24[s], reverse=True)[:max_pairs]
-        yield sse("log", {"msg": f"{len(pairs)} candidates - measuring "
-                                 f"{MOVER_LOOKBACK_D}-day volume and range baselines"})
-
-        spd = SPEED[speed]
-        limiter = RateLimiter(spd["rps"].get(exid, 8))
-        yield sse("total", {"total": len(pairs)})
-
-        tls = threading.local()
-
-        def worker_ex():
-            ex = getattr(tls, "ex", None)
-            if ex is None:
-                ex = make_exchange(exid, rate_limit=False)
-                ex.set_markets(mkts)
-                tls.ex = ex
-            return ex
-
-        q = queue.Queue()
-        counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0,
-                   "quiet": 0, "errors": 0, "thin_analysed": 0, "thin_quiet": 0}
-        clock = threading.Lock()
-
-        def scan_pair(sym):
-            base = sym.split("/")[0]
-            try:
-                ex = worker_ex()
-                raw = _to_df(fetch_ohlcv(ex, limiter, sym, "1d",
-                                         limit=MOVER_LOOKBACK_D + 12))
-                if raw is None or raw.empty:
-                    with clock:
-                        counter["no_data"] += 1
-                    return
-                live_price = float(raw["close"].iloc[-1])
-
-                # Same ordering trap as the divergence scan: drop the open bar
-                # BEFORE any volume measurement. The still-forming day compared
-                # against full days makes every pair look quiet.
-                df = drop_forming_candle(raw, 1440)
-                if df is None or len(df) < MOVER_LOOKBACK_D + 2:
-                    with clock:
-                        counter["no_data"] += 1
-                    return
-
-                wk_vol = weekly_usd_volume(df, vol24.get(sym), 1440)
-                tier = "core"
-                if wk_vol is None or wk_vol < min_vol:
-                    if not (thin and wk_vol is not None and wk_vol >= thin_floor):
-                        with clock:
-                            counter["vol_reject"] += 1
-                        return
-                    tier = "thin"
-
-                m = analyse_mover(df, live_price)
-                if m is None:
-                    with clock:
-                        counter["no_data"] += 1
-                    return
-
-                with clock:
-                    counter["thin_analysed" if tier == "thin" else "analysed"] += 1
-
-                qualifies, flags, score = classify_mover(m, thin=(tier == "thin"))
-                if not qualifies:
-                    with clock:
-                        counter["thin_quiet" if tier == "thin" else "quiet"] += 1
-                    return
-
-                m.update({
-                    "pair": sym, "base": base,
-                    "direction": "UP" if m["chg_1d_pct"] >= 0 else "DOWN",
-                    "flags": flags, "score": score,
-                    "weekly_volume": round(wk_vol, 2),
-                    "daily_volume": round(wk_vol / 7.0, 2),
-                    "tier": tier,
-                    "current_price": px(live_price),
-                })
-                q.put(("result", m))
-            except Exception as e:
-                with clock:
-                    counter["errors"] += 1
-                q.put(("log", {"msg": f"[{base}] skipped: {e}"}))
-            finally:
-                with clock:
-                    counter["n"] += 1
-                    n_now = counter["n"]
-                q.put(("progress", {"current": n_now, "pair": sym}))
-
-        done = threading.Event()
-
-        def runner():
-            try:
-                with ThreadPoolExecutor(max_workers=spd["workers"]) as pool:
-                    list(pool.map(scan_pair, pairs))
-            finally:
-                done.set()
-
-        threading.Thread(target=runner, daemon=True).start()
-
-        rows = []
-
-        def persist():
-            with clock:
-                c = dict(counter)
-            meta = {"exchange": exid, "lookback_d": MOVER_LOOKBACK_D,
-                    "range_d": MOVER_RANGE_D, "min_weekly_vol": min_vol,
-                    "dispatched": len(pairs), "analysed": c["analysed"],
-                    "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
-                    "quiet": c["quiet"], "errors": c["errors"],
-                    "tradfi_excluded": skipped_tradfi,
-                    "thin": thin, "thin_floor": thin_floor if thin else None,
-                    "thin_analysed": c["thin_analysed"],
-                    "thin_quiet": c["thin_quiet"],
-                    "complete": done.is_set() and q.empty()}
-            with _lock:
-                _movers_state["rows"] = rows
-                _movers_state["ts"] = datetime.datetime.now(datetime.timezone.utc)
-                _movers_state["meta"] = meta
-            save_movers()
-            return meta
-
-        # Same discipline as the other two scans: if the browser tab closes
-        # mid-scan, whatever was collected is still saved — and flagged
-        # incomplete, because a partial result read as "quiet market" is the
-        # failure mode that matters.
-        try:
-            while not (done.is_set() and q.empty()):
-                try:
-                    kind, payload = q.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                if kind == "result":
-                    rows.append(payload)
-                yield sse(kind, payload)
-        finally:
-            meta = persist()
-
-        yield sse("done", {"hits": len(rows), "meta": meta})
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -4348,6 +3915,5 @@ document.addEventListener('DOMContentLoaded', function(){
 if __name__ == "__main__":
     load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
     load_state()      # restore the last scan so the dashboard isn't amnesiac
-    load_movers()     # ...and the last movers scan
     load_calendar()   # ...and the news calendar
     app.run(debug=False, threaded=True, port=5099)

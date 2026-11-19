@@ -87,5 +87,24 @@ class Detection(unittest.TestCase):
             self.assertEqual(self.detect(20, 100, "bearish", tf), [])  # 80 bars apart
 
 
+class SignalsForTf(unittest.TestCase):
+    def test_finished_signal_carries_everything_a_row_needs(self):
+        df = make_df(70, 116, "bullish")
+        out = m.signals_for_tf(df, "1h", m.STRICTNESS["balanced"],
+                               float(df["close"].iloc[-1]), "ENS/USDT:USDT", 9e7)
+        self.assertEqual(len(out), 1)
+        s = out[0]
+        self.assertEqual((s["tf"], s["pair"], s["base"], s["side"], s["weekly_volume"]),
+                         ("1h", "ENS/USDT:USDT", "ENS", "bullish", 9e7))
+        for k in ("status", "targets", "risk_pct", "score", "current_price", "stop_price"):
+            self.assertIn(k, s)
+        self.assertNotIn("_b", s)
+
+    def test_too_few_bars_gives_nothing(self):
+        df = make_df(20, 40, "bullish", n=60)
+        self.assertEqual(m.signals_for_tf(df, "4h", m.STRICTNESS["balanced"],
+                                          100.0, "ENS/USDT:USDT", 9e7), [])
+
+
 if __name__ == "__main__":
     unittest.main()

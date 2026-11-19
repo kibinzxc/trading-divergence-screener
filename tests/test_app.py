@@ -61,5 +61,32 @@ class SavedState(unittest.TestCase):
             self.assertEqual(sorted(json.load(f)), ["meta", "results", "ts"])
 
 
+import re  # noqa: E402
+
+
+class Page(unittest.TestCase):
+    def setUp(self):
+        self.html = m.app.test_client().get("/").get_data(as_text=True)
+
+    def test_three_pages(self):
+        self.assertEqual(re.findall(r'class="nav-btn[^"]*" data-pg="(\w+)"', self.html),
+                         ["scan", "calendar", "learn"])
+        self.assertEqual(sorted(re.findall(r'<div id="pg-(\w+)"', self.html)),
+                         ["calendar", "learn", "scan"])
+
+    def test_no_unfilled_template_placeholders(self):
+        self.assertEqual(re.findall(r"__[A-Z][A-Z_]+__", self.html), [])
+
+    def test_removed_features_leave_no_code_behind(self):
+        for gone in ("startWatch", "startMovers", "rtGo", "loadDash", "mvThin",
+                     'data-val="loose"', 'data-val="1d"', "/watchlist", "/movers"):
+            self.assertNotIn(gone, self.html, gone)
+
+    def test_new_table_and_filters(self):
+        for want in ('data-f="enter"', 'data-f="both"', "function evCell", "function ctxCell",
+                     'id="scan-age"', 'id="dash-cal"'):
+            self.assertIn(want, self.html, want)
+
+
 if __name__ == "__main__":
     unittest.main()

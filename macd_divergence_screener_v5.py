@@ -232,14 +232,6 @@ MOVER_VOL_MULT    = 2.0
 MOVER_RANGE_MULT  = 1.5
 MOVER_EDGE_PCT    = 2.0     # within this % of a 7-day boundary = "at the edge"
 
-# Thin band (opt-in, /movers?thin=1). Pairs between this and the volume floor
-# are measured too, but listed separately and held to a stricter test: volume
-# spike AND range expansion together. On a $3M/day perp one whale order is a
-# "7x volume day" on its own; needing the range to expand with it is what
-# separates real participation from a single fill. The costs that justify the
-# main floor (spread, slippage through stops, wicks that clear stops and snap
-# back) do not go away — the band is labelled so size can come down with it.
-MOVER_THIN_MIN_WEEKLY_VOL = 20_000_000   # ≈ $3M/day
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "scan_state.json")
@@ -1733,7 +1725,6 @@ def index():
         "__MOVER_VOL__":   format(MOVER_VOL_MULT, "g"),
         "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
         "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
-        "__MOVER_THIN_M__": str(int(MOVER_THIN_MIN_WEEKLY_VOL / 1e6)),
         "__OI_LB__":       str(OI_LOOKBACK_D),
         "__OI_MIN__":      format(OI_MIN_CHANGE_PCT, "g"),
         "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
@@ -2084,9 +2075,7 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
 .slbl.fd{opacity:.3}
 .page{display:none}
 .page.active{display:flex;flex-direction:column}
-#pg-dash.active,#pg-signals.active,#pg-watch.active{display:block;overflow-y:auto;padding:24px}
 #pg-scan.active{display:grid;grid-template-columns:286px 1fr;overflow:hidden}
-#pg-dash,#pg-signals,#pg-watch{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
 .wq{display:inline-flex;align-items:center;padding:3px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:700;white-space:nowrap}
 .wq-sc{background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
 .wq-cap{background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2)}
@@ -2197,9 +2186,18 @@ tbody tr{animation:ri .3s var(--eout) both}
 .st-extended{background:#2D1500;color:#FB923C;border:1px solid #4a2800}
 .st-ran{background:#2D1F06;color:#FBBF24;border:1px solid #4a3500}
 .st-invalidated{background:#1A2438;color:#4F6380;border:1px solid var(--bd2)}
+.ev{display:inline-flex;flex-direction:column;gap:1px;padding:5px 9px;border-radius:5px;font-family:var(--mono);min-width:150px;max-width:260px}
+.ev .tsub{white-space:normal;line-height:1.35}
+.ev-enter{background:#0D2E1F;color:#34D399;border:1px solid #1a4020}
+.ev-wait{background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500}
+.ev-skip{background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2)}
+table.stale .ev{opacity:.4}
+tbody tr.main-row{cursor:pointer}
+tr.det td{background:var(--sf);font-family:var(--mono);font-size:10px;color:var(--tx2);line-height:1.8;padding:10px 16px}
+tr.det b{color:var(--tx)}
+.tfb{display:inline-block;margin-left:4px;padding:2px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
 .volc{font-family:var(--mono);font-size:11px;color:var(--tx2)}
 .volc small{display:block;font-size:9px;color:var(--tx3)}
-.tgt-row{font-family:var(--mono);font-size:10px;display:flex;gap:6px;flex-wrap:wrap}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;color:var(--tx3);font-family:var(--mono);font-size:12px}
 .empty-icon{font-size:28px;opacity:.3}
 .greet{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;padding:48px 40px}
@@ -2208,26 +2206,8 @@ tbody tr{animation:ri .3s var(--eout) both}
 .g-cta{margin-top:16px;padding:14px 52px;background:var(--acc);color:#000;border:none;border-radius:7px;font-family:var(--sans);font-size:14px;font-weight:600;cursor:pointer;transition:opacity .2s,transform .15s,box-shadow .2s}
 .g-cta:hover{opacity:.88;box-shadow:0 0 28px rgba(240,96,138,.4)}
 .g-cta:active{transform:scale(.97)}
-.kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:24px}
-.kpi{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:14px 16px}
-.kpi-lbl{font-size:10px;color:var(--tx3);margin-bottom:4px;letter-spacing:.06em;text-transform:uppercase}
-.kpi-val{font-family:var(--mono);font-size:28px;font-weight:600;color:var(--tx)}
-.kpi-sub{font-size:11px;color:var(--tx3);margin-top:2px}
 .dash-sec{margin-bottom:28px}
 .dash-sec-ttl{font-size:10px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3);margin-bottom:12px}
-.ready-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.sig-card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
-.sc-timing{padding:8px 14px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.04em;flex-shrink:0;white-space:nowrap}
-.sc-body{padding:14px}
-.sc-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
-.sc-pair{font-family:var(--mono);font-size:16px;font-weight:600;color:var(--tx)}
-.sc-meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px}
-.sml{color:var(--tx3);font-size:10px}.smv{color:var(--tx2);font-family:var(--mono)}
-.smv.bull{color:var(--bull)}.smv.bear{color:var(--bear)}
-.qbar-wrap{margin-top:10px;padding-top:10px;border-top:1px solid var(--bd)}
-.qbar-lbl{display:flex;justify-content:space-between;font-size:10px;color:var(--tx3);margin-bottom:4px}
-.qbar-bg{height:4px;background:var(--sf3);border-radius:2px;overflow:hidden}
-.qbar-fill{height:100%;border-radius:2px}
 .no-sig{color:var(--tx3);font-family:var(--mono);font-size:12px;padding:20px;background:var(--sf);border:1px solid var(--bd);border-radius:8px;text-align:center}
 .audit{font-family:var(--mono);font-size:10px;color:var(--tx3);margin:-14px 0 24px;line-height:1.7}
 .audit.warn{color:var(--fresh);background:var(--fresh-bg);border:1px solid #4a3500;border-radius:6px;padding:9px 12px;margin-top:-10px}
@@ -2256,65 +2236,7 @@ tbody tr{animation:ri .3s var(--eout) both}
 .lp-cap-bear{fill:var(--bear)}
 .rules{max-width:760px}
 
-/* ── Routine flow ── */
-.rt-hdr{display:flex;align-items:flex-start;gap:16px;margin-bottom:22px}
-.rt-hdr .sig-sub{max-width:640px;line-height:1.6;margin-top:4px}
-.rt-play{margin-left:auto;flex-shrink:0;display:flex;align-items:center;gap:6px;background:var(--sf2);border:1px solid var(--bd2);color:var(--tx);font-family:var(--mono);font-size:11px;padding:8px 16px;border-radius:6px;cursor:pointer;transition:border-color .2s,background .2s}
-.rt-play:hover{border-color:var(--acc)}
-.rt-play.on{background:var(--acc);border-color:var(--acc);color:#fff}
-.rt-flow{display:flex;align-items:stretch}
-.rt-node{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:6px;text-align:left;background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:14px 14px 12px;cursor:pointer;color:var(--tx2);font-family:var(--sans);
   opacity:0;transform:translateY(8px);animation:rtIn .45s ease forwards;animation-delay:var(--d);transition:border-color .3s,background .3s,box-shadow .3s}
-.rt-node:hover{border-color:var(--bd2)}
-.rt-dot{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:600;background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2);transition:all .3s}
-.rt-name{font-size:13px;font-weight:600;color:var(--tx)}
-.rt-q{font-size:11px;line-height:1.45;color:var(--tx3)}
-.rt-meta{margin-top:auto;padding-top:4px;display:flex;flex-direction:column;gap:2px;font-family:var(--mono);font-size:9px;color:var(--tx3)}
-.rt-cnt{color:var(--tx2)}
-.rt-node.done .rt-dot{background:var(--bull-bg);color:var(--bull);border-color:#1a4020}
-.rt-node.on{border-color:var(--acc);background:var(--sf2);box-shadow:0 0 0 3px rgba(240,96,138,.12)}
-.rt-node.on .rt-dot{background:var(--acc);color:#fff;border-color:var(--acc);animation:rtBeat 1.8s ease-in-out infinite}
-.rt-node.on .rt-q{color:var(--tx2)}
-.rt-link{flex:0 0 26px;align-self:center;position:relative;height:2px;background:var(--bd2);border-radius:2px}
-.rt-fill{position:absolute;inset:0;width:0;background:var(--bull);border-radius:2px;transition:width .5s ease}
-.rt-link.done .rt-fill{width:100%}
-.rt-pulse{position:absolute;top:50%;left:0;width:6px;height:6px;margin-top:-3px;border-radius:50%;background:var(--acc);box-shadow:0 0 8px var(--acc);opacity:0}
-.rt-link.into .rt-pulse{animation:rtFlowDot 1.4s linear infinite}
-.rt-bar{height:2px;background:var(--bd);border-radius:2px;margin:14px 0 18px;overflow:hidden}
-.rt-bar i{display:block;height:100%;width:0;background:var(--acc)}
-.rt-bar i.run{animation:rtTimer linear forwards}
-.rt-panel{display:none;background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:18px 20px;max-width:820px}
-.rt-panel.on{display:block;animation:rtPanel .35s ease}
-.rt-ph{display:flex;align-items:flex-start;gap:12px;margin-bottom:12px}
-.rt-step{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
-.rt-pt{font-size:15px;font-weight:600;color:var(--tx);margin-top:3px}
-.rt-open{margin-left:auto;flex-shrink:0;background:none;border:1px solid var(--bd2);color:var(--tx2);font-family:var(--mono);font-size:10px;padding:6px 12px;border-radius:5px;cursor:pointer}
-.rt-open:hover{color:var(--tx);border-color:var(--acc)}
-.rt-leave{display:flex;gap:10px;align-items:baseline;font-size:12px;color:var(--tx);background:var(--bull-bg);border:1px solid #1a4020;border-radius:6px;padding:8px 12px;margin-bottom:6px}
-.rt-leave span{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--bull);flex-shrink:0}
-.rt-nav{display:flex;justify-content:space-between;margin-top:14px}
-.rt-nav button{background:none;border:none;color:var(--tx3);font-family:var(--mono);font-size:11px;cursor:pointer;padding:4px 0}
-.rt-nav button:hover{color:var(--tx)}
-.rt-nav button:disabled{visibility:hidden}
-@keyframes rtIn{to{opacity:1;transform:none}}
-@keyframes rtBeat{0%,100%{box-shadow:0 0 0 0 rgba(240,96,138,.45)}50%{box-shadow:0 0 0 6px rgba(240,96,138,0)}}
-@keyframes rtFlowDot{0%{left:0;opacity:0}15%{opacity:1}85%{opacity:1}100%{left:calc(100% - 6px);opacity:0}}
-@keyframes rtTimer{from{width:0}to{width:100%}}
-@keyframes rtPanel{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-@media (max-width:860px){
-  .rt-flow{flex-direction:column}
-  .rt-link{flex:0 0 18px;width:2px;height:auto;margin-left:26px;align-self:flex-start}
-  .rt-link.done .rt-fill{width:100%;height:100%}
-  .rt-fill{width:100%;height:0;transition:height .5s ease}
-  .rt-link.into .rt-pulse{animation-name:rtFlowDotV}
-  .rt-hdr{flex-wrap:wrap}
-}
-@keyframes rtFlowDotV{0%{top:0;left:-2px;opacity:0}15%{opacity:1}85%{opacity:1}100%{top:100%;left:-2px;opacity:0}}
-@media (prefers-reduced-motion:reduce){
-  .rt-node{animation:none;opacity:1;transform:none}
-  .rt-node.on .rt-dot,.rt-link.into .rt-pulse,.rt-panel.on{animation:none}
-  .rt-fill{transition:none}
-}
 .rule{display:flex;gap:12px;padding:11px 0;border-bottom:1px solid var(--bd)}
 .rule:last-child{border-bottom:none}
 .rule-n{font-family:var(--mono);font-size:10px;color:var(--acc);flex-shrink:0;width:22px;padding-top:2px}
@@ -2327,22 +2249,11 @@ tbody tr{animation:ri .3s var(--eout) both}
 .sig-ftab{padding:5px 12px;background:var(--sf);border:1px solid var(--bd2);color:var(--tx3);font-family:var(--mono);font-size:10px;font-weight:600;border-radius:4px;cursor:pointer;transition:all .15s}
 .sig-ftab:hover{color:var(--tx2);border-color:var(--tx3)}
 .sig-ftab.active{background:var(--sf3);color:var(--tx);border-color:var(--acc)}
-.sig-list{display:flex;flex-direction:column;gap:8px}
-.srow{display:grid;grid-template-columns:132px 165px 120px 60px 96px 116px 1fr;align-items:center;gap:10px;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:12px 14px;transition:border-color .15s}
-.srow:hover{border-color:var(--bd2)}
-.srow.dim{opacity:.5}
-.srow-pair{display:flex;flex-direction:column;gap:3px}
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px}
 ::-webkit-scrollbar-thumb:hover{background:var(--tx3)}
-#pg-movers.active{display:block;overflow-y:auto;padding:24px}
-#pg-movers{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
 
-.mv-thin{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--tx2);cursor:pointer;user-select:none}
-.mv-thin input{accent-color:var(--fresh)}
-.mv-sep td{background:var(--fresh-bg);color:var(--fresh);font-family:var(--mono);font-size:10px;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid #4a3500}
-.thin-badge{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500;white-space:nowrap}
 
 /* ── Calendar ── */
 #pg-calendar.active{display:block;overflow-y:auto;padding:24px}
@@ -2387,17 +2298,11 @@ tbody tr{animation:ri .3s var(--eout) both}
 .cal-out:hover{color:var(--acc);border-bottom-color:var(--acc)}
 .cal-day-hdr{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:12px}
 .cal-day-hdr .dash-sec-ttl{margin:0}
-.mrank{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;border-radius:5px;background:var(--sf3);border:1px solid var(--bd2);font-family:var(--mono);font-size:10px;font-weight:700;color:var(--tx3)}
-.mrank.top{background:var(--acc);border-color:var(--acc);color:#000}
 .mf-vol{background:#2D1F06;color:#FBBF24;border:1px solid #4a3500}
 .mf-rng{background:#1B1030;color:#C4A0FF;border:1px solid #3A2A5A}
 .mf-hi{background:var(--bull-bg);color:var(--bull);border:1px solid #1a4020}
 .mf-lo{background:var(--bear-bg);color:var(--bear);border:1px solid #4a1a22}
 .mf-move{background:#0F2A3A;color:#7DD3FC;border:1px solid #1F4A66}
-.mpos{position:relative;width:88px;height:5px;background:var(--sf3);border-radius:3px}
-.mpos i{position:absolute;top:-3px;width:3px;height:11px;border-radius:2px;background:var(--tx);transform:translateX(-1px)}
-.mlv{font-family:var(--mono);font-size:10px;color:var(--tx2);white-space:nowrap;line-height:1.6}
-.mlv small{color:var(--tx3);font-size:9px}
 </style>
 </head>
 <body>
@@ -2407,13 +2312,8 @@ tbody tr{animation:ri .3s var(--eout) both}
   <span class="t-logo">MACD&middot;DIV</span>
   <div class="t-div"></div>
   <nav class="nav">
-    <button class="nav-btn active" data-pg="dash">Dashboard</button>
-    <button class="nav-btn" data-pg="scan">Scanner</button>
-    <button class="nav-btn" data-pg="signals">Signals</button>
-    <button class="nav-btn" data-pg="watch">Watchlist</button>
-    <button class="nav-btn" data-pg="movers">Movers</button>
+    <button class="nav-btn active" data-pg="scan">Scan</button>
     <button class="nav-btn" data-pg="calendar">Calendar</button>
-    <button class="nav-btn" data-pg="routine">Routine</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
   <div class="t-right">
@@ -2422,39 +2322,10 @@ tbody tr{animation:ri .3s var(--eout) both}
   </div>
 </header>
 
-<div id="pg-dash" class="page active">
-  <div id="dash-loader" style="display:flex;align-items:center;justify-content:center;height:180px;color:var(--tx3);font-family:var(--mono);font-size:12px">Loading last scan...</div>
-  <div id="dash-content" style="display:none">
-    <div class="kpi-row">
-      <div class="kpi"><div class="kpi-lbl">Live setups</div><div class="kpi-val" id="kpi-live">-</div><div class="kpi-sub" id="kpi-live-sub">Stop not yet taken out</div></div>
-      <div class="kpi"><div class="kpi-lbl">Regular bullish</div><div class="kpi-val" id="kpi-bull" style="color:var(--bull)">-</div><div class="kpi-sub">Reversal up</div></div>
-      <div class="kpi"><div class="kpi-lbl">Regular bearish</div><div class="kpi-val" id="kpi-bear" style="color:var(--bear)">-</div><div class="kpi-sub">Reversal down</div></div>
-      <div class="kpi"><div class="kpi-lbl">Pairs analysed</div><div class="kpi-val" id="kpi-scan">-</div><div class="kpi-sub" id="kpi-scan-sub">No scan yet</div></div>
-    </div>
-    <div id="scan-audit" class="audit"></div>
-    <div class="cal-strip" id="dash-cal" style="display:none"></div>
-    <div class="dash-sec">
-      <div class="dash-sec-ttl">Freshest setups &mdash; newest pivots, stop intact</div>
-      <div class="ready-grid" id="ready-grid"></div>
-    </div>
-    <div class="dash-sec">
-      <div class="dash-sec-ttl">All live signals from the last scan (sorted by setup score)</div>
-      <div class="sig-list" id="dash-sig-list"></div>
-    </div>
-  </div>
-</div>
-
-<div id="pg-scan" class="page">
+<div id="pg-scan" class="page active">
   <aside class="sb">
     <div class="ss"><div class="fl">Exchange</div>
       <select id="exchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select></div>
-
-    <div class="ss"><div class="fl">Timeframe</div>
-      <div class="trow" id="tfG">
-        <button class="tbtn active" data-val="4h">4H</button>
-        <button class="tbtn" data-val="1d">1D</button>
-      </div>
-      <div class="hint">1D pivots are wider and cleaner &mdash; usually the better fit for a week-long hold.</div></div>
 
     <div class="ss"><div class="fl">Minimum weekly volume ($M)</div>
       <div class="nw"><button class="nb" onclick="stepVol(-10)">-</button><input type="number" id="minVol" value="__DEFAULT_VOL_M__" min="5" max="2000" step="10"><button class="nb" onclick="stepVol(10)">+</button></div>
@@ -2464,7 +2335,6 @@ tbody tr{animation:ri .3s var(--eout) both}
 
     <div class="ss"><div class="fl">Detection strictness</div>
       <div class="trow" id="strG">
-        <button class="tbtn" data-val="loose">Loose</button>
         <button class="tbtn active" data-val="balanced">Balanced</button>
         <button class="tbtn" data-val="strict">Strict</button>
       </div>
@@ -2504,19 +2374,23 @@ tbody tr{animation:ri .3s var(--eout) both}
       <div class="lpair" id="lpair">Loading markets...</div>
       <div class="llbl">Scanning for divergences</div>
     </div>
+    <div class="cal-strip" id="dash-cal" style="display:none;margin:10px 16px 0"></div>
     <div class="rbar">
-      <span class="rtitle">Signals</span>
+      <span class="rtitle">Divergences</span>
       <span class="spill sbull" id="stBull">&#9650; <span class="num" id="cBull">0</span> bullish</span>
       <span class="spill sbear" id="stBear">&#9660; <span class="num" id="cBear">0</span> bearish</span>
-      <span class="spill sfresh" id="stFresh">&#9889; <span class="num" id="cFresh">0</span> fresh</span>
+      <span class="spill sfresh" id="stEnter">&#9889; <span class="num" id="cEnter">0</span> enter now</span>
       <div class="fbar">
-        <button class="ftab active" data-f="live" onclick="setF(this)">Live</button>
-        <button class="ftab" data-f="fresh" onclick="setF(this)">Fresh</button>
+        <button class="ftab active" data-f="live" onclick="setF(this)" title="Everything still worth watching: verdict Enter or Wait.">Live</button>
+        <button class="ftab" data-f="enter" onclick="setF(this)" title="Only rows whose verdict is Enter.">Enter now</button>
         <button class="ftab" data-f="bull" onclick="setF(this)">Bullish</button>
         <button class="ftab" data-f="bear" onclick="setF(this)">Bearish</button>
-        <button class="ftab" data-f="all" onclick="setF(this)">All</button>
+        <button class="ftab" data-f="both" onclick="setF(this)" title="The same side diverging on 4H and 1H at once.">4H+1H</button>
+        <button class="ftab" data-f="all" onclick="setF(this)" title="Includes Skip rows: stopped out, already ran, or too old.">All</button>
       </div>
     </div>
+    <div id="scan-age" class="audit" style="margin:8px 16px 0"></div>
+    <div id="scan-audit" class="audit" style="margin:4px 16px 8px"></div>
     <div class="tw">
       <div class="empty" id="emS">
         <span class="empty-icon">&#9672;</span><span>Run a scan to find divergences</span>
@@ -2524,107 +2398,19 @@ tbody tr{animation:ri .3s var(--eout) both}
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th title="Where price is now relative to the signal. At the signal = still near the pivot. Extended = moved on without the stop or 1R being hit. Ran = reached 1R or better. Invalidated = traded through the stop.">Status</th>
-          <th title="Regular bullish: price makes a lower low while MACD makes a higher low. Regular bearish: price makes a higher high while MACD makes a lower high. Both are counter-trend reversal signatures.">Type</th>
-          <th class="sortable sorted" data-sort="score" title="How textbook the structure is, 0-100: divergence size vs the leg (30) + decisiveness of the price break in ATR terms (15) + pivot spacing (15) + classic side of the MACD zero line (15) + MACD crossing its signal line since the pivot (15) + liquidity (10). Describes the picture. Not a win rate, not backtested.">Setup score &#8595;</th>
-          <th class="sortable" data-sort="vol" title="Rolling 7-day traded value in USD, measured from the candles. The liquidity gate.">Weekly vol</th>
-          <th class="sortable" data-sort="age" title="Time of pivot B, the bar that completed the divergence. FRESH = it completed within the last few bars of this timeframe.">Signal date</th>
-          <th title="Just past pivot B (its low for bullish, its high for bearish) plus an ATR-sized buffer. Price trading through it means the divergence has failed. Risk = stop distance as a % of the entry reference.">Stop</th>
-          <th title="Multiples of the stop distance. Anchored to the signal price while the setup is still near it; re-anchored to the live price once it has run, because if you enter now your risk is measured from now.">Targets (1R / 2R / 3R)</th>
+          <th title="A checklist, not a prediction. ENTER: second pivot is recent, price is within 2% of the signal, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on the 4H signal when there is one, else the 1H.">Entry</th>
+          <th title="Regular bullish: price makes a lower low while the MACD line makes a higher low. Regular bearish: price makes a higher high while the MACD line makes a lower high. The tags show which timeframes diverge; 4H+1H agreeing sorts first.">Side &middot; TF</th>
+          <th title="Not part of the verdict. Movers tags describe the last completed day against this coin's own 20-day baseline. OI tags describe 7-day open-interest flow and funding. Hover a tag for its definition.">Context</th>
+          <th class="sortable sorted" data-sort="score" title="Default order: Enter, then Wait, then Skip; within each, 4H+1H first, then setup score. The score is how textbook the structure is, 0-100. Not a win rate, not backtested.">Setup score &#8595;</th>
+          <th class="sortable" data-sort="vol" title="Rolling 7-day traded value in USD, measured from the 4H candles. The liquidity gate.">Weekly vol</th>
+          <th class="sortable" data-sort="age" title="Time of pivot B, the bar that completed the divergence, on the row's main timeframe.">Signal date</th>
+          <th title="Just past pivot B plus an ATR-sized buffer. Price trading through it means the divergence has failed. Risk = stop distance as a % of the entry reference.">Stop</th>
+          <th title="Multiples of the stop distance. Anchored to the signal price while the setup is still near it; re-anchored to the live price once it has run.">Targets (1R / 2R / 3R)</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
     </div>
   </main>
-</div>
-
-<div id="pg-signals" class="page">
-  <div class="sig-hdr">
-    <div><div class="sig-ttl">Signals</div><div class="sig-sub" id="sig-sub">Run a scan first</div></div>
-  </div>
-  <div class="sig-filters">
-    <button class="sig-ftab active" data-sf="live" onclick="setSF(this)">Live</button>
-    <button class="sig-ftab" data-sf="fresh" onclick="setSF(this)">Fresh</button>
-    <button class="sig-ftab" data-sf="active" onclick="setSF(this)">At the signal</button>
-    <button class="sig-ftab" data-sf="bull" onclick="setSF(this)">Bullish</button>
-    <button class="sig-ftab" data-sf="bear" onclick="setSF(this)">Bearish</button>
-    <button class="sig-ftab" data-sf="all" onclick="setSF(this)">All</button>
-  </div>
-  <div class="sig-list" id="sigList"><div class="no-sig">No signals yet - run a scan.</div></div>
-</div>
-
-<div id="pg-watch" class="page">
-  <div class="sig-hdr">
-    <div><div class="sig-ttl">Watchlist &mdash; OI flow</div>
-    <div class="sig-sub" id="watch-sub">Where did open interest move over the last 7 days? Uses the Scanner's volume floor and speed.</div></div>
-  </div>
-  <div class="wbar">
-    <select id="wExchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
-    <button class="rbtn" id="wRunBtn" onclick="startWatch()">Scan OI Flow</button>
-    <span class="wprog" id="wProg"></span>
-  </div>
-  <div class="sig-filters">
-    <button class="sig-ftab active" data-wf="all" onclick="setWF(this)">All movers</button>
-    <button class="sig-ftab" data-wf="longs" onclick="setWF(this)">New longs</button>
-    <button class="sig-ftab" data-wf="shorts" onclick="setWF(this)">New shorts</button>
-    <button class="sig-ftab" data-wf="squeeze" onclick="setWF(this)">Squeeze fuel</button>
-    <button class="sig-ftab" data-wf="spot" onclick="setWF(this)">Spot-led</button>
-  </div>
-  <div id="watch-audit" class="audit" style="margin:0 0 12px"></div>
-  <div class="tw" style="overflow:visible">
-    <table id="wT" style="display:none">
-      <thead><tr>
-        <th>Coin</th>
-        <th title="Open interest now vs about __OI_LB__ days ago, in USD. A pair is listed only if this moved at least __OI_MIN__% either way. OI only rises when new positions are opened, which is the whole reason to look.">&Delta;OI 7d</th>
-        <th title="Current open interest in USD. Underneath: OI as a multiple of average daily volume. Above __OI_VOL__x, positions cannot exit without moving the price.">OI now</th>
-        <th title="Close-to-close price change over the same __OI_LB__-day window.">&Delta;Price 7d</th>
-        <th title="Sign of price and OI together. Price up + OI up = NEW LONGS. Price down + OI up = NEW SHORTS. OI falling means positions closing (SHORT COVERING or CAPITULATION), shown dimmed: movement without new conviction. Hover a badge for detail.">Quadrant</th>
-        <th title="Funding rate normalised to % per day (intervals differ per contract). Neutral is about 0.03%/day. Positive = longs pay shorts.">Funding /day</th>
-        <th title="Health read from funding and crowding. Hover a tag for its definition and threshold.">Read</th>
-        <th title="Rolling 7-day traded value in USD. The liquidity gate.">Weekly vol</th>
-      </tr></thead>
-      <tbody id="wB"></tbody>
-    </table>
-    <div class="no-sig" id="wEmpty">No OI scan yet &mdash; hit Scan OI Flow. Sunday is the classic day to look.</div>
-  </div>
-</div>
-
-<div id="pg-movers" class="page">
-  <div class="sig-hdr">
-    <div><div class="sig-ttl">Movers &mdash; daily watchlist</div>
-    <div class="sig-sub" id="mv-sub">Unusual volume, unusual range, or a big day &mdash; measured on completed daily bars. Crypto perps only. Uses the Scanner's volume floor, speed and max-pairs.</div></div>
-  </div>
-  <div class="wbar">
-    <select id="mvExchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
-    <button class="rbtn" id="mvRunBtn" onclick="startMovers()">Scan Movers</button>
-    <label class="mv-thin" title="Also measure coins trading $__MOVER_THIN_M__M a week up to the volume floor. They are listed in their own section and need a volume spike AND range expansion together, since on a thin coin one big order is a volume spike by itself. Expect worse fills, slippage through stops, and wicks that clear stops and snap back: size down."><input type="checkbox" id="mvThin" onchange="mvThinPref()"> Include thin coins ($__MOVER_THIN_M__M+/wk)</label>
-    <span class="wprog" id="mvProg"></span>
-  </div>
-  <div class="sig-filters">
-    <button class="sig-ftab active" data-mf="all" onclick="setMF(this)">All</button>
-    <button class="sig-ftab" data-mf="top" onclick="setMF(this)">Top 4</button>
-    <button class="sig-ftab" data-mf="vol" onclick="setMF(this)">Volume spike</button>
-    <button class="sig-ftab" data-mf="rng" onclick="setMF(this)">Range expansion</button>
-    <button class="sig-ftab" data-mf="hi" onclick="setMF(this)">At range high</button>
-    <button class="sig-ftab" data-mf="lo" onclick="setMF(this)">At range low</button>
-  </div>
-  <div id="mv-audit" class="audit" style="margin:0 0 12px"></div>
-  <div class="tw" style="overflow:visible">
-    <table id="mvT" style="display:none">
-      <thead><tr>
-        <th>#</th><th>Coin</th>
-        <th title="How unusual the day was, 0-100: volume anomaly (35) + range expansion (30) + proximity to a 7-day boundary (20) + size of the move (15). Has no direction. Not a win rate, not backtested.">Standout</th>
-        <th title="Last completed daily bar, close to close. Highlighted at __MOVER_CHG__%+, which is one of the three triggers. The small figure underneath is the live move since that close.">&Delta;1d</th>
-        <th title="Traded value of the last completed day as a multiple of this coin's own 20-day average. __MOVER_VOL__x+ is a trigger. A self-ratio only, never a dollar figure.">Vol vs 20d</th>
-        <th title="True range of the last completed day as a multiple of this coin's own 20-day ATR. __MOVER_RNG__x+ is a trigger.">Range vs ATR20</th>
-        <th title="Where the live price sits between the 7-day low (0%) and the 7-day high (100%).">Position in 7d range</th>
-        <th title="PDH / PDL: prior-day high and low. 7D: the 7-day range boundaries. The levels to plan around, and the point where you are wrong.">Levels</th>
-        <th title="Why this coin is on the list. Any one trigger qualifies. Hover a tag for its definition and threshold.">Read</th>
-      </tr></thead>
-      <tbody id="mvB"></tbody>
-    </table>
-    <div class="no-sig" id="mvEmpty">No movers scan yet &mdash; hit Scan Movers.</div>
-  </div>
 </div>
 
 <div id="pg-calendar" class="page">
@@ -2660,22 +2446,6 @@ tbody tr{animation:ri .3s var(--eout) both}
       </table>
       <div class="no-sig" id="calEmpty">Nothing scheduled.</div>
     </div>
-  </div>
-</div>
-
-<div id="pg-routine" class="page" style="overflow-y:auto;padding:24px">
-  <div class="rt-hdr">
-    <div><div class="sig-ttl">Daily routine</div>
-    <div class="sig-sub">Once a day after the daily close, left to right, about fifteen minutes. Each step narrows the list the next one works on. Click a step, or press play.</div></div>
-    <button class="rt-play" id="rtPlay" onclick="rtToggle()"><span id="rtPlayIco">&#9654;</span> <span id="rtPlayTxt">Play</span></button>
-  </div>
-  <div class="rt-flow" id="rtFlow"><button class="rt-node" data-i="0" onclick="rtGo(0, true)" style="--d:0ms"><span class="rt-dot">0</span><span class="rt-name">Prep</span><span class="rt-q">Is it time, and is anything scheduled?</span><span class="rt-meta"><span>2 min</span><span class="rt-cnt">08:00&ndash;10:00 PHT</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="1" onclick="rtGo(1, true)" style="--d:90ms"><span class="rt-dot">1</span><span class="rt-name">Movers</span><span class="rt-q">What did something unusual yesterday?</span><span class="rt-meta"><span>3 min</span><span class="rt-cnt">~400 pairs &rarr; ~40&ndash;80</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="2" onclick="rtGo(2, true)" style="--d:180ms"><span class="rt-dot">2</span><span class="rt-name">Scanner</span><span class="rt-q">Where does momentum disagree with price?</span><span class="rt-meta"><span>5 min</span><span class="rt-cnt">&rarr; a handful of setups</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="3" onclick="rtGo(3, true)" style="--d:270ms"><span class="rt-dot">3</span><span class="rt-name">Watchlist</span><span class="rt-q">Is new money behind it?</span><span class="rt-meta"><span>2 min</span><span class="rt-cnt">same names, qualified</span></span></button><div class="rt-link" aria-hidden="true"><i class="rt-fill"></i><i class="rt-pulse"></i></div><button class="rt-node" data-i="4" onclick="rtGo(4, true)" style="--d:360ms"><span class="rt-dot">4</span><span class="rt-name">Shortlist</span><span class="rt-q">What will I actually trade today?</span><span class="rt-meta"><span>2 min</span><span class="rt-cnt">3&ndash;5 names</span></span></button></div>
-  <div class="rt-bar" aria-hidden="true"><i id="rtTimer"></i></div>
-  <div class="rt-detail"><div class="rt-panel" data-i="0"><div class="rt-ph"><div><div class="rt-step">Step 0 of 4</div><div class="rt-pt">Prep &mdash; Is it time, and is anything scheduled?</div></div><button class="rt-open" onclick="showPg('calendar')">Open Calendar &rarr;</button></div><div class="rt-leave"><span>You leave with</span>the right time, one exchange, and a clear calendar window</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run after the daily close.</b> Perp daily candles close at 00:00 UTC, which is 08:00 Manila. Every scan reads the last <b>completed</b> daily bar, so a run at 07:00 Manila still describes the day before yesterday. Aim for 08:00 to 10:00 Manila.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Pick the exchange with the deepest book.</b> Binance carries the most volume on most pairs. Some majors trade thinly on other venues and get volume-rejected there for no chart reason. Each tab has its own exchange dropdown; keep them the same.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One volume floor for everything.</b> The Min 7-day volume box on the Scanner tab applies to all three scans. Default is $70M a week, about $10M a day. If a coin you expected is missing, check the audit line under the table before assuming there was no setup.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Read the audit line every time.</b> It says how many pairs were scanned, volume-rejected, errored, and whether the run finished. A short list from an unfinished scan is not a quiet market.</div></div><div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Check the Calendar tab.</b> A fresh entry sized into a CPI or FOMC print is a coin flip, not a setup. If the next market mover is inside 24 hours, wait for it or size for it. The Dashboard strip shows the countdown.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="1"><div class="rt-ph"><div><div class="rt-step">Step 1 of 4</div><div class="rt-pt">Movers &mdash; What did something unusual yesterday?</div></div><button class="rt-open" onclick="showPg('movers')">Open Movers &rarr;</button></div><div class="rt-leave"><span>You leave with</span>extended runs, breakdowns, and the levels they sit against</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Scan Movers, keep the All filter, read by score.</b> Top 4 is a shortcut, not the list. The score ranks how unusual the day was and how close price sits to a 7-day boundary. It has no direction.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Extended runs are the rows flagged ABOVE 7D HIGH or AT RANGE HIGH with a big 1-day change.</b> These names have already run for days. Treat them as fade-or-wait candidates, not chases, until the Scanner shows a bearish divergence or price gives back the prior-day low.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Breakdowns are the mirror.</b> BELOW 7D LOW or AT RANGE LOW with a big negative day. Same logic, other side.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Levels come with the row.</b> PDH and PDL are yesterday's high and low, the 7D range is the box price is in, and the position bar shows where in that box it sits now. Write the level down; that is the part a watchlist poster leaves out.</div></div><div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Thin coins are opt-in.</b> Tick Include thin coins to see $20M&ndash;$70M/week names in their own section. They only show on a volume spike and a wide day together. Worse fills, stops that slip: size down or skip.</div></div><div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Known blind spot.</b> A coin that had a quiet day is dropped even if it is sitting in a clean consolidation after a breakout. Movers will not show you the pullback. The Scanner does.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="2"><div class="rt-ph"><div><div class="rt-step">Step 2 of 4</div><div class="rt-pt">Scanner &mdash; Where does momentum disagree with price?</div></div><button class="rt-open" onclick="showPg('scan')">Open Scanner &rarr;</button></div><div class="rt-leave"><span>You leave with</span>pullback longs and fade candidates, each with a stop and 1R / 2R / 3R</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Run 4H on Balanced.</b> Loose finds more and most of it is junk. Strict adds the zero-line rule and misses real setups. Balanced is the default for a reason.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>On the Signals tab, look at Fresh first, then At the signal.</b> Fresh means the second pivot formed within the last 12 bars, two days on 4H. At the signal means price is still within about 2% of where the divergence completed. Those two filters are your entry candidates.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Ran and invalidated are history.</b> Ran means the move already happened. Invalidated means price traded through the stop. Neither is an entry.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Bullish rows are your pullback candidates.</b> A regular bullish divergence on 4H during a dip is the structural version of a first pullback after the impulse, usually a few days before it gets posted.</div></div><div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Bearish rows on extended names are your fade candidates.</b> A name at its range high in Movers with a fresh bearish divergence here is the only version of shorting the run this screener will vouch for.</div></div><div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Then 1D for context.</b> Fresh on 1D means within 3 bars. A 4H setup that agrees with a 1D one is worth more than either alone.</div></div><div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Symbols override for a specific name.</b> Type tickers into the Symbols box to scan only those. The volume floor is skipped for an override.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="3"><div class="rt-ph"><div><div class="rt-step">Step 3 of 4</div><div class="rt-pt">Watchlist &mdash; Is new money behind it?</div></div><button class="rt-open" onclick="showPg('watch')">Open Watchlist &rarr;</button></div><div class="rt-leave"><span>You leave with</span>each name tagged spot-led, crowded, or squeeze fuel</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Qualify names here, do not hunt for them.</b> This tab is ranked by 7-day open-interest change and reads best on a Sunday. Use it to check the names you already have.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>For an extended run you want NEW LONGS with SPOT-LED.</b> Price up, OI up, funding near zero: the run is being bought in spot. CROWDED LONGS is the same picture with latecomer leverage paying rich funding. A fade gets stronger with CROWDED, weaker with SPOT-LED.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>For a breakdown, NEW SHORTS with SQUEEZE FUEL is the warning.</b> Shorts crowded and paying deeply negative funding can be squeezed. A pullback long into that is a better trade than a short.</div></div><div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL means nobody can leave quietly.</b> Expect violent moves either way. Size down.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div><div class="rt-panel" data-i="4"><div class="rt-ph"><div><div class="rt-step">Step 4 of 4</div><div class="rt-pt">Shortlist &mdash; What will I actually trade today?</div></div></div><div class="rt-leave"><span>You leave with</span>a level, a stop and a target for every name, before the session starts</div><div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Three to five names, no more.</b> Two buckets. <b>Extended</b>: wait for a fade signal or a reclaim. <b>Pullback</b>: a fresh bullish divergence or a hold of the prior-day low.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Each name gets a level, a stop and a target.</b> From Movers: PDH, PDL, the 7D range. From the Scanner: the stop price and the 1R, 2R, 3R levels. If you cannot fill those in, the name is not a setup, it is a ticker.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Scores rank, they do not predict.</b> Both scores describe structure. Neither is a backtested win rate. A 90 is a clean picture, not a promise.</div></div></div><div class="rt-nav"><button class="rt-prev" onclick="rtGo(rtCur - 1, true)">&larr; Back</button><button class="rt-next" onclick="rtGo(rtCur + 1, true)">Next step &rarr;</button></div></div></div>
-
-  <div class="dash-sec" style="margin-top:30px">
-    <div class="dash-sec-ttl">If something looks wrong</div>
-    <div class="rules"><div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Partial scan warning.</b> The tab was closed mid-run or the exchange rate-limited it. Re-run at the Safe speed before trusting the table.</div></div><div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>A ticker says NOT LISTED.</b> The exchange you chose does not carry that perp. Try another exchange.</div></div><div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Nothing fresh anywhere.</b> Normal in a one-way market: regular divergences need a trend extreme to argue with. Movers still works on those days.</div></div></div>
   </div>
 </div>
 
@@ -2752,26 +2522,23 @@ tbody tr{animation:ri .3s var(--eout) both}
   </div>
 
   <div class="dash-sec" style="margin-top:28px">
-    <div class="dash-sec-ttl">Watchlist &mdash; how to read OI flow</div>
+    <div class="dash-sec-ttl">Entry verdict &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>OI only rises when new money opens positions.</b> Volume can churn forever between the same hands; open interest cannot. A 7-day OI build means someone is deliberately positioning &mdash; that is the whole reason the Sunday check works.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>The quadrant is price and OI together.</b> Price up + OI up = new longs (real trend). Price down + OI up = new shorts (real downtrend, or a squeeze being loaded). Price up + OI <i>down</i> is just short covering, and both-down is longs capitulating &mdash; those rows are shown dimmed because they are movement without new conviction.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Funding is the lie detector.</b> Normalised to %/day (intervals differ per contract). New longs with funding near zero or negative = spot buyers leading while shorts fight it &mdash; <b>SPOT-LED</b>, the healthy version. The same picture with rich positive funding = leverage arriving late &mdash; <b>CROWDED LONGS</b>. New shorts paying deeply negative funding = <b>SQUEEZE FUEL</b>.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Fresh listings are excluded on purpose.</b> A new contract's OI always ramps from zero, which looks like a monster build and means nothing. Pairs with under ~6 days of OI history are skipped and counted in the audit line instead of silently shown.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>HIGH OI/VOL is a crowding warning, not a direction.</b> When open interest exceeds ~1.5x average daily volume, positions cannot exit without moving the price &mdash; fuel for squeezes in either direction.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>ENTER means five things are true at scan time.</b> The second pivot is within the last 12 bars, price is within 2% of the signal price, the stop has not been touched, the MACD line has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. It does not mean the trade works.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>WAIT names the one thing missing.</b> A pullback to the signal price after price ran, the MACD cross, or a CPI / FOMC-class print that is too close. A divergence is listed as WAIT as soon as its second pivot is confirmed, so you see it before it is enterable.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>SKIP is history.</b> The stop was hit, the move already made 1R or more, or the second pivot is older than 12 bars. These rows only appear under the All filter.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The verdict ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old, one full 1H bar has closed since, the verdicts dim and the page asks for a re-run.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags, sorts first, and takes its verdict, stop and targets from the 4H signal. Click a row for each timeframe's pivots and levels.</div></div>
     </div>
   </div>
 
   <div class="dash-sec" style="margin-top:28px">
-    <div class="dash-sec-ttl">Movers &mdash; what a daily watchlist is actually screening for</div>
+    <div class="dash-sec-ttl">Context tags &mdash; what else is true about this coin</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Three triggers, any one qualifies.</b> A 1-day move of 5%+, <i>or</i> the day's traded value at 2x its own 20-day average, <i>or</i> the day's true range at 1.5x ATR20. A coin only has to be unusual in one way to be worth a look.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Volume and range beat raw % change.</b> Sorting the market by 24h gainers is the lazy version of this screen: it surfaces whatever already moved and misses a dormant coin waking up on 3x volume. Both ratios are measured against each coin's <b>own</b> 20-day baseline, so a quiet large-cap and a volatile micro-cap are judged on the same scale.</div></div>
-      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Volume is only ever a self-ratio.</b> The OHLCV volume column means different things per exchange &mdash; coins, contracts, or quote currency. Comparing one coin's day against its own average divides that unknown factor out; comparing dollar amounts across venues would not.</div></div>
-      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Every row arrives with levels.</b> Prior-day high and low, the 7-day range boundaries, and where price sits inside that range right now. A watchlist without a level and a point where you are wrong is a list of names, not a plan &mdash; and that is the part these posts usually leave out.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Completed bars only.</b> The scan describes the last <b>closed</b> day, so it reads the same at 02:00 and at 22:00. It tells you what happened yesterday so you can plan today; it is not a live intraday tape.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>No stocks, ETFs or commodities.</b> Those perps are excluded from the universe entirely. Their underlying market closes at the weekend, leaving a thin book, funding-driven drift and a gap at the Monday cash open &mdash; quoting a weekend level on one is quoting a level on nothing.</div></div>
-      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>The standout score is a description, not an edge.</b> Volume anomaly (35), range expansion (30), proximity to a 7-day boundary (20), size of the move (15). It has no direction and has not been backtested &mdash; the same caveat as the setup score.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Context never changes the verdict.</b> It is fetched only for coins that already have a divergence, and it is yours to weigh.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Movers tags describe the last completed day.</b> VOLUME SPIKE and RANGE EXPANSION are measured against the coin's own 20-day baseline, BIG MOVE is a 5%+ day, and the range tags say price is at or through its 7-day high or low. A bearish divergence AT RANGE HIGH is the textbook fade; the same divergence mid-range is weaker.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>OI tags describe 7-day positioning.</b> Price and open interest together give the quadrant: NEW LONGS, NEW SHORTS, SHORT COVERING, CAPITULATION. Funding refines it: SPOT-LED is the healthy version of new longs, CROWDED LONGS is leverage arriving late, SQUEEZE FUEL is shorts crowded and paying. No OI tag means open interest moved less than 5% or the contract is too new to judge.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL is a crowding warning, not a direction.</b> Open interest above about 1.5x average daily volume means positions cannot exit without moving the price. Size down.</div></div>
     </div>
   </div>
 
@@ -2796,7 +2563,6 @@ tbody tr{animation:ri .3s var(--eout) both}
 
 <script>
 var TFM = __TF_CFG_JSON__;
-var cTf = '4h';
 
 var SC = {
   active:      {icon:'&#9679;',  lbl:'At the signal', sub:'Price still near the pivot', cls:'st-active'},
@@ -2805,18 +2571,6 @@ var SC = {
   invalidated: {icon:'&#10005;', lbl:'Invalidated',   sub:'Traded through the stop', cls:'st-invalidated'}
 };
 
-function sbadge(d){
-  var c = SC[d.status] || SC.active;
-  var sub = c.sub;
-  // pct_chg is the move IN THE SIGNAL'S DIRECTION, not the raw price change:
-  // on a short, price falling 3% is pct_chg +3. Label it so a green +3% next
-  // to a bearish setup cannot be misread as price having gone up.
-  if(d.status === 'extended') sub = 'Moved ' + d.pct_chg + '% in signal direction';
-  else if(d.status === 'ran') sub = 'Made ' + d.r_reached + 'R since signal';
-  else if(d.status === 'active') sub = (d.pct_chg >= 0 ? '+' : '') + d.pct_chg + '% in signal direction';
-  return '<div class="status ' + c.cls + '"><span class="tlbl">' + c.icon + ' ' + c.lbl + '</span>' +
-         '<span class="tsub">' + sub + '</span></div>';
-}
 function qcolor(q){ return q >= 70 ? 'var(--bull)' : q >= 50 ? 'var(--fresh)' : 'var(--tx3)'; }
 function qcell(q){
   var c = qcolor(q), lbl = q >= 70 ? 'HIGH' : q >= 50 ? 'MED' : 'LOW';
@@ -2840,9 +2594,6 @@ function fmtVol(v){
 function volCell(d){
   return '<div class="volc">' + fmtVol(d.weekly_volume) + '<small>7 days</small></div>';
 }
-function freshTag(d){
-  return d.fresh ? ' <span class="bdg bx" style="font-size:8px;padding:2px 5px">FRESH</span>' : '';
-}
 function b2t(bars, tf){
   var m = bars * ((TFM[tf] && TFM[tf].minutes) || 240);
   if(m < 60) return m + 'm ago';
@@ -2851,15 +2602,48 @@ function b2t(bars, tf){
   return d + (d === 1 ? ' day' : ' days') + ' ago';
 }
 
-function matches(d, f){
-  if(f === 'all')    return true;
-  if(f === 'live')   return d.status !== 'invalidated';
-  if(f === 'fresh')  return d.fresh && d.status !== 'invalidated';
-  if(f === 'active') return d.status === 'active';
-  if(f === 'bull')   return d.side === 'bullish' && d.status !== 'invalidated';
-  if(f === 'bear')   return d.side === 'bearish' && d.status !== 'invalidated';
+var EV = {
+  enter: {lbl:'&#10003; ENTER', cls:'ev-enter'},
+  wait:  {lbl:'&#9203; WAIT',   cls:'ev-wait'},
+  skip:  {lbl:'&#10005; SKIP',  cls:'ev-skip'}
+};
+var EV_RANK = {enter:0, wait:1, skip:2};
+function verdict(r){ return (r.entry && r.entry.verdict) || 'skip'; }
+function primary(r){ return r.signals[r.tfs[0]]; }
+
+function matches(r, f){
+  var v = verdict(r);
+  if(f === 'all')   return true;
+  if(f === 'live')  return v !== 'skip';
+  if(f === 'enter') return v === 'enter';
+  if(f === 'bull')  return r.side === 'bullish' && v !== 'skip';
+  if(f === 'bear')  return r.side === 'bearish' && v !== 'skip';
+  if(f === 'both')  return r.tfs.length > 1 && v !== 'skip';
   return true;
 }
+function evCell(r){
+  var e = r.entry || {verdict:'skip', reason:''}, c = EV[e.verdict] || EV.skip;
+  /* the reason can carry a calendar event title from an outside feed */
+  var txt = calEsc(e.reason) + (e.level != null ? ' ' + fmtPx(e.level) : '');
+  return '<div class="ev ' + c.cls + '"><span class="tlbl">' + c.lbl + '</span>' +
+         '<span class="tsub">' + txt + '</span></div>';
+}
+function ctxCell(r){
+  if(r.context_error) return '<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>';
+  var h = [];
+  ((r.mover || {}).flags || []).forEach(function(f){
+    h.push('<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
+  });
+  if(r.flow){
+    h.push('<span class="' + (WQ[r.flow.quadrant] || {cls:'wq'}).cls + '"' + tip(r.flow.quadrant) + '>' + r.flow.quadrant + '</span>');
+    (r.flow.flags || []).forEach(function(f){
+      h.push('<span class="wflag ' + (WFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
+    });
+  }
+  return h.length ? '<div style="display:flex;flex-wrap:wrap;gap:4px;max-width:260px">' + h.join('') + '</div>'
+                  : '<span class="ptm">&mdash;</span>';
+}
+function tfLabel(tf){ return (TFM[tf] && TFM[tf].label) || tf.toUpperCase(); }
 
 /* Every coin the scan did not actually analyse gets named here. The point is
    that "3 live setups" must never be readable as "the market is quiet" when
@@ -2884,140 +2668,13 @@ function showPg(name){
   document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
   document.getElementById('pg-' + name).classList.add('active');
   document.querySelectorAll('.nav-btn').forEach(function(b){ b.classList.toggle('active', b.dataset.pg === name); });
-  if(name === 'dash') loadDash();
-  if(name === 'signals') loadSignals();
-  if(name === 'watch') loadWatch();
-  if(name === 'movers') loadMovers();
   if(name === 'calendar') loadCalendar();
-  if(name !== 'routine') rtStop();
 }
 document.querySelectorAll('.nav-btn').forEach(function(b){
   b.addEventListener('click', function(){ showPg(b.dataset.pg); });
 });
 
-/* ── Dashboard ────────────────────────────────────────────────────────────── */
-function loadDash(){
-  fetch('/signals').then(function(r){ return r.json(); })
-    .then(renderDash)
-    .catch(function(){ document.getElementById('dash-loader').textContent = 'Failed to load data.'; });
-}
-
-function renderDash(sd){
-  document.getElementById('dash-loader').style.display = 'none';
-  document.getElementById('dash-content').style.display = 'block';
-  var sigs = sd.signals || [], meta = sd.meta || {}, ts = sd.ts;
-  cTf = meta.tf || '4h';
-
-  var live = sigs.filter(function(s){ return s.status !== 'invalidated'; });
-  document.getElementById('kpi-live').textContent = live.length;
-  document.getElementById('kpi-bull').textContent = live.filter(function(s){ return s.side === 'bullish'; }).length;
-  document.getElementById('kpi-bear').textContent = live.filter(function(s){ return s.side === 'bearish'; }).length;
-  document.getElementById('kpi-scan').textContent = meta.scanned || '-';
-  document.getElementById('kpi-live-sub').textContent = sigs.length + ' total incl. invalidated';
-
-  if(ts){
-    var ma = Math.round((Date.now() - new Date(ts)) / 60000);
-    var tflbl = (TFM[cTf] && TFM[cTf].label) || cTf.toUpperCase();
-    document.getElementById('kpi-scan-sub').textContent =
-      tflbl + ' · ' + (meta.exchange || '').toUpperCase() + ' · ' + ma + ' min ago';
-  }
-  document.getElementById('scan-audit').innerHTML = auditLine(meta);
-
-  var fresh = live.filter(function(s){ return s.fresh; })
-                  .sort(function(a,b){ return b.score - a.score; }).slice(0, 9);
-  var rg = document.getElementById('ready-grid');
-  if(fresh.length === 0){
-    rg.innerHTML = '<div class="no-sig" style="grid-column:1/-1">No fresh setups in the last scan.</div>';
-  } else {
-    rg.innerHTML = '';
-    fresh.forEach(function(s){ rg.appendChild(mkCard(s)); });
-  }
-
-  var list = document.getElementById('dash-sig-list');
-  list.innerHTML = '';
-  if(live.length === 0){
-    list.innerHTML = '<div class="no-sig">Run a scan from the Scanner tab.</div>';
-  } else {
-    live.sort(function(a,b){ return b.score - a.score; })
-        .forEach(function(s){ list.appendChild(mkRow(s)); });
-  }
-}
-
-function mkCard(s){
-  var c = SC[s.status] || SC.active;
-  var isBull = s.side === 'bullish';
-  var qc = qcolor(s.score);
-  var tgt = s.targets || {};
-  var div = document.createElement('div');
-  div.className = 'sig-card';
-  div.innerHTML =
-    '<div class="sc-timing ' + c.cls + '">' + c.icon + ' ' + c.lbl + '</div>' +
-    '<div class="sc-body">' +
-      '<div class="sc-header"><span class="sc-pair">' + s.base + '</span>' +
-        '<span class="bdg ' + (isBull ? 'bb' : 'br') + '" style="font-size:9px">' + s.type + '</span>' + freshTag(s) + '</div>' +
-      '<div class="sc-meta">' +
-        '<div><div class="sml">Weekly volume</div><div class="smv">' + fmtVol(s.weekly_volume) + '</div></div>' +
-        '<div><div class="sml">In signal direction</div><div class="smv ' + (s.pct_chg >= 0 ? 'bull' : 'bear') + '">' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% <span style="color:var(--tx3);font-size:9px">(px ' + (s.price_chg_pct >= 0 ? '+' : '') + s.price_chg_pct + '%)</span></div></div>' +
-        '<div><div class="sml">Signal date</div><div class="smv" style="font-size:9px">' + s.pivot2_time + '</div></div>' +
-        '<div><div class="sml">3R target</div><div class="smv ' + (isBull ? 'bull' : 'bear') + '">' + fmtPx(tgt['3r']) + '</div></div>' +
-      '</div>' +
-      '<div class="qbar-wrap"><div class="qbar-lbl"><span>Setup score</span><span style="color:' + qc + '">' + s.score + '/100</span></div>' +
-        '<div class="qbar-bg"><div class="qbar-fill" style="width:' + s.score + '%;background:' + qc + '"></div></div></div>' +
-    '</div>';
-  return div;
-}
-
-function mkRow(s){
-  var isBull = s.side === 'bullish';
-  var tgt = s.targets || {};
-  var div = document.createElement('div');
-  div.className = 'srow' + (s.status === 'invalidated' ? ' dim' : '');
-  div.innerHTML =
-    '<div class="srow-pair"><div style="display:flex;align-items:center;gap:5px">' +
-      '<span style="font-family:var(--mono);font-size:14px;font-weight:600;color:var(--tx)">' + s.base + '</span>' + freshTag(s) + '</div>' +
-      '<span style="font-family:var(--mono);font-size:9px;color:var(--tx3)">USDT PERP</span></div>' +
-    '<div>' + sbadge(s) + '</div>' +
-    '<div><span class="bdg ' + (isBull ? 'bb' : 'br') + '">' + s.type + '</span></div>' +
-    '<div>' + qcell(s.score) + '</div>' +
-    '<div>' + volCell(s) + '</div>' +
-    '<div class="ptm">' + s.pivot2_time + '<br>' + b2t(s.bars_ago, s.tf || cTf) + '</div>' +
-    '<div class="tgt-row">' +
-      '<span style="color:var(--bear)">Stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)</span>' +
-      '<span style="color:var(--tx3)">|</span>' +
-      '<span style="color:var(--tx2)">1R ' + fmtPx(tgt['1r']) + '</span>' +
-      '<span style="color:var(--tx2)">2R ' + fmtPx(tgt['2r']) + '</span>' +
-      '<span style="color:var(--bull);font-weight:600">3R ' + fmtPx(tgt['3r']) + '</span>' +
-    '</div>';
-  return div;
-}
-
-/* ── Signals page ─────────────────────────────────────────────────────────── */
-var _sf = 'live', _sigs = [];
-function loadSignals(){
-  fetch('/signals').then(function(r){ return r.json(); }).then(function(d){
-    _sigs = d.signals || [];
-    cTf = (d.meta || {}).tf || cTf;
-    var ts = d.ts, ma = ts ? Math.round((Date.now() - new Date(ts)) / 60000) + ' min ago' : '-';
-    document.getElementById('sig-sub').textContent =
-      _sigs.length + ' signals · ' + ((d.meta || {}).scanned || 0) + ' pairs analysed · ' + ma;
-    renderSigs();
-  });
-}
-function setSF(btn){
-  document.querySelectorAll('.sig-ftab').forEach(function(b){ b.classList.remove('active'); });
-  btn.classList.add('active'); _sf = btn.dataset.sf; renderSigs();
-}
-function renderSigs(){
-  var s = _sigs.filter(function(x){ return matches(x, _sf); });
-  var c = document.getElementById('sigList');
-  if(s.length === 0){ c.innerHTML = '<div class="no-sig">No signals match this filter.</div>'; return; }
-  c.innerHTML = '';
-  s.sort(function(a,b){ return b.score - a.score; });
-  s.forEach(function(x){ c.appendChild(mkRow(x)); });
-}
-
 /* ── Watchlist (OI flow) ──────────────────────────────────────────────────── */
-var _wf = 'all', _wrows = [], wes = null;
 var WQ = {
   'NEW LONGS':      {cls:'bdg bb'},
   'NEW SHORTS':     {cls:'bdg br'},
@@ -3026,7 +2683,7 @@ var WQ = {
 };
 var WFLAG = {'SPOT-LED':'wf-spot','CROWDED LONGS':'wf-crowd','SQUEEZE FUEL':'wf-squeeze','HIGH OI/VOL':'wf-hioi'};
 
-var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__, thinM:__MOVER_THIN_M__,
+var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__,
           oiVol:__OI_VOL__, fundSpot:__FUND_SPOT__, fundCrowd:__FUND_CROWD__, fundSqueeze:__FUND_SQUEEZE__};
 var TIP = {
   'NEW LONGS':       'Price up + OI up: new money opening longs. A real trend if funding is not rich.',
@@ -3047,309 +2704,17 @@ var TIP = {
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 
-function wMatches(r, f){
-  if(f === 'longs')   return r.quadrant === 'NEW LONGS';
-  if(f === 'shorts')  return r.quadrant === 'NEW SHORTS';
-  if(f === 'squeeze') return (r.flags || []).indexOf('SQUEEZE FUEL') >= 0;
-  if(f === 'spot')    return (r.flags || []).indexOf('SPOT-LED') >= 0;
-  return true;
-}
-function setWF(btn){
-  document.querySelectorAll('.sig-ftab[data-wf]').forEach(function(b){ b.classList.remove('active'); });
-  btn.classList.add('active'); _wf = btn.dataset.wf; renderWatch();
-}
-function fmtPct(v){
-  if(v === null || v === undefined) return '&mdash;';
-  return (v >= 0 ? '+' : '') + v + '%';
-}
-function watchAudit(m){
-  if(!m || !m.dispatched) return '';
-  var bits = [m.analysed + ' of ' + m.dispatched + ' pairs measured',
-              (m.quiet || 0) + ' quiet (OI moved < 5%)'];
-  if(m.vol_rejected) bits.push(m.vol_rejected + ' below the volume floor');
-  if(m.no_oi)        bits.push(m.no_oi + ' had no usable OI history (fresh listings excluded on purpose)');
-  if(m.errors)       bits.push(m.errors + ' errored');
-  var txt = bits.join(' · ');
-  if(m.complete === false){
-    return '<div class="audit warn">&#9888; This OI scan did not finish &mdash; re-run before trusting it.<br>' + txt + '</div>';
-  }
-  return txt;
-}
-function renderWatch(){
-  var rows = _wrows.filter(function(r){ return wMatches(r, _wf); });
-  rows.sort(function(a, b){ return b.oi_chg_pct - a.oi_chg_pct; });
-  var tb = document.getElementById('wB'); tb.innerHTML = '';
-  if(rows.length === 0){
-    document.getElementById('wT').style.display = 'none';
-    document.getElementById('wEmpty').style.display = '';
-    document.getElementById('wEmpty').textContent = _wrows.length ?
-      'No pairs match this filter.' : 'No OI scan yet - hit Scan OI Flow. Sunday is the classic day to look.';
-    return;
-  }
-  document.getElementById('wEmpty').style.display = 'none';
-  document.getElementById('wT').style.display = 'table';
-  rows.forEach(function(r){
-    var q = WQ[r.quadrant] || WQ['CAPITULATION'];
-    var dimmed = (r.quadrant === 'SHORT COVERING' || r.quadrant === 'CAPITULATION');
-    var flags = (r.flags || []).map(function(f){
-      return '<span class="wflag ' + (WFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
-    }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
-    var fund = r.funding_day_pct === null || r.funding_day_pct === undefined ? '&mdash;'
-             : (r.funding_day_pct >= 0 ? '+' : '') + r.funding_day_pct.toFixed(3) + '%';
-    var tr = document.createElement('tr');
-    if(dimmed) tr.className = 'dim';
-    tr.innerHTML =
-      '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div></td>' +
-      '<td><span style="font-family:var(--mono);font-weight:600;color:' + (r.oi_chg_pct >= 0 ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.oi_chg_pct) + '</span></td>' +
-      '<td class="volc">' + fmtVol(r.oi_usd) + (r.oi_vol_ratio ? '<small>' + r.oi_vol_ratio + 'x daily vol</small>' : '') + '</td>' +
-      '<td><span style="font-family:var(--mono);color:' + (r.price_chg_pct >= 0 ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.price_chg_pct) + '</span></td>' +
-      '<td><span class="' + q.cls + '"' + tip(r.quadrant) + '>' + r.quadrant + '</span></td>' +
-      '<td><span style="font-family:var(--mono);font-size:11px;color:var(--tx2)">' + fund + '</span></td>' +
-      '<td>' + flags + '</td>' +
-      '<td>' + volCell(r) + '</td>';
-    tb.appendChild(tr);
-  });
-}
-function loadWatch(){
-  fetch('/watch_signals').then(function(r){ return r.json(); }).then(function(d){
-    _wrows = d.rows || [];
-    var m = d.meta || {};
-    if(d.ts){
-      var ma = Math.round((Date.now() - new Date(d.ts)) / 60000);
-      document.getElementById('watch-sub').textContent =
-        _wrows.length + ' movers on ' + (m.exchange || '').toUpperCase() + ' · ' +
-        (m.lookback_d || 7) + '-day OI change · scanned ' + ma + ' min ago';
-      if(m.exchange) document.getElementById('wExchange').value = m.exchange;
-    }
-    document.getElementById('watch-audit').innerHTML = watchAudit(m);
-    renderWatch();
-  }).catch(function(){});
-}
-function startWatch(){
-  if(wes){ wes.close(); wes = null; }
-  var ex  = document.getElementById('wExchange').value;
-  var vol = (parseInt(document.getElementById('minVol').value) || 70) * 1e6;
-  var spd = document.querySelector('#spdG .tbtn.active').dataset.val;
-  var mp  = parseInt(document.getElementById('maxPairs').value) || 400;
-  var btn = document.getElementById('wRunBtn');
-  btn.disabled = true;
-  _wrows = [];
-  renderWatch();
-  document.getElementById('watch-audit').innerHTML = '';
-  var wtot = 0, prog = document.getElementById('wProg');
-  prog.textContent = 'Loading markets...';
-
-  wes = new EventSource('/watchlist?exchange=' + ex + '&min_weekly_vol=' + vol +
-                        '&speed=' + spd + '&max_pairs=' + mp);
-  wes.addEventListener('log', function(e){ prog.textContent = JSON.parse(e.data).msg; });
-  wes.addEventListener('total', function(e){ wtot = JSON.parse(e.data).total; });
-  wes.addEventListener('progress', function(e){
-    var d = JSON.parse(e.data);
-    prog.textContent = d.current + '/' + wtot + ' - ' + d.pair.replace('/USDT:USDT','');
-  });
-  wes.addEventListener('result', function(e){
-    _wrows.push(JSON.parse(e.data));
-    renderWatch();
-  });
-  wes.addEventListener('done', function(e){
-    var d = JSON.parse(e.data);
-    wes.close(); btn.disabled = false;
-    prog.textContent = 'Done - ' + d.hits + ' mover(s)';
-    document.getElementById('watch-audit').innerHTML = watchAudit(d.meta || {});
-    var m = d.meta || {};
-    document.getElementById('watch-sub').textContent =
-      d.hits + ' movers on ' + (m.exchange || '').toUpperCase() + ' · ' +
-      (m.lookback_d || 7) + '-day OI change · just now';
-  });
-  wes.addEventListener('error', function(e){
-    if(!e.data) return;
-    var m = 'Scan error';
-    try { m = JSON.parse(e.data).msg; } catch(x){}
-    prog.textContent = m; wes.close(); btn.disabled = false;
-  });
-  wes.onerror = function(){
-    if(wes.readyState === EventSource.CLOSED) return;
-    // same reasoning as the divergence scan: an EventSource reconnect would
-    // silently launch a SECOND full OI scan. Close and let the user re-run.
-    wes.close(); btn.disabled = false;
-    prog.textContent = 'Connection lost - scan stopped.';
-  };
-}
-
 /* ── Movers (daily watchlist) ─────────────────────────────────────────────── */
-var _mf = 'all', _mrows = [], mes = null;
 var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-move',
              'AT RANGE HIGH':'mf-hi','ABOVE 7D HIGH':'mf-hi',
              'AT RANGE LOW':'mf-lo','BELOW 7D LOW':'mf-lo'};
 
-function mMatches(r, f){
-  var fl = r.flags || [];
-  if(f === 'vol') return fl.indexOf('VOLUME SPIKE') >= 0;
-  if(f === 'rng') return fl.indexOf('RANGE EXPANSION') >= 0;
-  if(f === 'hi')  return fl.indexOf('AT RANGE HIGH') >= 0 || fl.indexOf('ABOVE 7D HIGH') >= 0;
-  if(f === 'lo')  return fl.indexOf('AT RANGE LOW') >= 0 || fl.indexOf('BELOW 7D LOW') >= 0;
-  return true;
-}
-function setMF(btn){
-  document.querySelectorAll('.sig-ftab[data-mf]').forEach(function(b){ b.classList.remove('active'); });
-  btn.classList.add('active'); _mf = btn.dataset.mf; renderMovers();
-}
-function fmtX(v){ return (v === null || v === undefined) ? '&mdash;' : v.toFixed(2) + 'x'; }
-
-/* Same contract as the other two audit lines: every pair the scan did not
-   actually measure gets named, so a short list can never be misread as a
-   quiet market. */
-function moversAudit(m){
-  if(!m || !m.dispatched) return '';
-  var bits = [m.analysed + ' of ' + m.dispatched + ' pairs measured',
-              (m.quiet || 0) + ' unremarkable (no trigger hit)'];
-  if(m.vol_rejected)    bits.push(m.vol_rejected + ' below the volume floor');
-  if(m.no_data)         bits.push(m.no_data + ' had too little daily history');
-  if(m.errors)          bits.push(m.errors + ' errored');
-  if(m.tradfi_excluded) bits.push(m.tradfi_excluded + ' stock/ETF/commodity perp(s) excluded by design');
-  if(m.thin) bits.push((m.thin_analysed || 0) + ' thin pair(s) measured, ' + (m.thin_quiet || 0) +
-                       ' without volume spike + range expansion together');
-  var txt = bits.join(' · ');
-  if(m.complete === false){
-    return '<div class="audit warn">&#9888; This movers scan did not finish &mdash; re-run before trusting it.<br>' + txt + '</div>';
-  }
-  return txt;
-}
-function mvRow(r, i, thin){
-  var flags = (r.flags || []).map(function(f){
-    return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
-  }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
-  var up  = r.chg_1d_pct >= 0;
-  var big = Math.abs(r.chg_1d_pct || 0) >= TH.chg;
-  var badge = thin ? '<div><span class="thin-badge" title="Below the volume floor. Thin book: expect worse fills and slippage through stops. Size down.">THIN &middot; ' +
-                     fmtVol(r.daily_volume) + '/day</span></div>' : '';
-  var tr = document.createElement('tr');
-  tr.className = up ? 'rb' : 'rr';
-  tr.innerHTML =
-    '<td><span class="mrank' + (!thin && i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
-    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div>' + badge + '</td>' +
-    '<td>' + qcell(r.score) + '</td>' +
-    '<td><span style="font-family:var(--mono);font-weight:600;color:' + (big ? 'var(--fresh)' : up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
-      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">today ' + fmtPct(r.chg_live_pct) + '</div></td>' +
-    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= TH.vol ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
-    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= TH.rng ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
-    '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
-      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:3px">' + r.pos_in_range + '% of range</div></td>' +
-    '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + ' &nbsp;<small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
-      '<div class="mlv"><small>7D</small> ' + fmtPx(r.r_lo) + ' &ndash; ' + fmtPx(r.r_hi) + '</div></td>' +
-    '<td>' + flags + '</td>';
-  return tr;
-}
-/* Thin rows never share a ranking with the main list: a $3M/day coin with a
-   whale print would otherwise top it on score alone. Top 4 is main-list only. */
-function renderMovers(){
-  var rows = _mrows.slice().sort(function(a, b){ return b.score - a.score; })
-                   .filter(function(r){ return mMatches(r, _mf); });
-  var core = rows.filter(function(r){ return r.tier !== 'thin'; });
-  var thin = _mf === 'top' ? [] : rows.filter(function(r){ return r.tier === 'thin'; });
-  if(_mf === 'top') core = core.slice(0, 4);
-  var tb = document.getElementById('mvB'); tb.innerHTML = '';
-  if(core.length + thin.length === 0){
-    document.getElementById('mvT').style.display = 'none';
-    var e = document.getElementById('mvEmpty');
-    e.style.display = '';
-    e.textContent = _mrows.length ? 'No pairs match this filter.' : 'No movers scan yet - hit Scan Movers.';
-    return;
-  }
-  document.getElementById('mvEmpty').style.display = 'none';
-  document.getElementById('mvT').style.display = 'table';
-  core.forEach(function(r, i){ tb.appendChild(mvRow(r, i, false)); });
-  if(thin.length){
-    var sep = document.createElement('tr');
-    sep.className = 'mv-sep';
-    sep.innerHTML = '<td colspan="9">&#9888; LOW LIQUIDITY &mdash; $' + TH.thinM + 'M/week up to the floor &middot; ' +
-      'listed only on volume spike AND range expansion together &middot; thin book, wider fills, size down</td>';
-    tb.appendChild(sep);
-    thin.forEach(function(r, i){ tb.appendChild(mvRow(r, i, true)); });
-  }
-}
-function mvThinPref(){
-  try { localStorage.setItem('mvThin', document.getElementById('mvThin').checked ? '1' : '0'); } catch(x){}
-}
-function loadMovers(){
-  fetch('/mover_signals').then(function(r){ return r.json(); }).then(function(d){
-    _mrows = d.rows || [];
-    var m = d.meta || {};
-    if(d.ts){
-      var ma = Math.round((Date.now() - new Date(d.ts)) / 60000);
-      document.getElementById('mv-sub').textContent =
-        _mrows.length + ' movers on ' + (m.exchange || '').toUpperCase() +
-        ' · last completed daily bar vs its ' + (m.lookback_d || 20) +
-        '-day baseline · scanned ' + ma + ' min ago';
-      if(m.exchange) document.getElementById('mvExchange').value = m.exchange;
-    }
-    var pref = null;
-    try { pref = localStorage.getItem('mvThin'); } catch(x){}
-    document.getElementById('mvThin').checked = pref !== null ? pref === '1' : !!m.thin;
-    document.getElementById('mv-audit').innerHTML = moversAudit(m);
-    renderMovers();
-  }).catch(function(){});
-}
-function startMovers(){
-  if(mes){ mes.close(); mes = null; }
-  var ex  = document.getElementById('mvExchange').value;
-  var vol = (parseInt(document.getElementById('minVol').value) || 70) * 1e6;
-  var spd = document.querySelector('#spdG .tbtn.active').dataset.val;
-  var mp  = parseInt(document.getElementById('maxPairs').value) || 400;
-  var btn = document.getElementById('mvRunBtn');
-  btn.disabled = true;
-  _mrows = [];
-  renderMovers();
-  document.getElementById('mv-audit').innerHTML = '';
-  var mtot = 0, prog = document.getElementById('mvProg');
-  prog.textContent = 'Loading markets...';
-
-  var thin = document.getElementById('mvThin').checked ? '1' : '0';
-  mes = new EventSource('/movers?exchange=' + ex + '&min_weekly_vol=' + vol +
-                        '&speed=' + spd + '&max_pairs=' + mp + '&thin=' + thin);
-  mes.addEventListener('log', function(e){ prog.textContent = JSON.parse(e.data).msg; });
-  mes.addEventListener('total', function(e){ mtot = JSON.parse(e.data).total; });
-  mes.addEventListener('progress', function(e){
-    var d = JSON.parse(e.data);
-    prog.textContent = d.current + '/' + mtot + ' - ' + d.pair.replace('/USDT:USDT','');
-  });
-  mes.addEventListener('result', function(e){
-    _mrows.push(JSON.parse(e.data));
-    renderMovers();
-  });
-  mes.addEventListener('done', function(e){
-    var d = JSON.parse(e.data);
-    mes.close(); btn.disabled = false;
-    prog.textContent = 'Done - ' + d.hits + ' mover(s)';
-    var m = d.meta || {};
-    document.getElementById('mv-audit').innerHTML = moversAudit(m);
-    document.getElementById('mv-sub').textContent =
-      d.hits + ' movers on ' + (m.exchange || '').toUpperCase() +
-      ' · last completed daily bar vs its ' + (m.lookback_d || 20) + '-day baseline · just now';
-  });
-  mes.addEventListener('error', function(e){
-    if(!e.data) return;
-    var msg = 'Scan error';
-    try { msg = JSON.parse(e.data).msg; } catch(x){}
-    prog.textContent = msg; mes.close(); btn.disabled = false;
-  });
-  mes.onerror = function(){
-    if(mes.readyState === EventSource.CLOSED) return;
-    // Same reasoning as the other two scans: an EventSource reconnect silently
-    // launches a SECOND full scan against the same exchange quota. Close it and
-    // let the user decide to re-run.
-    mes.close(); btn.disabled = false;
-    prog.textContent = 'Connection lost - scan stopped.';
-  };
-}
-
 /* ── Sidebar controls ─────────────────────────────────────────────────────── */
 var STR_HINTS = {
-  loose:    'Only requires price and MACD to disagree between two pivots. Most signals, including marginal ones you would reject by eye.',
   balanced: 'MACD pivot must align with the price pivot, the divergence line must be unbroken, and the move must clear a minimum size.',
   strict:   'Balanced plus the zero-line condition: both bullish MACD pivots below zero, both bearish above. Fewer signals, higher conviction.'
 };
-['tfG','strG','spdG'].forEach(function(g){
+['strG','spdG'].forEach(function(g){
   document.querySelectorAll('#' + g + ' .tbtn').forEach(function(b){
     b.addEventListener('click', function(){
       document.querySelectorAll('#' + g + ' .tbtn').forEach(function(x){ x.classList.remove('active'); });
@@ -3386,15 +2751,15 @@ function checkUniverse(){
 /* ── Scanner ──────────────────────────────────────────────────────────────── */
 var cb = 0, cr = 0, cf = 0;
 function bump(el, v){ el.textContent = v; el.classList.remove('bmp'); void el.offsetWidth; el.classList.add('bmp'); }
-function updStats(side, fresh){
+function updStats(side, isEnter){
   if(side === 'bullish'){ cb++; bump(document.getElementById('cBull'), cb); document.getElementById('stBull').classList.add('vis'); }
   else { cr++; bump(document.getElementById('cBear'), cr); document.getElementById('stBear').classList.add('vis'); }
-  if(fresh){ cf++; bump(document.getElementById('cFresh'), cf); document.getElementById('stFresh').classList.add('vis'); }
+  if(isEnter){ cf++; bump(document.getElementById('cEnter'), cf); document.getElementById('stEnter').classList.add('vis'); }
 }
 function resetStats(){
   cb = cr = cf = 0;
-  ['stBull','stBear','stFresh'].forEach(function(i){ document.getElementById(i).classList.remove('vis'); });
-  ['cBull','cBear','cFresh'].forEach(function(i){ document.getElementById(i).textContent = '0'; });
+  ['stBull','stBear','stEnter'].forEach(function(i){ document.getElementById(i).classList.remove('vis'); });
+  ['cBull','cBear','cEnter'].forEach(function(i){ document.getElementById(i).textContent = '0'; });
 }
 
 var af = 'live', sortKey = 'score', pendR = [], hasScanned = false, seenSig = {};
@@ -3490,37 +2855,63 @@ function pushBg(pair, isHit){
 }
 function resetBg(){ var f = document.getElementById('sbgFeed'); if(f) f.innerHTML = ''; }
 
-function buildRow(d){
-  var bull = d.side === 'bullish';
-  var base = d.base || (d.pair || '').replace('/USDT:USDT','').replace('/USDT','');
-  var tgt = d.targets || {};
-  var fromCur = d.targets_from === 'current';
-  var tr = document.createElement('tr');
-  tr.className = (bull ? 'rb' : 'rr') + (d.status === 'invalidated' ? ' dim' : '');
-  var basis = '<div style="font-family:var(--mono);font-size:8px;color:' + (fromCur ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
-    (fromCur ? 'FROM CURRENT PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>';
-  var tgts = basis + '<span style="color:var(--tx3)">' + fmtPx(tgt['1r']) + '</span>' +
+function tgtHtml(d){
+  var tgt = d.targets || {}, fromCur = d.targets_from === 'current';
+  return '<div style="font-family:var(--mono);font-size:8px;color:' + (fromCur ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
+    (fromCur ? 'FROM CURRENT PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>' +
+    '<span style="color:var(--tx3)">' + fmtPx(tgt['1r']) + '</span>' +
     ' <span style="color:var(--tx3)">/</span> <span style="color:var(--tx2)">' + fmtPx(tgt['2r']) + '</span>' +
     ' <span style="color:var(--tx3)">/</span> <span style="color:var(--bull);font-weight:600">' + fmtPx(tgt['3r']) + '</span>';
-  tr.innerHTML =
-    '<td><div class="pb"><div style="display:flex;align-items:center;gap:5px"><span class="pb-pair">' + base + '</span>' + freshTag(d) + '</div>' +
-      '<span class="pb-q">USDT PERP</span></div></td>' +
-    '<td>' + sbadge(d) + '</td>' +
-    '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + d.type + '</span></td>' +
-    '<td>' + qcell(d.score || 0) + '</td>' +
-    '<td>' + volCell(d) + '</td>' +
-    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + d.pivot2_time + '</div><div class="ptm">' + b2t(d.bars_ago, d.tf || cTf) + '</div></td>' +
-    '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(d.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + d.risk_pct + '%</div></td>' +
-    '<td style="font-family:var(--mono);font-size:10px">' + tgts + '</td>';
+}
+function detailRow(r){
+  var tr = document.createElement('tr');
+  tr.className = 'det';
+  var h = r.tfs.map(function(tf){
+    var s = r.signals[tf], c = SC[s.status] || SC.active;
+    return '<div><b>' + tfLabel(tf) + '</b> &nbsp;A ' + s.pivot1_time + ' @ ' + fmtPx(s.pivot1_price) +
+      ' &rarr; B ' + s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price) +
+      ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
+      ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
+      ' &nbsp;&middot;&nbsp; ' + (s.macd_cross ? 'MACD crossed ' + s.macd_cross_at : 'no MACD cross yet') +
+      ' &nbsp;&middot;&nbsp; score ' + s.score +
+      ' &nbsp;&middot;&nbsp; stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)' +
+      ' &nbsp;&middot;&nbsp; 1R ' + fmtPx((s.targets || {})['1r']) + ' / 2R ' + fmtPx((s.targets || {})['2r']) +
+      ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>';
+  }).join('');
+  tr.innerHTML = '<td colspan="9">' + h + '</td>';
   return tr;
 }
+function buildRow(r){
+  var bull = r.side === 'bullish', p = primary(r), tf = r.tfs[0];
+  var tr = document.createElement('tr');
+  tr.className = 'main-row ' + (bull ? 'rb' : 'rr') + (verdict(r) === 'skip' ? ' dim' : '');
+  var tfs = r.tfs.map(function(t){ return '<span class="tfb">' + tfLabel(t) + '</span>'; }).join('');
+  tr.innerHTML =
+    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP</span></div></td>' +
+    '<td>' + evCell(r) + '</td>' +
+    '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + (bull ? 'BULLISH' : 'BEARISH') + '</span>' + tfs + '</td>' +
+    '<td>' + ctxCell(r) + '</td>' +
+    '<td>' + qcell(r.score || 0) + '</td>' +
+    '<td>' + volCell(r) + '</td>' +
+    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.pivot2_time + '</div><div class="ptm">' + tfLabel(tf) + ' &middot; ' + b2t(p.bars_ago, tf) + '</div></td>' +
+    '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(p.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + p.risk_pct + '%</div></td>' +
+    '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>';
+  tr.addEventListener('click', function(){
+    var n = tr.nextSibling;
+    if(n && n.className === 'det'){ n.parentNode.removeChild(n); return; }
+    tr.parentNode.insertBefore(detailRow(r), tr.nextSibling);
+  });
+  return tr;
+}
+function ageMin(r){ var tf = r.tfs[0]; return primary(r).bars_ago * ((TFM[tf] && TFM[tf].minutes) || 240); }
 
 function renderAll(results){
   var rows = (results || []).filter(function(d){ return matches(d, af); });
   rows.sort(function(a, b){
     if(sortKey === 'vol') return (b.weekly_volume || 0) - (a.weekly_volume || 0);
-    if(sortKey === 'age') return a.bars_ago - b.bars_ago;
-    return b.score - a.score;
+    if(sortKey === 'age') return ageMin(a) - ageMin(b);
+    return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
+           (b.tfs.length - a.tfs.length) || (b.score - a.score);
   });
   var tb = document.getElementById('resB'); tb.innerHTML = '';
   var st = rows.length > 1 ? Math.min(60, 800 / rows.length) : 0;
@@ -3533,11 +2924,37 @@ function renderAll(results){
     document.getElementById('resT').style.display = 'none';
     var em = document.getElementById('emS');
     em.style.display = 'flex';
-    em.innerHTML = '<span class="empty-icon">&#9676;</span><span>No signals match this filter</span>';
+    em.innerHTML = '<span class="empty-icon">&#9676;</span><span>No divergences match this filter</span>';
   } else {
     document.getElementById('emS').style.display = 'none';
     document.getElementById('resT').style.display = 'table';
   }
+}
+
+/* The verdict is only as fresh as the scan. Past one closed 1H bar it is dimmed. */
+var scanTs = null;
+function updAge(){
+  var el = document.getElementById('scan-age');
+  if(!scanTs){ el.textContent = ''; el.className = 'audit'; return; }
+  var min = Math.max(0, Math.round((Date.now() - scanTs) / 60000)), stale = min > 60;
+  el.className = 'audit' + (stale ? ' warn' : '');
+  el.innerHTML = 'Entry verdicts as of ' + min + ' min ago' +
+    (stale ? ' &mdash; more than one 1H bar has closed since. Re-run the scan before acting on them.' : '');
+  document.getElementById('resT').classList.toggle('stale', stale);
+}
+setInterval(updAge, 60000);
+
+function loadLast(){
+  fetch('/signals').then(function(r){ return r.json(); }).then(function(d){
+    var rows = d.rows || [];
+    if(!d.ts) return;                       /* never scanned: leave the welcome panel */
+    pendR = rows; hasScanned = true;
+    scanTs = new Date(d.ts).getTime();
+    resetStats();
+    rows.forEach(function(r){ if(verdict(r) !== 'skip') updStats(r.side, verdict(r) === 'enter'); });
+    document.getElementById('scan-audit').innerHTML = auditLine(d.meta);
+    renderAll(pendR); updAge();
+  }).catch(function(){});
 }
 
 var es = null;
@@ -3557,17 +2974,17 @@ function startScan(){
   document.getElementById('runBtn').disabled = true;
   tot = 0; setProgress(0, 0, ''); setStatus('Scanning...', true);
   showLoader(); resetBg(); pendR = []; seenSig = {}; hasScanned = true;
+  scanTs = null; updAge();
+  document.getElementById('scan-audit').innerHTML = '';
 
   var exch = document.getElementById('exchange').value;
-  var tf   = document.querySelector('#tfG .tbtn.active').dataset.val;
   var str  = document.querySelector('#strG .tbtn.active').dataset.val;
   var spd  = document.querySelector('#spdG .tbtn.active').dataset.val;
   var vol  = (parseInt(document.getElementById('minVol').value) || 70) * 1e6;
   var mp   = parseInt(document.getElementById('maxPairs').value) || 400;
   var syms = document.getElementById('symOverride').value.trim();
-  cTf = tf;
 
-  var url = '/scan?exchange=' + exch + '&tf=' + tf + '&strictness=' + str +
+  var url = '/scan?exchange=' + exch + '&strictness=' + str +
             '&speed=' + spd + '&min_weekly_vol=' + vol + '&max_pairs=' + mp;
   if(syms) url += '&symbols=' + encodeURIComponent(syms);
 
@@ -3582,10 +2999,10 @@ function startScan(){
   });
   es.addEventListener('result', function(e){
     var d = JSON.parse(e.data);
-    var k = d.pair + '|' + d.side + '|' + d.pivot2_time;
+    var k = d.pair + '|' + d.side;
     if(seenSig[k]) return;            // duplicate guard, see es.onerror
     seenSig[k] = 1;
-    updStats(d.side, d.fresh);
+    if(verdict(d) !== 'skip') updStats(d.side, verdict(d) === 'enter');
     pendR.push(d);
     pushBg(d.pair, true);
   });
@@ -3594,9 +3011,11 @@ function startScan(){
     es.close();
     document.getElementById('runBtn').disabled = false;
     setProgress(tot, tot, '');
-    setStatus('Done - ' + d.hits + ' signal' + (d.hits !== 1 ? 's' : ''), false);
+    setStatus('Done - ' + d.hits + ' row' + (d.hits !== 1 ? 's' : ''), false);
     var m = d.meta || {};
-    pushLog('Scan complete - ' + d.hits + ' signal(s) from ' + (m.scanned || 0) + ' pairs analysed', 'dn');
+    pushLog('Scan complete - ' + d.hits + ' divergence row(s) from ' + (m.scanned || 0) + ' pairs analysed', 'dn');
+    scanTs = Date.now(); updAge();
+    document.getElementById('scan-audit').innerHTML = auditLine(m);
     if(m.vol_rejected) pushLog(m.vol_rejected + ' pair(s) fell short on 7-day volume', 'in');
     if(m.no_data || m.errors) pushLog(((m.no_data||0) + (m.errors||0)) + ' pair(s) could not be analysed (no candles / error)', 'er');
     setRing(100, '');
@@ -3630,7 +3049,7 @@ function startScan(){
     pushLog('Connection lost - scan stopped. Press Run Scan to restart.', 'er');
     document.getElementById('runBtn').disabled = false;
     setStatus('Disconnected', false);
-    if(pendR.length){ dissolve(); setTimeout(function(){ renderAll(pendR); }, 350); }
+    if(pendR.length){ scanTs = Date.now(); updAge(); dissolve(); setTimeout(function(){ renderAll(pendR); }, 350); }
   };
 }
 
@@ -3641,66 +3060,14 @@ function renderWelcome(){
     var h = new Date().getHours();
     var gr = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
     var subs = ['Ready to find divergences.',
-                'Full market, regular divergences only.',
-                'Every liquid perp, one scan.',
-                'Configure the volume floor and hit Run.'];
+                '4H and 1H, regular divergences only.',
+                'Every liquid perp, one scan, one table.',
+                'Set the volume floor and hit Run.'];
     el.style.display = 'flex';
     el.innerHTML = '<div class="greet"><div class="g-hl">' + gr + ', Kevin</div><div class="g-sub">' +
       subs[Math.floor(Math.random()*subs.length)] + '</div><button class="g-cta" onclick="startScan()">Run Scan</button></div>';
   } catch(e){}
 }
-
-/* ── Routine flow ─────────────────────────────────────────────────────────── */
-var rtCur = 0, rtTimer = null, RT_STEP_MS = 6000;
-function rtGo(i, manual){
-  var nodes = document.querySelectorAll('.rt-node'), links = document.querySelectorAll('.rt-link');
-  if(i < 0 || i >= nodes.length) return;
-  if(manual) rtStop();
-  rtCur = i;
-  nodes.forEach(function(n, k){ n.classList.toggle('on', k === i); n.classList.toggle('done', k < i); });
-  links.forEach(function(l, k){ l.classList.toggle('done', k < i); l.classList.toggle('into', k === i - 1); });
-  document.querySelectorAll('.rt-panel').forEach(function(p, k){
-    p.classList.toggle('on', k === i);
-    if(k === i){
-      p.querySelector('.rt-prev').disabled = i === 0;
-      p.querySelector('.rt-next').disabled = i === nodes.length - 1;
-    }
-  });
-  if(rtTimer) rtBar();
-}
-function rtBar(){
-  var b = document.getElementById('rtTimer');
-  b.classList.remove('run'); void b.offsetWidth;   /* restart the CSS animation */
-  b.style.animationDuration = RT_STEP_MS + 'ms';
-  b.classList.add('run');
-}
-function rtToggle(){ if(rtTimer) rtStop(); else rtStart(); }
-function rtStart(){
-  var last = document.querySelectorAll('.rt-node').length - 1;
-  if(rtCur >= last) rtGo(0);
-  document.getElementById('rtPlay').classList.add('on');
-  document.getElementById('rtPlayIco').innerHTML = '&#10074;&#10074;';
-  document.getElementById('rtPlayTxt').textContent = 'Pause';
-  rtTimer = setInterval(function(){
-    if(rtCur >= last){ rtStop(); return; }
-    rtGo(rtCur + 1);
-  }, RT_STEP_MS);
-  rtBar();
-}
-function rtStop(){
-  if(rtTimer){ clearInterval(rtTimer); rtTimer = null; }
-  var b = document.getElementById('rtPlay'); if(!b) return;
-  b.classList.remove('on');
-  document.getElementById('rtPlayIco').innerHTML = '&#9654;';
-  document.getElementById('rtPlayTxt').textContent = 'Play';
-  document.getElementById('rtTimer').classList.remove('run');
-}
-document.addEventListener('keydown', function(e){
-  if(!document.getElementById('pg-routine').classList.contains('active')) return;
-  if(/INPUT|TEXTAREA|SELECT/.test((e.target || {}).tagName || '')) return;
-  if(e.key === 'ArrowRight') rtGo(rtCur + 1, true);
-  if(e.key === 'ArrowLeft')  rtGo(rtCur - 1, true);
-});
 
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 var _cal = {events: [], meta: {}, ts: null}, _cf = 'movers', _calSel = null;
@@ -3902,8 +3269,7 @@ setInterval(function(){ if(_cal.events.length) calBanner(Date.now()); }, 60000);
 
 document.addEventListener('DOMContentLoaded', function(){
   renderWelcome();
-  rtGo(0);
-  loadDash();
+  loadLast();
   loadCalendar();
   var pg = (location.hash || '').slice(1);
   if(pg && document.getElementById('pg-' + pg)) showPg(pg);   /* deep link, e.g. /#calendar */

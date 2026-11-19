@@ -14,7 +14,7 @@ btc_state) and the coin's 200 EMA, and an
 optional early entry from the lower timeframe (ltf_trigger; a 4H signal also
 checks 15m). `--backtest`
 replays the same detector bar by bar (backtest_pair) and reports win rate and
-R per grade and regime. Everything below about pivots, PIVOT_SYNC, the clean
+expectancy after costs per timeframe, grade and regime, in and out of sample. Everything below about pivots, PIVOT_SYNC, the clean
 line and the setup score describes the detector this replaced.
 
 WHAT CHANGED IN v5
@@ -2061,29 +2061,35 @@ def render_chart(df, d, sig):
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
 BT_WARMUP = 80      # bars before the replay starts, so MACD has settled
+BT_SLIP, BT_FEE = 0.0005, 0.001          # slippage against the entry; round-trip fee, both of price
+BT_TIME_EXIT = {"4h": 30, "1h": 48}      # bars after entry, then out at the close
+BT_IN_SAMPLE = 0.7                       # first 70% of each frame's replayed bars
+BT_MIN_N = 30                            # fewer trades than this is "insufficient"
 
 
-def trade_outcome(df, i, side, entry, stop):
-    """What happened to a trade entered at the close of bar i.
-
-    hit = highest R target (0-3) reached before the stop. Inside one bar the
-    stop is checked first, the conservative read when a bar touches both.
-    """
+def trade_result(df, i, side, entry, stop, target, max_bars):
+    """One exit policy for a trade entered at the close of bar i: +target R at
+    the target, -1R at the stop (checked first when one bar touches both), or
+    the close max_bars later marked to market. The round-trip fee is taken off
+    in R. None when the history ends before any of the three."""
     k = 1 if side == "bullish" else -1
     risk = max((entry - stop) * k, entry * 0.005)
-    hi, lo = df["high"].values, df["low"].values
-    hit, mae, stopped, bars = 0, 0.0, False, None
-    for j in range(i + 1, len(df)):
+    hi, lo, cl = df["high"].values, df["low"].values, df["close"].values
+    mae = 0.0
+    for j in range(i + 1, min(i + max_bars + 1, len(df))):
         worst, best = (lo[j], hi[j]) if k > 0 else (hi[j], lo[j])
         mae = max(mae, (entry - worst) * k / risk)
         if (worst - stop) * k <= 0:
-            stopped, bars = True, j - i
-            break
-        hit = max(hit, min(3, int((best - entry) * k // risk)))
-        if hit == 3:
-            bars = j - i
-            break
-    return {"hit": hit, "stopped": stopped, "bars": bars, "mae_r": round(float(mae), 2)}
+            r = -1
+        elif (best - entry) * k >= target * risk:
+            r = target
+        elif j - i == max_bars:
+            r = (cl[j] - entry) * k / risk
+        else:
+            continue
+        return {"r": round(float(r - entry * BT_FEE / risk), 3), "bars": j - i,
+                "mae_r": round(float(mae), 2)}
+    return None
 
 
 def backtest_pair(df, tf, rules, htf=None, btc=None):
@@ -2095,6 +2101,7 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
     """
     cfg, seen, trades = TF_CFG[tf], set(), []
     close = df["close"].values
+    cut = BT_WARMUP + BT_IN_SAMPLE * (len(df) - 1 - BT_WARMUP)
     for i in range(BT_WARMUP, len(df) - 1):
         view = df.iloc[:i + 1]
         for side in ("bullish", "bearish"):
@@ -2105,7 +2112,7 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
                     continue                       # old news, or already taken
                 seen.add(key)
                 sig = _mk(view, d, cfg)
-                entry, stop = float(close[i]), sig["stop_price"]
+                entry, stop = float(close[i]) * (1 + k * BT_SLIP), sig["stop_price"]
                 if (entry - stop) * k <= 0:
                     continue                       # already through the stop when first seen
                 # Graded as of the signal bar's close, exactly like add_context.
@@ -2113,32 +2120,67 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
                 state = btc_state_at(btc, close_ts)
                 score, grade, _ = score_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], side),
                                                btc_state=state)
+                res = {n: trade_result(df, i, side, entry, stop, n, BT_TIME_EXIT[tf]) for n in (1, 2, 3)}
                 trades.append(dict(
-                    trade_outcome(df, i, side, entry, stop), tf=tf, side=side,
+                    {f"r{n}": o and o["r"] for n, o in res.items()},
+                    bars=res[2] and res[2]["bars"], mae_r=res[2] and res[2]["mae_r"],
+                    tf=tf, side=side, entry=entry, in_sample=i < cut,
                     score=score, grade=grade, time=str(view.index[-1]),
                     regime=regime_tag(side, sig["above_ema200"], state)))
     return trades
 
 
-def summarise(trades, key):
-    """Per group: count, and for each target R the win rate (%) and average R
-    of exiting there, over trades that reached that target or the stop."""
-    rows = []
-    for g in sorted({t[key] for t in trades}):
-        ts = [t for t in trades if t[key] == g]
-        row = {key: g, "n": len(ts)}
-        for r in (1, 2, 3):
-            done = [t for t in ts if t["stopped"] or t["hit"] >= r]
-            wins = sum(t["hit"] >= r for t in done)
-            row[f"win{r}"] = round(100 * wins / len(done), 1) if done else None
-            row[f"avg_r{r}"] = round((wins * r - (len(done) - wins)) / len(done), 2) if done else None
-        rows.append(row)
-    return rows
+def group_stats(trades):
+    """Statistics over the trades resolved under the 2R policy (they are then
+    resolved under 1R too). Below BT_MIN_N only the count is returned."""
+    ts = sorted((t for t in trades if t["r2"] is not None), key=lambda t: t["time"])
+    if len(ts) < BT_MIN_N:
+        return {"n": len(ts)}
+    r1, r2 = [t["r1"] for t in ts], [t["r2"] for t in ts]
+    loss = -sum(r for r in r2 if r < 0)
+    streak = run = 0
+    for r in r2:
+        run = run + 1 if r <= 0 else 0
+        streak = max(streak, run)
+    return {"n": len(ts),
+            "win1": round(100 * sum(r > 0 for r in r1) / len(ts), 1),
+            "win2": round(100 * sum(r > 0 for r in r2) / len(ts), 1),
+            "exp1": round(statistics.mean(r1), 2), "exp2": round(statistics.mean(r2), 2),
+            "pf": round(sum(r for r in r2 if r > 0) / loss, 2) if loss else float("inf"),
+            "bars": statistics.median(t["bars"] for t in ts),
+            "mae": round(statistics.mean(t["mae_r"] for t in ts), 2), "streak": streak}
 
 
-def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
-    """Fetch the scan's own history for the most liquid pairs and print win
-    rate and average R per grade and per regime."""
+def tune_cutoff(trades):
+    """Grade A cutoff on the 2R policy: the lowest in-sample score whose trades
+    at or above it number BT_MIN_N+ with expectancy >= +0.3R, kept only if the
+    out-of-sample trades at that cutoff earn > 0 and at least half as much.
+    Returns (cutoff or None, the sentence to print)."""
+    done = [t for t in trades if t["r2"] is not None]
+    ins = [t for t in done if t["in_sample"]]
+    for c in sorted({int(t["score"]) for t in ins}):
+        a = [t["r2"] for t in ins if t["score"] >= c]
+        if len(a) >= BT_MIN_N and statistics.mean(a) >= 0.3:
+            break
+    else:
+        return None, (f"Grade cutoffs: {GRADE_A} / {GRADE_B} kept - no in-sample score has "
+                      f"{BT_MIN_N}+ trades at or above it with expectancy >= +0.3R at 2R.")
+    ea = statistics.mean(a)
+    b = [t["r2"] for t in done if not t["in_sample"] and t["score"] >= c]
+    eb = statistics.mean(b) if b else None
+    seen = (f"in-sample n={len(a)} {ea:+.2f}R, out-of-sample n={len(b)} "
+            + (f"{eb:+.2f}R" if b else "no trades"))
+    if b and eb > 0 and eb >= ea / 2:
+        return c, (f"Grade cutoffs: recommend grade A at score >= {c} ({seen}). "
+                   f"GRADE_A is not changed by the backtest.")
+    return None, (f"Grade cutoffs: {GRADE_A} / {GRADE_B} kept - score >= {c} qualified in-sample "
+                  f"but did not hold out of sample ({seen}; needs > 0 and >= half the in-sample value).")
+
+
+def run_backtest(exid="binance", n_pairs=30, symbols=(), strictness="balanced"):
+    """Fetch the scan's own history for the most liquid pairs and print the
+    statistics per timeframe x grade x regime, in-sample next to out-of-sample,
+    then the grade cutoff check and the known gaps."""
     rules = STRICTNESS[strictness]
     ex = make_exchange(exid)
     mkts = ex.load_markets()
@@ -2168,20 +2210,35 @@ def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
         trades += got
         print(f"[{n}/{len(pairs)}] {sym}: {len(got)} signal(s)")
 
-    def cell(v, suffix=""):
-        return f"{'-' if v is None else str(v) + suffix:>9}"
+    def half(s):
+        if "pf" not in s:
+            return f"{s['n']:>4}  insufficient".ljust(55)
+        return (f"{s['n']:>4}{s['win1']:>7.1f}{s['win2']:>7.1f}{s['exp1']:>+7.2f}{s['exp2']:>+7.2f}"
+                f"{s['pf']:>6.2f}{s['bars']:>6.1f}{s['mae']:>6.2f}{s['streak']:>5}")
 
-    for key in ("grade", "regime"):
-        print(f"\nBy {key}")
-        print(f"{key:<15}{'n':>5}" + "".join(f"{f'win@{r}R':>9}{f'avgR@{r}R':>9}" for r in (1, 2, 3)))
-        for row in summarise(trades, key):
-            print(f"{row[key]:<15}{row['n']:>5}" +
-                  "".join(cell(row[f'win{r}'], '%') + cell(row[f'avg_r{r}']) for r in (1, 2, 3)))
-    print("\nwin@NR = share of resolved trades that reached N x risk before the stop; "
-          "avgR@NR = average result of exiting there.\n"
-          "Entry is the close of the bar the signal first appears on. Open interest and the "
-          "lower-timeframe trigger are not replayed;\nthe OI component is left out of the "
-          "score and the rest rescaled, as the live scan does when OI is missing.")
+    cols = f"{'n':>4}{'win1R':>7}{'win2R':>7}{'exp1R':>7}{'exp2R':>7}{'PF':>6}{'bars':>6}{'MAE':>6}{'lose':>5}"
+    print(f"\nREG_DIV, {len(trades)} signals on {len(pairs)} pairs ({exid.upper()}, {strictness})")
+    for tf in ("4h", "1h"):
+        ts = [t for t in trades if t["tf"] == tf]
+        groups = [("ALL", ts)] + [(f"{g} {r}", [t for t in ts if (t["grade"], t["regime"]) == (g, r)])
+                                  for g, r in sorted({(t["grade"], t["regime"]) for t in ts})]
+        print(f"\n{TF_CFG[tf]['label']:<18}{'in-sample (first 70%)':<55} | out-of-sample (last 30%)")
+        print(f"{'grade regime':<18}{cols:<55} | {cols}")
+        for label, g in groups:
+            print(f"{label:<18}{half(group_stats([t for t in g if t['in_sample']]))} | "
+                  f"{half(group_stats([t for t in g if not t['in_sample']]))}")
+    print(f"\n{tune_cutoff(trades)[1]}")
+    print(f"""
+n = trades resolved under the 2R exit. winNR / expNR = share above zero and average R after
+fees when exiting at the stop, at N x risk, or at the close {BT_TIME_EXIT['4h']} bars (4H) /
+{BT_TIME_EXIT['1h']} bars (1H) later. PF, bars (median to outcome), MAE (average, in R) and lose
+(longest losing streak, by time) use the 2R exit. Entry: the close of the bar the signal first
+appears on, {BT_SLIP:.2%} slippage against the trade; fees {BT_FEE:.2%} of price round trip, in R.
+A bar touching both the stop and the target counts as the stop. Fewer than {BT_MIN_N} -> insufficient.
+
+Known gaps: open interest is not replayed (no bar-by-bar history), so that component is dropped
+and the score rescaled, as live does when OI is missing. The lower-timeframe triggers and the
+spread / OI thin-coin filters are not replayed. Funding is not replayed.""")
 
 
 # ── State persistence ──────────────────────────────────────────────────────────
@@ -4422,7 +4479,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="MACD wave divergence screener")
     ap.add_argument("--backtest", action="store_true",
                     help="replay the stored history and print win rates instead of starting the dashboard")
-    ap.add_argument("--exchange", default="okx", choices=sorted(ALLOWED_EXCHANGES))
+    ap.add_argument("--exchange", default="binance", choices=sorted(ALLOWED_EXCHANGES))
     ap.add_argument("--pairs", type=int, default=30, help="backtest the N most liquid pairs")
     ap.add_argument("--symbols", default="", help="backtest exactly these, e.g. BTC,ETH")
     ap.add_argument("--strictness", default="balanced", choices=sorted(STRICTNESS))

@@ -146,23 +146,38 @@ export needed. A real environment variable `JBLANKED_API_KEY` also works.
 ## Backtest
 
 ```bash
-python macd_divergence_screener_v5.py --backtest                      # 30 most liquid pairs on OKX
-python macd_divergence_screener_v5.py --backtest --exchange binance --pairs 60
+python macd_divergence_screener_v5.py --backtest                      # 30 most liquid pairs on Binance
+python macd_divergence_screener_v5.py --backtest --exchange okx --pairs 60
 python macd_divergence_screener_v5.py --backtest --symbols BTC,ETH,SOL --strictness strict
 ```
 
 Replays the same candles the scan uses (720 bars of 4H, 500 of 1H) bar by
-bar with the same detector, each bar seeing only the bars up to and including it. A
-signal is entered at the close of the bar it first appears on, with the
-scan's stop. The report gives, per grade and per regime, how many signals
-there were and, for 1R, 2R and 3R targets, the share that got there before
-the stop and the average R of exiting there. Use it to check whether grade A
-actually beats grade B before trusting the cutoffs.
+bar with the same detector and scoring, each bar seeing only the bars up to and
+including it. A signal is entered at the close of the bar it first appears on
+plus 0.05% slippage against the trade, with the scan's stop. Fees of 0.10% of
+price round trip are converted to R and taken off every trade.
 
-Limits: open interest and the lower-timeframe trigger are not replayed (no
-bar-by-bar history); the OI component is left out of the backtest score and
-the rest rescaled, as the live scan does when OI is missing. When one bar
-touches both the stop and a target, the stop is counted.
+Each target (1R, 2R, 3R) is its own exit: the target, the stop, or the close
+30 bars (4H) / 48 bars (1H) later, marked to market. A bar that touches both
+the stop and the target counts as the stop; a trade whose history runs out
+first is left out. Trades are in-sample when their entry falls in the first
+70% of the pair's replayed bars, out-of-sample otherwise.
+
+The report has one block per timeframe: an `ALL` line, then one line per grade
+x regime, in-sample and out-of-sample side by side: n, win rate and expectancy
+(average R after fees) at 1R and 2R, and on the 2R exit the profit factor,
+median bars to outcome, average MAE in R and longest losing streak. Fewer than
+30 trades prints `insufficient`. It then checks the grade A cutoff on the 2R
+exit: the lowest in-sample score with 30+ trades at or above it averaging at
+least +0.3R, kept only if out-of-sample trades at that cutoff average above 0
+and at least half the in-sample value. Otherwise it says 70 / 55 are kept. It
+only prints; `GRADE_A` / `GRADE_B` are not changed.
+
+Known gaps: open interest is not replayed (no bar-by-bar history), so the OI
+component is left out of the backtest score and the rest rescaled, as the live
+scan does when OI is missing. The lower-timeframe triggers, the spread / OI
+thin-coin filters and funding are not replayed. A saved run is in
+`docs/superpowers/backtests/`.
 
 ## API
 

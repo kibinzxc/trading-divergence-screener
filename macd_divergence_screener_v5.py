@@ -678,6 +678,78 @@ def finish_signal(sig, htf_ok=False, oi_chg=None, fund=None, btc_rsi=None, trigg
     return sig
 
 
+# ── Outside context for a signal ───────────────────────────────────────────────
+def asof(series, ts):
+    """Last value at or before ts, or None."""
+    s = series.loc[:ts]
+    return float(s.iloc[-1]) if len(s) else None
+
+
+def htf_agrees(htf, close_ts, htf_minutes, side):
+    """Was the higher-timeframe MACD line rising (falling for bearish) on its
+    last bar completed by close_ts? Frames are indexed by bar OPEN time, so a
+    bar is complete once open + htf_minutes <= close_ts."""
+    if htf is None:
+        return False
+    m = htf["macd"].loc[:close_ts - pd.Timedelta(minutes=htf_minutes)]
+    if len(m) < 2:
+        return False
+    return bool(m.iloc[-1] > m.iloc[-2]) if side == "bullish" else bool(m.iloc[-1] < m.iloc[-2])
+
+
+def ltf_trigger(ltf, side, since_ts, from_ts, ltf_minutes):
+    """Early-entry trigger on the lower timeframe (spec Step 8).
+
+    From from_ts (the signal bar's open) onward: the MACD has crossed in the
+    signal's direction AND a candle closes beyond the last 3/3 swing high
+    (low for bearish) made since since_ts (price extreme B). Returns
+    (close of that candle, its close time in ms), or None.
+    """
+    k = 1 if side == "bullish" else -1
+    d = ((ltf["macd"] - ltf["signal"]) * k).values
+    close = ltf["close"].values
+    src = ltf["high"].values if k > 0 else ltf["low"].values
+    highs, lows = find_pivots(src, 3, 3)
+    piv = [p for p in (highs if k > 0 else lows) if ltf.index[p] >= since_ts]
+    crossed = False
+    for i in range(max(1, int(ltf.index.searchsorted(from_ts))), len(ltf)):
+        crossed = crossed or (d[i] > 0 and d[i - 1] <= 0)
+        known = [p for p in piv if p + 3 < i]          # confirmed by bars before this one
+        if crossed and known and k * close[i] > k * src[known[-1]]:
+            return float(close[i]), int(ltf.index[i].timestamp() * 1000) + ltf_minutes * 60_000
+    return None
+
+
+def oi_change_pct(hist, t0_ms, t1_ms):
+    """% change in open interest between two times, or None when the history
+    does not cover both. One unit is used for both points (coin amount when the
+    venue reports it, else USD value) so a price move is not read as OI."""
+    # shortcut: nearest point at or before each time, so daily OI on a wave
+    # shorter than a day gives None; fetch finer OI history if 4H scores need it.
+    pts = sorted((p for p in (hist or []) if p.get("timestamp")), key=lambda p: p["timestamp"])
+    for key in ("openInterestAmount", "openInterestValue"):
+        a = [p for p in pts if p["timestamp"] <= t0_ms and p.get(key)]
+        b = [p for p in pts if p["timestamp"] <= t1_ms and p.get(key)]
+        if a and b and b[-1] is not a[-1]:
+            return (float(b[-1][key]) / float(a[-1][key]) - 1) * 100.0
+    return None
+
+
+def add_context(sig, htf, ltf, oi_hist, fund, btc):
+    """Re-grade a signal with everything fetched for it. Any argument may be
+    None; that component then scores nothing."""
+    cfg = TF_CFG[sig["tf"]]
+    close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
+    trig = None
+    if ltf is not None and sig["fresh"]:
+        trig = ltf_trigger(ltf, sig["side"], pd.Timestamp(sig["b_ms"], unit="ms"),
+                           pd.Timestamp(sig["signal_ms"], unit="ms"), cfg["ltf_minutes"])
+    btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) if btc is not None else None
+    return finish_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], sig["side"]),
+                         oi_change_pct(oi_hist, sig["b_start_ms"], sig["b_ms"]),
+                         fund, btc_rsi, trig)
+
+
 # ── Entry verdict ──────────────────────────────────────────────────────────────
 EVENT_WAIT_H = 24     # a curated macro print inside this many hours means wait
 

@@ -5,9 +5,10 @@ WHAT CHANGED IN v5
 ──────────────────
 One scan instead of three. /scan reads 4H and 1H for every pair, groups the
 signals into one row per coin and side, and attaches an entry verdict
-(entry_verdict: a checklist, not a prediction). The OI-flow and daily-movers
-scans no longer exist as lists; their classifiers run only for coins that
-have a divergence and show up as context tags. 1D and the Loose preset are
+(entry_verdict: a checklist, not a prediction). The OI-flow scan no longer
+exists as a list; its classifier runs only for coins that have a divergence
+and shows up as context tags, next to the daily-movers tags. The daily-movers
+scan (/movers) keeps its own tab. 1D and the Loose preset are
 gone. A pivot is confirmed 3 closed bars after it instead of 5, the two
 pivots may be at most 60 bars apart, and Balanced needs the MACD pivots to
 differ by 15% of the leg's range. Those last two numbers are a first guess,
@@ -219,7 +220,6 @@ FUND_SQUEEZE_MAX   = -0.10  # ≤ this with price down + OI up: shorts crowded �
 OI_VOL_RATIO_HIGH  = 1.5    # OI larger than 1.5x average daily volume = crowded either way
 
 # ── Daily movers ───────────────────────────────────────────────────────────────
-# Used for context tags only since v5: classify_mover's flags are shown on divergence rows; its qualifies/score outputs are no longer used by the app.
 # A different question from everything above: no MACD, no divergence, no OI.
 # "Which liquid perps did something UNUSUAL in the last completed day, and what
 # level is that move sitting against?" — i.e. what a daily watchlist post is
@@ -246,9 +246,22 @@ MOVER_VOL_MULT    = 2.0
 MOVER_RANGE_MULT  = 1.5
 MOVER_EDGE_PCT    = 2.0     # within this % of a 7-day boundary = "at the edge"
 
+# Thin band (opt-in, /movers?thin=1). Pairs between this and the volume floor
+# are measured too, but listed separately and held to a stricter test: volume
+# spike AND range expansion together. On a $3M/day perp one whale order is a
+# "7x volume day" on its own; needing the range to expand with it is what
+# separates real participation from a single fill. The costs that justify the
+# main floor (spread, slippage through stops, wicks that clear stops and snap
+# back) do not go away — the band is labelled so size can come down with it.
+MOVER_THIN_MIN_WEEKLY_VOL = 20_000_000   # ≈ $3M/day
+
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "scan_state.json")
+# Own file on purpose: a movers scan must never be able to clobber the
+# divergence scan's saved state, and vice versa.
+MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "movers_state.json")
 
 # ── News calendar ──────────────────────────────────────────────────────────────
 # Scheduled macro prints, so a setup is never sized into a CPI or FOMC release
@@ -298,6 +311,7 @@ _CAL_MOVERS_RE = [(c, re.compile(p, re.I)) for c, p in CAL_MOVERS]
 # ── Server state ───────────────────────────────────────────────────────────────
 _state = {"results": [], "ts": None, "meta": {}}
 _lock  = threading.Lock()
+_movers_state = {"rows": [], "ts": None, "meta": {}}
 _cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
               "jb": {"events": [], "ts": None, "attempt": None}}
 
@@ -1050,12 +1064,15 @@ def analyse_mover(df, live_price):
     }
 
 
-def classify_mover(m):
+def classify_mover(m, thin=False):
     """(qualifies, flags, score) for one analysed pair.
 
     The score ranks how UNUSUAL the day was and how close price sits to a
     decision level. It carries NO direction and is NOT a win rate — the same
     caveat as setup_score, for the same reason: nothing here was backtested.
+
+    thin=True is the stricter test for the low-liquidity band: volume spike
+    AND range expansion, where a liquid pair needs any one trigger.
     """
     vm  = m.get("vol_mult") or 0.0
     rm  = m.get("range_mult") or 0.0
@@ -1078,8 +1095,11 @@ def classify_mover(m):
     elif lo_d is not None and lo_d <= MOVER_EDGE_PCT:
         flags.append("AT RANGE LOW")
 
-    qualifies = (vm >= MOVER_VOL_MULT or rm >= MOVER_RANGE_MULT
-                 or chg >= MOVER_MIN_CHG_PCT)
+    if thin:
+        qualifies = vm >= MOVER_VOL_MULT and rm >= MOVER_RANGE_MULT
+    else:
+        qualifies = (vm >= MOVER_VOL_MULT or rm >= MOVER_RANGE_MULT
+                     or chg >= MOVER_MIN_CHG_PCT)
 
     # Distance to the NEARER 7-day boundary. Already through one → 0 → full marks.
     edge = min([d for d in (hi_d, lo_d) if d is not None] or [99.0])
@@ -1088,6 +1108,35 @@ def classify_mover(m):
     score += float(np.clip(1.0 - max(edge, 0.0) / 6.0, 0, 1)) * 20  # near a level
     score += float(np.clip(chg / 12.0, 0, 1)) * 15                  # size of the move
     return qualifies, flags, int(max(0, min(100, round(score))))
+
+
+def save_movers():
+    try:
+        with _lock:
+            rows = list(_movers_state["rows"])
+            ts   = _movers_state["ts"]
+            meta = dict(_movers_state["meta"])
+        with open(MOVERS_STATE_FILE, "w") as f:
+            json.dump({"rows": rows, "ts": ts.isoformat() if ts else None,
+                       "meta": meta}, f)
+    except Exception as e:
+        print(f"[movers] save failed: {e}")
+
+
+def load_movers():
+    try:
+        with open(MOVERS_STATE_FILE) as f:
+            data = json.load(f)
+        ts = data.get("ts")
+        with _lock:
+            _movers_state["rows"] = data.get("rows", [])
+            _movers_state["ts"]   = datetime.datetime.fromisoformat(ts) if ts else None
+            _movers_state["meta"] = data.get("meta", {})
+        print(f"[movers] restored {len(_movers_state['rows'])} row(s) from last scan")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[movers] load failed: {e}")
 
 
 # ── News calendar ──────────────────────────────────────────────────────────────
@@ -1746,6 +1795,7 @@ def index():
         "__MOVER_VOL__":   format(MOVER_VOL_MULT, "g"),
         "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
         "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
+        "__MOVER_THIN_M__": str(int(MOVER_THIN_MIN_WEEKLY_VOL / 1e6)),
         "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
         "__FUND_SPOT__":   format(FUND_SPOT_LED_MAX, "g"),
         "__FUND_CROWD__":  format(FUND_CROWDED_MIN, "g"),
@@ -2048,6 +2098,14 @@ def scan_route():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.route("/mover_signals")
+def mover_signals_route():
+    with _lock:
+        s = _movers_state
+        return jsonify({"rows": list(s["rows"]), "meta": dict(s["meta"]),
+                        "ts": s["ts"].isoformat() if s["ts"] else None})
+
+
 @app.route("/calendar")
 def calendar_route():
     refresh_calendar(force=request.args.get("refresh") == "1")
@@ -2056,6 +2114,204 @@ def calendar_route():
                         "meta": dict(_cal_state["meta"]),
                         "ts": _cal_state["ts"].isoformat() if _cal_state["ts"] else None,
                         "now": _iso_z(datetime.datetime.now(datetime.timezone.utc))})
+
+
+@app.route("/movers")
+def movers_route():
+    """Daily movers scan — one SSE stream, ~1 API call per pair.
+
+    Crypto only: is_tradfi() keeps stock / ETF / commodity perps out of the
+    universe entirely. A watchlist built at the weekend that quietly includes an
+    equity perp is quoting levels on an instrument whose underlying market is
+    shut — thin book, funding-driven drift, and a gap at the Monday cash open.
+    """
+    exid      = request.args.get("exchange", "okx")
+    speed     = request.args.get("speed", "normal")
+    min_vol   = float(request.args.get("min_weekly_vol", DEFAULT_MIN_WEEKLY_VOL))
+    max_pairs = int(request.args.get("max_pairs", DEFAULT_MAX_PAIRS))
+    thin      = request.args.get("thin") == "1"
+    # Never above the main floor: lowering the floor below $20M already lets
+    # those pairs in as ordinary rows, and the band is then simply empty.
+    thin_floor = min(MOVER_THIN_MIN_WEEKLY_VOL, min_vol)
+    if speed not in SPEED:
+        speed = "normal"
+
+    def generate():
+        try:
+            main_ex = make_exchange(exid)
+        except ValueError as e:
+            yield sse("error", {"msg": str(e)}); return
+
+        yield sse("log", {"msg": "Loading markets..."})
+        try:
+            mkts = main_ex.load_markets()
+        except Exception as e:
+            yield sse("error", {"msg": f"load_markets failed: {e}"}); return
+
+        all_perps = [s for s in mkts
+                     if s.endswith("/USDT:USDT") and mkts[s].get("active")
+                     and s.split("/")[0] not in STABLE_BASES]
+        perps = [s for s in all_perps if not is_tradfi(mkts[s])]
+        skipped_tradfi = len(all_perps) - len(perps)
+        yield sse("log", {"msg": f"{len(perps)} crypto perps on {exid.upper()} · "
+                                 f"{skipped_tradfi} stock/ETF/commodity perp(s) excluded"})
+
+        yield sse("log", {"msg": "Fetching 24h volumes (one bulk call)..."})
+        try:
+            tickers = main_ex.fetch_tickers()
+        except Exception as e:
+            yield sse("error", {"msg": f"volume fetch failed: {e}"}); return
+
+        vol24 = {}
+        for s in perps:
+            v = usd_volume(tickers.get(s))
+            if v:
+                vol24[s] = v
+        pre_floor = ((thin_floor if thin else min_vol) / 7.0) * PREGATE_SLACK
+        # Sorted most-liquid first, so the max_pairs cap can only ever cut
+        # into the thin end of the list, never the main one.
+        pairs = sorted([s for s in vol24 if vol24[s] >= pre_floor],
+                       key=lambda s: vol24[s], reverse=True)[:max_pairs]
+        yield sse("log", {"msg": f"{len(pairs)} candidates - measuring "
+                                 f"{MOVER_LOOKBACK_D}-day volume and range baselines"})
+
+        spd = SPEED[speed]
+        limiter = RateLimiter(spd["rps"].get(exid, 8))
+        yield sse("total", {"total": len(pairs)})
+
+        tls = threading.local()
+
+        def worker_ex():
+            ex = getattr(tls, "ex", None)
+            if ex is None:
+                ex = make_exchange(exid, rate_limit=False)
+                ex.set_markets(mkts)
+                tls.ex = ex
+            return ex
+
+        q = queue.Queue()
+        counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0,
+                   "quiet": 0, "errors": 0, "thin_analysed": 0, "thin_quiet": 0}
+        clock = threading.Lock()
+
+        def scan_pair(sym):
+            base = sym.split("/")[0]
+            try:
+                ex = worker_ex()
+                raw = _to_df(fetch_ohlcv(ex, limiter, sym, "1d",
+                                         limit=MOVER_LOOKBACK_D + 12))
+                if raw is None or raw.empty:
+                    with clock:
+                        counter["no_data"] += 1
+                    return
+                live_price = float(raw["close"].iloc[-1])
+
+                # Same ordering trap as the divergence scan: drop the open bar
+                # BEFORE any volume measurement. The still-forming day compared
+                # against full days makes every pair look quiet.
+                df = drop_forming_candle(raw, 1440)
+                if df is None or len(df) < MOVER_LOOKBACK_D + 2:
+                    with clock:
+                        counter["no_data"] += 1
+                    return
+
+                wk_vol = weekly_usd_volume(df, vol24.get(sym), 1440)
+                tier = "core"
+                if wk_vol is None or wk_vol < min_vol:
+                    if not (thin and wk_vol is not None and wk_vol >= thin_floor):
+                        with clock:
+                            counter["vol_reject"] += 1
+                        return
+                    tier = "thin"
+
+                m = analyse_mover(df, live_price)
+                if m is None:
+                    with clock:
+                        counter["no_data"] += 1
+                    return
+
+                with clock:
+                    counter["thin_analysed" if tier == "thin" else "analysed"] += 1
+
+                qualifies, flags, score = classify_mover(m, thin=(tier == "thin"))
+                if not qualifies:
+                    with clock:
+                        counter["thin_quiet" if tier == "thin" else "quiet"] += 1
+                    return
+
+                m.update({
+                    "pair": sym, "base": base,
+                    "direction": "UP" if m["chg_1d_pct"] >= 0 else "DOWN",
+                    "flags": flags, "score": score,
+                    "weekly_volume": round(wk_vol, 2),
+                    "daily_volume": round(wk_vol / 7.0, 2),
+                    "tier": tier,
+                    "current_price": px(live_price),
+                })
+                q.put(("result", m))
+            except Exception as e:
+                with clock:
+                    counter["errors"] += 1
+                q.put(("log", {"msg": f"[{base}] skipped: {e}"}))
+            finally:
+                with clock:
+                    counter["n"] += 1
+                    n_now = counter["n"]
+                q.put(("progress", {"current": n_now, "pair": sym}))
+
+        done = threading.Event()
+
+        def runner():
+            try:
+                with ThreadPoolExecutor(max_workers=spd["workers"]) as pool:
+                    list(pool.map(scan_pair, pairs))
+            finally:
+                done.set()
+
+        threading.Thread(target=runner, daemon=True).start()
+
+        rows = []
+
+        def persist():
+            with clock:
+                c = dict(counter)
+            meta = {"exchange": exid, "lookback_d": MOVER_LOOKBACK_D,
+                    "range_d": MOVER_RANGE_D, "min_weekly_vol": min_vol,
+                    "dispatched": len(pairs), "analysed": c["analysed"],
+                    "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
+                    "quiet": c["quiet"], "errors": c["errors"],
+                    "tradfi_excluded": skipped_tradfi,
+                    "thin": thin, "thin_floor": thin_floor if thin else None,
+                    "thin_analysed": c["thin_analysed"],
+                    "thin_quiet": c["thin_quiet"],
+                    "complete": done.is_set() and q.empty()}
+            with _lock:
+                _movers_state["rows"] = rows
+                _movers_state["ts"] = datetime.datetime.now(datetime.timezone.utc)
+                _movers_state["meta"] = meta
+            save_movers()
+            return meta
+
+        # Same discipline as the other two scans: if the browser tab closes
+        # mid-scan, whatever was collected is still saved — and flagged
+        # incomplete, because a partial result read as "quiet market" is the
+        # failure mode that matters.
+        try:
+            while not (done.is_set() and q.empty()):
+                try:
+                    kind, payload = q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if kind == "result":
+                    rows.append(payload)
+                yield sse(kind, payload)
+        finally:
+            meta = persist()
+
+        yield sse("done", {"hits": len(rows), "meta": meta})
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -2274,6 +2530,18 @@ tr.det b{color:var(--tx)}
 ::-webkit-scrollbar-thumb:hover{background:var(--tx3)}
 
 
+#pg-movers.active{display:block;overflow-y:auto;padding:24px}
+#pg-movers{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
+.mv-thin{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--tx2);cursor:pointer;user-select:none}
+.mv-thin input{accent-color:var(--fresh)}
+.mv-sep td{background:var(--fresh-bg);color:var(--fresh);font-family:var(--mono);font-size:10px;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid #4a3500}
+.thin-badge{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500;white-space:nowrap}
+.mrank{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;border-radius:5px;background:var(--sf3);border:1px solid var(--bd2);font-family:var(--mono);font-size:10px;font-weight:700;color:var(--tx3)}
+.mrank.top{background:var(--acc);border-color:var(--acc);color:#000}
+.mpos{position:relative;width:88px;height:5px;background:var(--sf3);border-radius:3px}
+.mpos i{position:absolute;top:-3px;width:3px;height:11px;border-radius:2px;background:var(--tx);transform:translateX(-1px)}
+.mlv{font-family:var(--mono);font-size:10px;color:var(--tx2);white-space:nowrap;line-height:1.6}
+.mlv small{color:var(--tx3);font-size:9px}
 /* ── Calendar ── */
 #pg-calendar.active{display:block;overflow-y:auto;padding:24px}
 #pg-calendar{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
@@ -2332,6 +2600,7 @@ tr.det b{color:var(--tx)}
   <div class="t-div"></div>
   <nav class="nav">
     <button class="nav-btn active" data-pg="scan">Scan</button>
+    <button class="nav-btn" data-pg="movers">Movers</button>
     <button class="nav-btn" data-pg="calendar">Calendar</button>
     <button class="nav-btn" data-pg="learn">Method</button>
   </nav>
@@ -2430,6 +2699,44 @@ tr.det b{color:var(--tx)}
       </table>
     </div>
   </main>
+</div>
+
+<div id="pg-movers" class="page">
+  <div class="sig-hdr">
+    <div><div class="sig-ttl">Movers &mdash; daily watchlist</div>
+    <div class="sig-sub" id="mv-sub">Unusual volume, unusual range, or a big day &mdash; measured on completed daily bars. Crypto perps only. Uses the Scan tab's volume floor, speed and max-pairs.</div></div>
+  </div>
+  <div class="wbar">
+    <select id="mvExchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
+    <button class="rbtn" id="mvRunBtn" onclick="startMovers()">Scan Movers</button>
+    <label class="mv-thin" title="Also measure coins trading $__MOVER_THIN_M__M a week up to the volume floor. They are listed in their own section and need a volume spike AND range expansion together, since on a thin coin one big order is a volume spike by itself. Expect worse fills, slippage through stops, and wicks that clear stops and snap back: size down."><input type="checkbox" id="mvThin" onchange="mvThinPref()"> Include thin coins ($__MOVER_THIN_M__M+/wk)</label>
+    <span class="wprog" id="mvProg"></span>
+  </div>
+  <div class="sig-filters">
+    <button class="sig-ftab active" data-mf="all" onclick="setMF(this)">All</button>
+    <button class="sig-ftab" data-mf="top" onclick="setMF(this)">Top 4</button>
+    <button class="sig-ftab" data-mf="vol" onclick="setMF(this)">Volume spike</button>
+    <button class="sig-ftab" data-mf="rng" onclick="setMF(this)">Range expansion</button>
+    <button class="sig-ftab" data-mf="hi" onclick="setMF(this)">At range high</button>
+    <button class="sig-ftab" data-mf="lo" onclick="setMF(this)">At range low</button>
+  </div>
+  <div id="mv-audit" class="audit" style="margin:0 0 12px"></div>
+  <div class="tw" style="overflow:visible">
+    <table id="mvT" style="display:none">
+      <thead><tr>
+        <th>#</th><th>Coin</th>
+        <th title="How unusual the day was, 0-100: volume anomaly (35) + range expansion (30) + proximity to a 7-day boundary (20) + size of the move (15). Has no direction. Not a win rate, not backtested.">Standout</th>
+        <th title="Last completed daily bar, close to close. Highlighted at __MOVER_CHG__%+, which is one of the three triggers. The small figure underneath is the live move since that close.">&Delta;1d</th>
+        <th title="Traded value of the last completed day as a multiple of this coin's own 20-day average. __MOVER_VOL__x+ is a trigger. A self-ratio only, never a dollar figure.">Vol vs 20d</th>
+        <th title="True range of the last completed day as a multiple of this coin's own 20-day ATR. __MOVER_RNG__x+ is a trigger.">Range vs ATR20</th>
+        <th title="Where the live price sits between the 7-day low (0%) and the 7-day high (100%).">Position in 7d range</th>
+        <th title="PDH / PDL: prior-day high and low. 7D: the 7-day range boundaries. The levels to plan around, and the point where you are wrong.">Levels</th>
+        <th title="Why this coin is on the list. Any one trigger qualifies. Hover a tag for its definition and threshold.">Read</th>
+      </tr></thead>
+      <tbody id="mvB"></tbody>
+    </table>
+    <div class="no-sig" id="mvEmpty">No movers scan yet &mdash; hit Scan Movers.</div>
+  </div>
 </div>
 
 <div id="pg-calendar" class="page">
@@ -2563,6 +2870,19 @@ tr.det b{color:var(--tx)}
   </div>
 
   <div class="dash-sec">
+    <div class="dash-sec-ttl">Movers &mdash; what a daily watchlist is actually screening for</div>
+    <div class="rules">
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Three triggers, any one qualifies.</b> A 1-day move of 5%+, <i>or</i> the day's traded value at 2x its own 20-day average, <i>or</i> the day's true range at 1.5x ATR20. A coin only has to be unusual in one way to be worth a look.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Volume and range beat raw % change.</b> Sorting the market by 24h gainers is the lazy version of this screen: it surfaces whatever already moved and misses a dormant coin waking up on 3x volume. Both ratios are measured against each coin's <b>own</b> 20-day baseline, so a quiet large-cap and a volatile micro-cap are judged on the same scale.</div></div>
+      <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Volume is only ever a self-ratio.</b> The OHLCV volume column means different things per exchange &mdash; coins, contracts, or quote currency. Comparing one coin's day against its own average divides that unknown factor out; comparing dollar amounts across venues would not.</div></div>
+      <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Every row arrives with levels.</b> Prior-day high and low, the 7-day range boundaries, and where price sits inside that range right now. A watchlist without a level and a point where you are wrong is a list of names, not a plan &mdash; and that is the part these posts usually leave out.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Completed bars only.</b> The scan describes the last <b>closed</b> day, so it reads the same at 02:00 and at 22:00. It tells you what happened yesterday so you can plan today; it is not a live intraday tape.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>No stocks, ETFs or commodities.</b> Those perps are excluded from the universe entirely. Their underlying market closes at the weekend, leaving a thin book, funding-driven drift and a gap at the Monday cash open &mdash; quoting a weekend level on one is quoting a level on nothing.</div></div>
+      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>The standout score is a description, not an edge.</b> Volume anomaly (35), range expansion (30), proximity to a 7-day boundary (20), size of the move (15). It has no direction and has not been backtested &mdash; the same caveat as the setup score.</div></div>
+    </div>
+  </div>
+
+  <div class="dash-sec">
     <div class="dash-sec-ttl">Setup score &mdash; read this before trusting it</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
       The score is a <b style="color:var(--tx)">description of the structure</b>, not a win rate and not a
@@ -2689,6 +3009,7 @@ function showPg(name){
   document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
   document.getElementById('pg-' + name).classList.add('active');
   document.querySelectorAll('.nav-btn').forEach(function(b){ b.classList.toggle('active', b.dataset.pg === name); });
+  if(name === 'movers') loadMovers();
   if(name === 'calendar') loadCalendar();
 }
 document.querySelectorAll('.nav-btn').forEach(function(b){
@@ -2704,7 +3025,7 @@ var WQ = {
 };
 var WFLAG = {'SPOT-LED':'wf-spot','CROWDED LONGS':'wf-crowd','SQUEEZE FUEL':'wf-squeeze','HIGH OI/VOL':'wf-hioi'};
 
-var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__,
+var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__, thinM:__MOVER_THIN_M__,
           oiVol:__OI_VOL__, fundSpot:__FUND_SPOT__, fundCrowd:__FUND_CROWD__, fundSqueeze:__FUND_SQUEEZE__};
 var TIP = {
   'NEW LONGS':       'Price up + OI up: new money opening longs. A real trend if funding is not rich.',
@@ -2729,6 +3050,174 @@ function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-move',
              'AT RANGE HIGH':'mf-hi','ABOVE 7D HIGH':'mf-hi',
              'AT RANGE LOW':'mf-lo','BELOW 7D LOW':'mf-lo'};
+
+function fmtPct(v){
+  if(v === null || v === undefined) return '&mdash;';
+  return (v >= 0 ? '+' : '') + v + '%';
+}
+/* ── Movers (daily watchlist) ─────────────────────────────────────────────── */
+var _mf = 'all', _mrows = [], mes = null;
+
+function mMatches(r, f){
+  var fl = r.flags || [];
+  if(f === 'vol') return fl.indexOf('VOLUME SPIKE') >= 0;
+  if(f === 'rng') return fl.indexOf('RANGE EXPANSION') >= 0;
+  if(f === 'hi')  return fl.indexOf('AT RANGE HIGH') >= 0 || fl.indexOf('ABOVE 7D HIGH') >= 0;
+  if(f === 'lo')  return fl.indexOf('AT RANGE LOW') >= 0 || fl.indexOf('BELOW 7D LOW') >= 0;
+  return true;
+}
+function setMF(btn){
+  document.querySelectorAll('.sig-ftab[data-mf]').forEach(function(b){ b.classList.remove('active'); });
+  btn.classList.add('active'); _mf = btn.dataset.mf; renderMovers();
+}
+function fmtX(v){ return (v === null || v === undefined) ? '&mdash;' : v.toFixed(2) + 'x'; }
+
+/* Same contract as the other two audit lines: every pair the scan did not
+   actually measure gets named, so a short list can never be misread as a
+   quiet market. */
+function moversAudit(m){
+  if(!m || !m.dispatched) return '';
+  var bits = [m.analysed + ' of ' + m.dispatched + ' pairs measured',
+              (m.quiet || 0) + ' unremarkable (no trigger hit)'];
+  if(m.vol_rejected)    bits.push(m.vol_rejected + ' below the volume floor');
+  if(m.no_data)         bits.push(m.no_data + ' had too little daily history');
+  if(m.errors)          bits.push(m.errors + ' errored');
+  if(m.tradfi_excluded) bits.push(m.tradfi_excluded + ' stock/ETF/commodity perp(s) excluded by design');
+  if(m.thin) bits.push((m.thin_analysed || 0) + ' thin pair(s) measured, ' + (m.thin_quiet || 0) +
+                       ' without volume spike + range expansion together');
+  var txt = bits.join(' · ');
+  if(m.complete === false){
+    return '<div class="audit warn">&#9888; This movers scan did not finish &mdash; re-run before trusting it.<br>' + txt + '</div>';
+  }
+  return txt;
+}
+function mvRow(r, i, thin){
+  var flags = (r.flags || []).map(function(f){
+    return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
+  }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
+  var up  = r.chg_1d_pct >= 0;
+  var big = Math.abs(r.chg_1d_pct || 0) >= TH.chg;
+  var badge = thin ? '<div><span class="thin-badge" title="Below the volume floor. Thin book: expect worse fills and slippage through stops. Size down.">THIN &middot; ' +
+                     fmtVol(r.daily_volume) + '/day</span></div>' : '';
+  var tr = document.createElement('tr');
+  tr.className = up ? 'rb' : 'rr';
+  tr.innerHTML =
+    '<td><span class="mrank' + (!thin && i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
+    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div>' + badge + '</td>' +
+    '<td>' + qcell(r.score) + '</td>' +
+    '<td><span style="font-family:var(--mono);font-weight:600;color:' + (big ? 'var(--fresh)' : up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
+      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">today ' + fmtPct(r.chg_live_pct) + '</div></td>' +
+    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= TH.vol ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
+    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= TH.rng ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
+    '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
+      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:3px">' + r.pos_in_range + '% of range</div></td>' +
+    '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + ' &nbsp;<small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
+      '<div class="mlv"><small>7D</small> ' + fmtPx(r.r_lo) + ' &ndash; ' + fmtPx(r.r_hi) + '</div></td>' +
+    '<td>' + flags + '</td>';
+  return tr;
+}
+/* Thin rows never share a ranking with the main list: a $3M/day coin with a
+   whale print would otherwise top it on score alone. Top 4 is main-list only. */
+function renderMovers(){
+  var rows = _mrows.slice().sort(function(a, b){ return b.score - a.score; })
+                   .filter(function(r){ return mMatches(r, _mf); });
+  var core = rows.filter(function(r){ return r.tier !== 'thin'; });
+  var thin = _mf === 'top' ? [] : rows.filter(function(r){ return r.tier === 'thin'; });
+  if(_mf === 'top') core = core.slice(0, 4);
+  var tb = document.getElementById('mvB'); tb.innerHTML = '';
+  if(core.length + thin.length === 0){
+    document.getElementById('mvT').style.display = 'none';
+    var e = document.getElementById('mvEmpty');
+    e.style.display = '';
+    e.textContent = _mrows.length ? 'No pairs match this filter.' : 'No movers scan yet - hit Scan Movers.';
+    return;
+  }
+  document.getElementById('mvEmpty').style.display = 'none';
+  document.getElementById('mvT').style.display = 'table';
+  core.forEach(function(r, i){ tb.appendChild(mvRow(r, i, false)); });
+  if(thin.length){
+    var sep = document.createElement('tr');
+    sep.className = 'mv-sep';
+    sep.innerHTML = '<td colspan="9">&#9888; LOW LIQUIDITY &mdash; $' + TH.thinM + 'M/week up to the floor &middot; ' +
+      'listed only on volume spike AND range expansion together &middot; thin book, wider fills, size down</td>';
+    tb.appendChild(sep);
+    thin.forEach(function(r, i){ tb.appendChild(mvRow(r, i, true)); });
+  }
+}
+function mvThinPref(){
+  try { localStorage.setItem('mvThin', document.getElementById('mvThin').checked ? '1' : '0'); } catch(x){}
+}
+function loadMovers(){
+  fetch('/mover_signals').then(function(r){ return r.json(); }).then(function(d){
+    _mrows = d.rows || [];
+    var m = d.meta || {};
+    if(d.ts){
+      var ma = Math.round((Date.now() - new Date(d.ts)) / 60000);
+      document.getElementById('mv-sub').textContent =
+        _mrows.length + ' movers on ' + (m.exchange || '').toUpperCase() +
+        ' · last completed daily bar vs its ' + (m.lookback_d || 20) +
+        '-day baseline · scanned ' + ma + ' min ago';
+      if(m.exchange) document.getElementById('mvExchange').value = m.exchange;
+    }
+    var pref = null;
+    try { pref = localStorage.getItem('mvThin'); } catch(x){}
+    document.getElementById('mvThin').checked = pref !== null ? pref === '1' : !!m.thin;
+    document.getElementById('mv-audit').innerHTML = moversAudit(m);
+    renderMovers();
+  }).catch(function(){});
+}
+function startMovers(){
+  if(mes){ mes.close(); mes = null; }
+  var ex  = document.getElementById('mvExchange').value;
+  var vol = (parseInt(document.getElementById('minVol').value) || 70) * 1e6;
+  var spd = document.querySelector('#spdG .tbtn.active').dataset.val;
+  var mp  = parseInt(document.getElementById('maxPairs').value) || 400;
+  var btn = document.getElementById('mvRunBtn');
+  btn.disabled = true;
+  _mrows = [];
+  renderMovers();
+  document.getElementById('mv-audit').innerHTML = '';
+  var mtot = 0, prog = document.getElementById('mvProg');
+  prog.textContent = 'Loading markets...';
+
+  var thin = document.getElementById('mvThin').checked ? '1' : '0';
+  mes = new EventSource('/movers?exchange=' + ex + '&min_weekly_vol=' + vol +
+                        '&speed=' + spd + '&max_pairs=' + mp + '&thin=' + thin);
+  mes.addEventListener('log', function(e){ prog.textContent = JSON.parse(e.data).msg; });
+  mes.addEventListener('total', function(e){ mtot = JSON.parse(e.data).total; });
+  mes.addEventListener('progress', function(e){
+    var d = JSON.parse(e.data);
+    prog.textContent = d.current + '/' + mtot + ' - ' + d.pair.replace('/USDT:USDT','');
+  });
+  mes.addEventListener('result', function(e){
+    _mrows.push(JSON.parse(e.data));
+    renderMovers();
+  });
+  mes.addEventListener('done', function(e){
+    var d = JSON.parse(e.data);
+    mes.close(); btn.disabled = false;
+    prog.textContent = 'Done - ' + d.hits + ' mover(s)';
+    var m = d.meta || {};
+    document.getElementById('mv-audit').innerHTML = moversAudit(m);
+    document.getElementById('mv-sub').textContent =
+      d.hits + ' movers on ' + (m.exchange || '').toUpperCase() +
+      ' · last completed daily bar vs its ' + (m.lookback_d || 20) + '-day baseline · just now';
+  });
+  mes.addEventListener('error', function(e){
+    if(!e.data) return;
+    var msg = 'Scan error';
+    try { msg = JSON.parse(e.data).msg; } catch(x){}
+    prog.textContent = msg; mes.close(); btn.disabled = false;
+  });
+  mes.onerror = function(){
+    if(mes.readyState === EventSource.CLOSED) return;
+    // Same reasoning as the other two scans: an EventSource reconnect silently
+    // launches a SECOND full scan against the same exchange quota. Close it and
+    // let the user decide to re-run.
+    mes.close(); btn.disabled = false;
+    prog.textContent = 'Connection lost - scan stopped.';
+  };
+}
 
 /* ── Sidebar controls ─────────────────────────────────────────────────────── */
 var STR_HINTS = {
@@ -3305,5 +3794,6 @@ document.addEventListener('DOMContentLoaded', function(){
 if __name__ == "__main__":
     load_dotenv()     # JBLANKED_API_KEY from .env, if there is one
     load_state()      # restore the last scan so the dashboard isn't amnesiac
+    load_movers()     # ...and the last movers scan
     load_calendar()   # ...and the news calendar
     app.run(debug=False, threaded=True, port=5099)

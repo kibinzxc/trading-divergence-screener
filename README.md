@@ -46,6 +46,11 @@ serves both the API and a browser dashboard.
   expansion, at the 7-day high or low) and 7-day open-interest flow with
   funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
   change the verdict.
+- **Movers tab** (`/movers`): a separate scan of every liquid crypto perp for
+  an unusual last completed day (5%+ move, 2x its 20-day volume, or 1.5x its
+  ATR20), whether or not the coin diverges. Each row lists the prior-day and
+  7-day levels. An opt-in thin band adds coins from $20M a week up to the
+  volume floor, held to volume spike and range expansion together.
 - **News calendar** (`/calendar`): the scheduled macro prints that actually
   move crypto perps — US CPI/PCE/PPI, the jobs report, FOMC and Powell, GDP,
   retail sales, ISM, plus the BoJ/ECB/BoE rate decisions — on a two-week grid
@@ -103,6 +108,8 @@ without re-scanning.
 | `/` | GET | Dashboard UI |
 | `/scan` | GET (SSE) | Run the 4H + 1H divergence scan |
 | `/signals` | GET | Last cached `/scan` result (`rows`, `meta`, `ts`) |
+| `/movers` | GET (SSE) | Run the daily movers scan; `thin=1` adds the low-liquidity band |
+| `/mover_signals` | GET | Last cached `/movers` result (`rows`, `meta`, `ts`) |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
 | `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 

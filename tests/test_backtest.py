@@ -5,6 +5,7 @@ Run with:  python -m unittest tests.test_backtest -v
 import os
 import sys
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -18,8 +19,15 @@ RULES = m.STRICTNESS["balanced"]
 REPLAY = [(90, 1, 0)] + W[1:4] + [(30, 1, 0)]
 
 
-def frame(**after_130):
-    df = wave_df(REPLAY)
+def padded(df, n):
+    """df plus n copies of its last bar: MACD stays above the signal line, no new cross."""
+    idx = pd.date_range(df.index[-1], periods=n + 1, freq=df.index.freq)[1:]
+    return pd.concat([df, pd.DataFrame([df.iloc[-1]] * n, index=idx)])
+
+
+def frame(pad=60, **after_130):
+    # 214 bars: entries up to bar 165 still have the 48-bar 1H time exit ahead
+    df = padded(wave_df(REPLAY), pad)
     for col, val in after_130.items():
         df.iloc[130:, df.columns.get_loc(col)] = val
     return df
@@ -55,19 +63,33 @@ class Outcome(unittest.TestCase):
         self.assertEqual(m.trade_result(df, 0, "bullish", 100.0, 99.9, 1, 30)["r"], -1.2)
 
 
+@mock.patch.object(m, "MIN_HISTORY", 80)   # the synthetic frames are shorter than the live 300
 class Replay(unittest.TestCase):
     def test_signal_is_taken_on_the_bar_it_first_exists(self):
         t = m.backtest_pair(frame(), "1h", RULES)
         self.assertEqual(len(t), 1)
         self.assertEqual((t[0]["side"], t[0]["tf"], t[0]["time"]),
                          ("bullish", "1h", str(wave_df(REPLAY).index[126])))
-        # 27 bars left, short of the 48-bar time exit and nothing hit: unresolved
-        self.assertEqual((t[0]["r1"], t[0]["r2"], t[0]["r3"], t[0]["bars"]), (None, None, None, None))
+        # flat after the signal, nothing hit: out at the close 48 bars later
+        self.assertEqual(t[0]["bars"], 48)
         # no HTF, OI or BTC here: the pattern points alone, rescaled (46.5 / 70)
         self.assertEqual((t[0]["score"], t[0]["grade"], t[0]["regime"]), (66, "B", "COUNTER TREND"))
-        # 0.05% slippage against a long; bar 126 of replayed 80..152 is in the first 70%
+        # 0.05% slippage against a long; bar 126 of replayed 79..165 is in the first 70%
         self.assertAlmostEqual(t[0]["entry"], wave_df(REPLAY)["close"].iloc[126] * 1.0005)
         self.assertTrue(t[0]["in_sample"])
+
+    def test_no_entry_without_the_full_time_exit_ahead(self):
+        # A win 4 bars in is still not taken when the history could not have shown
+        # a loss or a time exit: keeping only early outcomes would bias the stats.
+        self.assertEqual(m.backtest_pair(frame(pad=0, high=130.0), "1h", RULES), [])
+        self.assertEqual(m.backtest_pair(frame(pad=20, high=130.0), "1h", RULES), [])   # 47 bars after 126
+        self.assertEqual(len(m.backtest_pair(frame(pad=21, high=130.0), "1h", RULES)), 1)
+
+    def test_replay_starts_at_the_live_minimum_history(self):
+        with mock.patch.object(m, "MIN_HISTORY", 128):     # signal first seen at bar 126
+            self.assertEqual(m.backtest_pair(frame(), "1h", RULES), [])
+        with mock.patch.object(m, "MIN_HISTORY", 127):     # bar 126 is the 127th bar
+            self.assertEqual(len(m.backtest_pair(frame(), "1h", RULES)), 1)
 
     def test_outcome_follows_the_bars_after_entry(self):
         win = m.backtest_pair(frame(high=130.0), "1h", RULES)[0]
@@ -85,6 +107,7 @@ class Replay(unittest.TestCase):
         self.assertEqual([a[k] for k in keys], [b[k] for k in keys])
 
 
+@mock.patch.object(m, "MIN_HISTORY", 80)
 class SameMomentAsLive(unittest.TestCase):
     def test_context_is_judged_at_the_signal_bar_close_not_the_first_seen_bar(self):
         df = frame()

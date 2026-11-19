@@ -897,9 +897,10 @@ def entry_verdict(sig, blocker=None):
         return out("skip", f"No. Price already moved {sig['r_reached']:g}x the risk toward the "
                            "target. The move has happened; entering now is chasing it.")
     if not sig["fresh"]:
-        return out("skip", f"No. The signal bar closed {sig['bars_ago'] * cfg['minutes'] / 60:g}h "
-                           f"ago, too long ago to act on (the limit on {cfg['label']} is "
-                           f"{cfg['fresh_h']}h).")
+        return out("skip", f"No. {sig['bars_ago']} completed {cfg['label']} bars "
+                           f"({sig['bars_ago'] * cfg['minutes'] / 60:g}h) have closed after the signal "
+                           f"bar, too many to act on (the limit on {cfg['label']} is "
+                           f"{cfg['fresh_h'] * 60 // cfg['minutes']} bars, {cfg['fresh_h']}h).")
     if sig["grade"] == "C":
         return out("skip", f"No. Weak setup: grade C, score {sig['score']} of 100.")
     if sig["regime"] == "COUNTER TREND" and sig["grade"] != "A":
@@ -1100,6 +1101,7 @@ def atr_pct_out_of_range(atr, close):
 
 def oi_too_thin(hist, price):
     """Latest point of an OI history below MIN_OI_USD. Unknown: False."""
+    # shortcut: OKX's OI history is per coin (all its contracts), so there this is coin-wide, not this contract's; filter per contract from fetch_open_interest if a coin with several OKX contracts slips through.
     pts = [p for p in (hist or []) if p.get("timestamp")]
     usd = oi_point_usd(max(pts, key=lambda p: p["timestamp"]), price) if pts else None
     return usd is not None and usd < MIN_OI_USD
@@ -1868,11 +1870,11 @@ def load_venue(exid):
     return {"ex": ex, "mkts": mkts, "perps": usdt_perps(mkts), "tickers": ex.fetch_tickers()}
 
 
-def fetch_btc(ex, limiter):
+def fetch_btc(ex, limiter, bars=TF_CFG["4h"]["bars"]):
     """BTC 4H RSI 14, close and 200 EMA on completed bars, for the BTC state.
     None when unavailable."""
     df = drop_forming_candle(
-        fetch_df_deep(ex, limiter, "BTC/USDT:USDT", "4h", TF_CFG["4h"]["bars"]), 240)
+        fetch_df_deep(ex, limiter, "BTC/USDT:USDT", "4h", bars), 240)
     if df is None or len(df) < 80:
         return None
     return pd.DataFrame({"rsi": rsi(df["close"]), "close": df["close"],
@@ -1936,9 +1938,11 @@ def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, ma
     table shows — is the one with the best entry verdict (enter, then wait,
     then skip); on a tie the earlier timeframe in TF_CFG order (4H) wins.
     `blocker` / `macro` are the two halves of macro_window(): the first feeds
-    the verdict, the second only becomes the row's MACRO tag.
+    the verdict, the second only becomes the row's MACRO tag. A blocker due
+    within 24h that does not change the primary's answer (outside its wait
+    window, or the answer is already No / Not yet for another reason) is the
+    MACRO tag too; the sooner of the two is shown.
     """
-    macro_tag = f"MACRO {macro[1]} in {_hours_txt(macro[0])}" if macro else None
     order = list(TF_CFG)
     rows = {}
     for s in sorted(sigs, key=lambda s: order.index(s["tf"])):
@@ -1946,7 +1950,7 @@ def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, ma
             "pair": s["pair"], "base": s["base"], "side": s["side"],
             "current_price": s["current_price"], "weekly_volume": s["weekly_volume"],
             "tfs": [], "signals": {},
-            "mover": mover, "flow": flow, "context_error": context_error, "macro": macro_tag})
+            "mover": mover, "flow": flow, "context_error": context_error})
         r["tfs"].append(s["tf"])
         r["signals"][s["tf"]] = s
     for r in rows.values():
@@ -1959,6 +1963,10 @@ def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, ma
         r["fresh"]  = any(s["fresh"] for s in r["signals"].values())
         r["status"] = p["status"]
         r["entry"]  = verdicts[best]
+        due = [macro] if macro else []
+        if blocker and 0 < blocker[0] <= 24 and verdicts[best] == entry_verdict(p, None):
+            due.append(blocker)
+        r["macro"] = f"MACRO {min(due)[1]} in {_hours_txt(min(due)[0])}" if due else None
     return list(rows.values())
 
 
@@ -2060,7 +2068,7 @@ def render_chart(df, d, sig):
 
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
-BT_WARMUP = 80      # bars before the replay starts, so MACD has settled
+BT_BARS, BT_HTF_BARS_1D = 1500, 300     # deeper than the live scan, so the replay after MIN_HISTORY is long
 BT_SLIP, BT_FEE = 0.0005, 0.001          # slippage against the entry; round-trip fee, both of price
 BT_TIME_EXIT = {"4h": 30, "1h": 48}      # bars after entry, then out at the close
 BT_IN_SAMPLE = 0.7                       # first 70% of each frame's replayed bars
@@ -2098,11 +2106,17 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
     A signal is taken the first time the detector reports it, at that bar's
     close. Not replayed: open interest (no bar-by-bar history), so that
     component leaves the score's denominator, and the lower-timeframe trigger.
+
+    The first replayed bar is the first one the live scan would analyse
+    (MIN_HISTORY completed bars). The last is BT_TIME_EXIT bars before the
+    end, so every trade taken resolves under all three exits: a later entry
+    would only be kept when it hit the stop or a target early.
     """
     cfg, seen, trades = TF_CFG[tf], set(), []
     close = df["close"].values
-    cut = BT_WARMUP + BT_IN_SAMPLE * (len(df) - 1 - BT_WARMUP)
-    for i in range(BT_WARMUP, len(df) - 1):
+    first, last = MIN_HISTORY - 1, len(df) - 1 - BT_TIME_EXIT[tf]
+    cut = first + BT_IN_SAMPLE * (last + 1 - first)
+    for i in range(first, last + 1):
         view = df.iloc[:i + 1]
         for side in ("bullish", "bearish"):
             k = 1 if side == "bullish" else -1
@@ -2199,12 +2213,12 @@ def run_backtest(exid="binance", n_pairs=30, symbols=(), strictness="balanced"):
         df = drop_forming_candle(fetch_df_deep(ex, limiter, sym, tf, bars), minutes)
         return with_indicators(df) if df is not None and len(df) >= 80 else None
 
-    btc = fetch_btc(ex, limiter)
+    btc = fetch_btc(ex, limiter, BT_BARS)
     trades = []
     for n, sym in enumerate(pairs, 1):
-        d4 = load(sym, "4h", TF_CFG["4h"]["bars"], 240)
-        d1h = load(sym, "1h", TF_CFG["1h"]["bars"], 60)
-        d1d = load(sym, "1d", HTF_BARS_1D, 1440)
+        d4 = load(sym, "4h", BT_BARS, 240)
+        d1h = load(sym, "1h", BT_BARS, 60)
+        d1d = load(sym, "1d", BT_HTF_BARS_1D, 1440)
         got = (backtest_pair(d4, "4h", rules, d1d, btc) if d4 is not None else []) + \
               (backtest_pair(d1h, "1h", rules, d4, btc) if d1h is not None else [])
         trades += got
@@ -2227,7 +2241,9 @@ def run_backtest(exid="binance", n_pairs=30, symbols=(), strictness="balanced"):
         for label, g in groups:
             print(f"{label:<18}{half(group_stats([t for t in g if t['in_sample']]))} | "
                   f"{half(group_stats([t for t in g if not t['in_sample']]))}")
-    print(f"\n{tune_cutoff(trades)[1]}")
+    print()
+    for tf in ("4h", "1h"):        # per timeframe: their in / out-of-sample windows are different dates
+        print(f"{TF_CFG[tf]['label']} {tune_cutoff([t for t in trades if t['tf'] == tf])[1]}")
     print(f"""
 n = trades resolved under the 2R exit. winNR / expNR = share above zero and average R after
 fees when exiting at the stop, at N x risk, or at the close {BT_TIME_EXIT['4h']} bars (4H) /
@@ -2235,10 +2251,13 @@ fees when exiting at the stop, at N x risk, or at the close {BT_TIME_EXIT['4h']}
 (longest losing streak, by time) use the 2R exit. Entry: the close of the bar the signal first
 appears on, {BT_SLIP:.2%} slippage against the trade; fees {BT_FEE:.2%} of price round trip, in R.
 A bar touching both the stop and the target counts as the stop. Fewer than {BT_MIN_N} -> insufficient.
+Replay: {BT_BARS} bars per timeframe, from the {MIN_HISTORY}th (the live minimum) to {BT_TIME_EXIT['4h']} (4H) /
+{BT_TIME_EXIT['1h']} (1H) bars before the end, so every trade resolves under all three exits.
 
 Known gaps: open interest is not replayed (no bar-by-bar history), so that component is dropped
-and the score rescaled, as live does when OI is missing. The lower-timeframe triggers and the
-spread / OI thin-coin filters are not replayed. Funding is not replayed.""")
+and the score rescaled, as live does when OI is missing. The lower-timeframe triggers are not
+replayed, and neither are the scan's pair filters: the weekly volume floor, the 4H ATR% range
+and the spread / OI thin-coin filters (pairs are the most liquid now). Funding is not replayed.""")
 
 
 # ── State persistence ──────────────────────────────────────────────────────────
@@ -3282,7 +3301,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the signal bar closed more than 24h ago on 4H or 8h on 1H, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
+          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
           <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
           <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
           <th title="WITH TREND: the BTC 4H state (BULL or BEAR) and this coin's 200 EMA both agree with the side. CHOP: BTC is neither BULL nor BEAR; a reversal keeps the normal cutoff. COUNTER TREND (also when BTC data is missing) needs grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
@@ -3290,8 +3309,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
           <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
           <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
           <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
-          <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. Click to sort, biggest build-up first.">7d OI</th>
-          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 8 score points and a trigger (LTF, or 15M on a 4H signal) is what allows Yes (early). PARTIAL DATA means some score context could not be checked. Then MACRO (a non-blocking calendar print within 24h), the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
+          <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. On OKX it covers all of the coin's contracts, not just this one. Click to sort, biggest build-up first.">7d OI</th>
+          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 8 score points and a trigger (LTF, or 15M on a 4H signal) is what allows Yes (early). PARTIAL DATA means some score context could not be checked. Then MACRO (a calendar print within 24h that the answer does not name), the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -3377,9 +3396,10 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   <div class="dash-sec">
     <div class="dash-sec-ttl">What every tag means</div>
     <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
-      Each tag as it appears in the table, with the same wording as its hover text. Only the pattern
-      tags TRIPLE, LTF TRIGGER and 15M TRIGGER feed the answer; every other tag, MACRO included,
-      is context for you to weigh.
+      Each tag as it appears in the table, with the same wording as its hover text. The regime tags
+      set the grade the answer needs (COUNTER TREND needs A), TRIPLE and PARTIAL DATA change the
+      score, and LTF / 15M TRIGGER allow Yes (early); every other tag, MACRO included, is context
+      for you to weigh.
     </div>
   </div>
   <div id="tagsBody"></div>
@@ -3452,7 +3472,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>A then B, with a real bump between.</b> Two neighbouring troughs, 8 to 80 bars apart. The MACD peak between them must rise at least 25% of the leg's MACD range above the higher trough: that is the middle of the W.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be at least 15% of the leg's MACD range. This is what kills micro-divergences.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Reported only when wave B is closed.</b> The cross that ends wave B is the signal bar and its close is the signal price. Before that cross there is no signal.</div></div>
-      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars. Thin coins are left out too: a top-of-book spread above 0.1%, a 4H ATR outside 0.6% to 8% of price, or (for a coin with a setup) open interest under $5M. A timeframe with fewer than 300 completed bars is not analysed, so the 200 EMA has settled. Unknown spread or OI never excludes a coin, and a symbol override skips all of these. The audit line under the table counts each.</div></div>
+      <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars. Thin coins are left out too: a top-of-book spread above 0.1%, a 4H ATR outside 0.6% to 8% of price, or (for a coin with a setup) open interest under $5M. On OKX that open interest is the whole coin's, across all its contracts. A timeframe with fewer than 300 completed bars is not analysed, so the 200 EMA has settled. Unknown spread or OI never excludes a coin, and a symbol override skips all of these. The audit line under the table counts each.</div></div>
       <div class="rule"><div class="rule-n">08</div><div class="rule-b"><b>One row per coin, Binance first.</b> The All exchange setting reads Binance; a coin Binance does not list is read on whichever of OKX / Bybit trades more of it and tagged NOT ON BINANCE. For each row the same detection then runs on the other venues listing the coin, and the row is tagged ALSO ON with those where the same side fires within one bar. A tag, never points. Picking one exchange scans only that one, with no venue tags.</div></div>
     </div>
   </div>
@@ -3460,8 +3480,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">Good to enter? &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the signal bar closed more than 24 hours ago on 4H or 8 hours ago on 1H, or the grade is C.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment rate, FOMC rate / statement / press conference, Fed Chair speech or testimony) due within 12 hours for a 4H signal or 4 hours for a 1H signal, or printed in the last hour, or a signal bar that has not closed and has no lower-timeframe trigger. BoJ / ECB / BoE rate decisions and the rest of the market movers never block; one due within 24 hours shows as a MACRO tag.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar (counted to the last completed bar, not the clock), or the grade is C.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment rate, FOMC rate / statement / press conference, Fed Chair speech or testimony) due within 12 hours for a 4H signal or 4 hours for a 1H signal, or printed in the last hour, or a signal bar that has not closed and has no lower-timeframe trigger. BoJ / ECB / BoE rate decisions and the rest of the market movers never block; one due within 24 hours shows as a MACRO tag, and so does a USD print above that the answer does not name (e.g. CPI in 6 hours on a 1H row).</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run.</div></div>
@@ -3676,15 +3696,15 @@ var TIP = {
   'W-PATTERN':       'The bump between A and B is at least half the MACD range of the leg: a clear W (M for bearish).',
   'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
   '15M TRIGGER':     '4H signals only: the 15m chart has crossed its MACD and closed beyond its last swing since B, within 8 hours of the 4H close. Your actual entry moment; the trigger price is whichever trigger (1H or 15m) closed first.',
-  'MACRO':           'A curated market mover that does not block the answer (BoJ / ECB / BoE rates, GDP, retail sales, ISM, FOMC minutes, ...) is due within 24 hours. Context only: the USD prints that do block (CPI, PCE, PPI, jobs, FOMC rate, Fed Chair) show in the answer instead.',
+  'MACRO':           'A calendar print due within 24 hours that this row\'s answer does not name: a curated market mover that never blocks (BoJ / ECB / BoE rates, GDP, retail sales, ISM, FOMC minutes, ...), or a USD print that can block (CPI, PCE, PPI, jobs, FOMC rate, Fed Chair) but is outside this timeframe\'s wait window (12h on 4H, 4h on 1H) or the answer is already No / Not yet for another reason. The sooner one is shown. Context only.',
+  '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags above are exactly that combination. n/a = too little OI history. On OKX it covers all of the coin\'s contracts, not just this one.',
   'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.',
   'WITH TREND':      'The BTC 4H state agrees with the signal (BULL: RSI above 55 and close above its 200 EMA; BEAR: RSI below 45 and close below it) and so does the coin\'s own 200 EMA. Grade B is enough for Yes.',
   'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
   'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
   'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100.',
   'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is shown under the pair name).',
-  'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.',
-  '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags above are exactly that combination. n/a = too little OI history.'
+  'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 

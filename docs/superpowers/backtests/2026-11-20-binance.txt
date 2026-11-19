@@ -1,91 +1,93 @@
-[1/60] BTC/USDT:USDT: 2 signal(s)
-[2/60] ETH/USDT:USDT: 3 signal(s)
-[3/60] SOL/USDT:USDT: 3 signal(s)
-[4/60] ZEC/USDT:USDT: 4 signal(s)
-[5/60] XRP/USDT:USDT: 3 signal(s)
-[6/60] MMT/USDT:USDT: 1 signal(s)
-[7/60] HYPE/USDT:USDT: 5 signal(s)
-[8/60] EVAA/USDT:USDT: 3 signal(s)
-[9/60] NEAR/USDT:USDT: 5 signal(s)
-[10/60] PIEVERSE/USDT:USDT: 2 signal(s)
-[11/60] 1000PEPE/USDT:USDT: 2 signal(s)
-[12/60] BNB/USDT:USDT: 6 signal(s)
-[13/60] IRYS/USDT:USDT: 4 signal(s)
-[14/60] DOGE/USDT:USDT: 5 signal(s)
-[15/60] ENA/USDT:USDT: 2 signal(s)
-[16/60] ICNT/USDT:USDT: 6 signal(s)
-[17/60] UNI/USDT:USDT: 3 signal(s)
-[18/60] ADA/USDT:USDT: 5 signal(s)
-[19/60] BTW/USDT:USDT: 1 signal(s)
-[20/60] SUI/USDT:USDT: 3 signal(s)
-[21/60] NAORIS/USDT:USDT: 2 signal(s)
-[22/60] LINK/USDT:USDT: 3 signal(s)
-[23/60] PIPPIN/USDT:USDT: 2 signal(s)
-[24/60] AAVE/USDT:USDT: 4 signal(s)
-[25/60] SKY/USDT:USDT: 7 signal(s)
-[26/60] VELVET/USDT:USDT: 3 signal(s)
-[27/60] 1000LUNC/USDT:USDT: 3 signal(s)
-[28/60] PUMP/USDT:USDT: 8 signal(s)
-[29/60] INJ/USDT:USDT: 0 signal(s)
-[30/60] WLD/USDT:USDT: 1 signal(s)
-[31/60] BREV/USDT:USDT: 4 signal(s)
-[32/60] HUMA/USDT:USDT: 2 signal(s)
-[33/60] AVAX/USDT:USDT: 2 signal(s)
-[34/60] TAO/USDT:USDT: 4 signal(s)
-[35/60] YB/USDT:USDT: 1 signal(s)
-[36/60] FIL/USDT:USDT: 3 signal(s)
-[37/60] SENT/USDT:USDT: 3 signal(s)
-[38/60] INIT/USDT:USDT: 2 signal(s)
-[39/60] AKE/USDT:USDT: 1 signal(s)
-[40/60] LTC/USDT:USDT: 3 signal(s)
-[41/60] LIT/USDT:USDT: 5 signal(s)
-[42/60] BCH/USDT:USDT: 2 signal(s)
-[43/60] ASTER/USDT:USDT: 2 signal(s)
-[44/60] VVV/USDT:USDT: 4 signal(s)
-[45/60] XMR/USDT:USDT: 5 signal(s)
-[46/60] STRK/USDT:USDT: 3 signal(s)
-[47/60] TRUMP/USDT:USDT: 2 signal(s)
-[48/60] ZKC/USDT:USDT: 4 signal(s)
-[49/60] BLESS/USDT:USDT: 3 signal(s)
-[50/60] ARB/USDT:USDT: 2 signal(s)
-[51/60] TRX/USDT:USDT: 1 signal(s)
-[52/60] ARIA/USDT:USDT: 1 signal(s)
-[53/60] ONDO/USDT:USDT: 3 signal(s)
-[54/60] XLM/USDT:USDT: 5 signal(s)
-[55/60] APT/USDT:USDT: 4 signal(s)
-[56/60] ZRO/USDT:USDT: 7 signal(s)
-[57/60] ETHFI/USDT:USDT: 4 signal(s)
-[58/60] JCT/USDT:USDT: 1 signal(s)
-[59/60] DOT/USDT:USDT: 6 signal(s)
-[60/60] QNT/USDT:USDT: 2 signal(s)
+[1/60] BTC/USDT:USDT: 5 signal(s)
+[2/60] ETH/USDT:USDT: 9 signal(s)
+[3/60] SOL/USDT:USDT: 12 signal(s)
+[4/60] ZEC/USDT:USDT: 9 signal(s)
+[5/60] XRP/USDT:USDT: 10 signal(s)
+[6/60] MMT/USDT:USDT: 6 signal(s)
+[7/60] HYPE/USDT:USDT: 15 signal(s)
+[8/60] EVAA/USDT:USDT: 10 signal(s)
+[9/60] NEAR/USDT:USDT: 12 signal(s)
+[10/60] PIEVERSE/USDT:USDT: 13 signal(s)
+[11/60] 1000PEPE/USDT:USDT: 7 signal(s)
+[12/60] BNB/USDT:USDT: 9 signal(s)
+[13/60] IRYS/USDT:USDT: 10 signal(s)
+[14/60] DOGE/USDT:USDT: 14 signal(s)
+[15/60] ENA/USDT:USDT: 11 signal(s)
+[16/60] ICNT/USDT:USDT: 11 signal(s)
+[17/60] UNI/USDT:USDT: 6 signal(s)
+[18/60] ADA/USDT:USDT: 12 signal(s)
+[19/60] BTW/USDT:USDT: 8 signal(s)
+[20/60] SUI/USDT:USDT: 9 signal(s)
+[21/60] NAORIS/USDT:USDT: 7 signal(s)
+[22/60] PIPPIN/USDT:USDT: 3 signal(s)
+[23/60] LINK/USDT:USDT: 9 signal(s)
+[24/60] SKY/USDT:USDT: 12 signal(s)
+[25/60] AAVE/USDT:USDT: 7 signal(s)
+[26/60] VELVET/USDT:USDT: 8 signal(s)
+[27/60] 1000LUNC/USDT:USDT: 11 signal(s)
+[28/60] PUMP/USDT:USDT: 14 signal(s)
+[29/60] INJ/USDT:USDT: 5 signal(s)
+[30/60] WLD/USDT:USDT: 7 signal(s)
+[31/60] BREV/USDT:USDT: 6 signal(s)
+[32/60] HUMA/USDT:USDT: 14 signal(s)
+[33/60] AVAX/USDT:USDT: 9 signal(s)
+[34/60] TAO/USDT:USDT: 9 signal(s)
+[35/60] YB/USDT:USDT: 5 signal(s)
+[36/60] SENT/USDT:USDT: 7 signal(s)
+[37/60] FIL/USDT:USDT: 8 signal(s)
+[38/60] INIT/USDT:USDT: 7 signal(s)
+[39/60] AKE/USDT:USDT: 3 signal(s)
+[40/60] LTC/USDT:USDT: 7 signal(s)
+[41/60] LIT/USDT:USDT: 11 signal(s)
+[42/60] BCH/USDT:USDT: 6 signal(s)
+[43/60] ASTER/USDT:USDT: 6 signal(s)
+[44/60] VVV/USDT:USDT: 9 signal(s)
+[45/60] XMR/USDT:USDT: 14 signal(s)
+[46/60] STRK/USDT:USDT: 10 signal(s)
+[47/60] ZKC/USDT:USDT: 9 signal(s)
+[48/60] TRUMP/USDT:USDT: 7 signal(s)
+[49/60] ARB/USDT:USDT: 9 signal(s)
+[50/60] BLESS/USDT:USDT: 5 signal(s)
+[51/60] TRX/USDT:USDT: 7 signal(s)
+[52/60] ARIA/USDT:USDT: 6 signal(s)
+[53/60] ONDO/USDT:USDT: 8 signal(s)
+[54/60] XLM/USDT:USDT: 14 signal(s)
+[55/60] ZRO/USDT:USDT: 16 signal(s)
+[56/60] ETHFI/USDT:USDT: 8 signal(s)
+[57/60] APT/USDT:USDT: 14 signal(s)
+[58/60] JCT/USDT:USDT: 8 signal(s)
+[59/60] QNT/USDT:USDT: 8 signal(s)
+[60/60] HBAR/USDT:USDT: 11 signal(s)
 
-REG_DIV, 192 signals on 60 pairs (BINANCE, balanced)
+REG_DIV, 542 signals on 60 pairs (BINANCE, balanced)
 
 4H                in-sample (first 70%)                                   | out-of-sample (last 30%)
 grade regime         n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose |    n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose
-ALL                 71   47.9   45.1  -0.14  -0.11  0.77  29.0  0.75    6 |   49   30.6   24.5  -0.35  -0.35  0.47  18.0  0.91   14
-A CHOP               1  insufficient                                      |    1  insufficient                                     
-A COUNTER TREND      2  insufficient                                      |    4  insufficient                                     
-B CHOP              12  insufficient                                      |    4  insufficient                                     
-B COUNTER TREND      6  insufficient                                      |   16  insufficient                                     
-B WITH TREND         0  insufficient                                      |    2  insufficient                                     
-C CHOP              36   47.2   44.4  -0.18  -0.16  0.67  25.5  0.76    4 |    6  insufficient                                     
-C COUNTER TREND     14  insufficient                                      |   15  insufficient                                     
-C WITH TREND         0  insufficient                                      |    1  insufficient                                     
+ALL                163   47.2   44.2  -0.10  -0.06  0.87  29.0  0.75   10 |   97   41.2   36.1  -0.23  -0.24  0.57  22.0  0.84   14
+A CHOP               6  insufficient                                      |    2  insufficient                                     
+A COUNTER TREND     17  insufficient                                      |    5  insufficient                                     
+B CHOP              24  insufficient                                      |   15  insufficient                                     
+B COUNTER TREND     31   45.2   45.2  -0.13  +0.01  1.01  15.0  0.79    6 |   16  insufficient                                     
+B WITH TREND         2  insufficient                                      |    2  insufficient                                     
+C CHOP              43   44.2   39.5  -0.06  -0.08  0.82  30.0  0.69    5 |   37   45.9   43.2  -0.19  -0.10  0.80  17.0  0.76    4
+C COUNTER TREND     38   44.7   39.5  -0.15  -0.28  0.46  30.0  0.83    7 |   20  insufficient                                     
+C WITH TREND         2  insufficient                                      |    0  insufficient                                     
 
 1H                in-sample (first 70%)                                   | out-of-sample (last 30%)
 grade regime         n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose |    n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose
-ALL                 59   33.9   11.9  -0.26  -0.66  0.18  31.0  1.15   18 |    8  insufficient                                     
-A CHOP               1  insufficient                                      |    0  insufficient                                     
-A COUNTER TREND      4  insufficient                                      |    1  insufficient                                     
-B CHOP               3  insufficient                                      |    0  insufficient                                     
-B COUNTER TREND      9  insufficient                                      |    1  insufficient                                     
-B WITH TREND         1  insufficient                                      |    1  insufficient                                     
-C CHOP               2  insufficient                                      |    0  insufficient                                     
-C COUNTER TREND     39   28.2    7.7  -0.34  -0.73  0.10  32.0  1.11   16 |    5  insufficient                                     
-C WITH TREND         0  insufficient                                      |    0  insufficient                                     
+ALL                196   50.0   41.8  +0.01  +0.02  1.05  31.0  0.80   12 |   86   40.7   23.3  -0.14  -0.38  0.42  31.0  1.06   22
+A CHOP              10  insufficient                                      |    1  insufficient                                     
+A COUNTER TREND     14  insufficient                                      |    5  insufficient                                     
+A WITH TREND         2  insufficient                                      |    0  insufficient                                     
+B CHOP              31   61.3   51.6  +0.15  +0.18  1.41  34.0  0.76    3 |   10  insufficient                                     
+B COUNTER TREND     37   37.8   29.7  -0.19  -0.29  0.49  31.0  0.81    8 |   13  insufficient                                     
+B WITH TREND         0  insufficient                                      |    1  insufficient                                     
+C CHOP              50   66.0   52.0  +0.29  +0.28  1.71  41.0  0.65    5 |   15  insufficient                                     
+C COUNTER TREND     51   49.0   45.1  -0.04  +0.09  1.17  21.0  0.92   10 |   41   34.1   14.6  -0.24  -0.52  0.32  30.0  1.05   15
+C WITH TREND         1  insufficient                                      |    0  insufficient                                     
 
-Grade cutoffs: 70 / 55 kept - no in-sample score has 30+ trades at or above it with expectancy >= +0.3R at 2R.
+4H Grade cutoffs: 70 / 55 kept - no in-sample score has 30+ trades at or above it with expectancy >= +0.3R at 2R.
+1H Grade cutoffs: 70 / 55 kept - no in-sample score has 30+ trades at or above it with expectancy >= +0.3R at 2R.
 
 n = trades resolved under the 2R exit. winNR / expNR = share above zero and average R after
 fees when exiting at the stop, at N x risk, or at the close 30 bars (4H) /
@@ -93,7 +95,10 @@ fees when exiting at the stop, at N x risk, or at the close 30 bars (4H) /
 (longest losing streak, by time) use the 2R exit. Entry: the close of the bar the signal first
 appears on, 0.05% slippage against the trade; fees 0.10% of price round trip, in R.
 A bar touching both the stop and the target counts as the stop. Fewer than 30 -> insufficient.
+Replay: 1500 bars per timeframe, from the 300th (the live minimum) to 30 (4H) /
+48 (1H) bars before the end, so every trade resolves under all three exits.
 
 Known gaps: open interest is not replayed (no bar-by-bar history), so that component is dropped
-and the score rescaled, as live does when OI is missing. The lower-timeframe triggers and the
-spread / OI thin-coin filters are not replayed. Funding is not replayed.
+and the score rescaled, as live does when OI is missing. The lower-timeframe triggers are not
+replayed, and neither are the scan's pair filters: the weekly volume floor, the 4H ATR% range
+and the spread / OI thin-coin filters (pairs are the most liquid now). Funding is not replayed.

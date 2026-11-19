@@ -28,6 +28,7 @@ serves both the API and a browser dashboard.
   0.6%–8% of price keeps a pair out of the scan; a timeframe with fewer than
   300 completed bars is not analysed on that timeframe; a pair with a setup
   but under $5M open interest (latest daily OI point) has its rows dropped.
+  On OKX that OI (and the 7d OI column) is the whole coin's, all contracts.
   Unknown spread or OI never filters, a symbol override skips all four, and
   the audit line counts each. There's no trend/regime gate, since regular
   divergences are counter-trend by definition.
@@ -70,14 +71,17 @@ serves both the API and a browser dashboard.
   shows which. Click a row for each timeframe's levels and a chart of the
   A-to-B leg with the troughs, crossovers, stop and 1R / 2R / 3R drawn in.
 - **Good to enter?**: every row answers Yes, Not yet or No in plain language.
-  First matching rule wins. No: stop hit, already ran 1R, signal bar closed
-  more than 24 hours ago (4H) or 8 hours ago (1H), or grade C. Not yet:
+  First matching rule wins. No: stop hit, already ran 1R, more than 6
+  completed 4H bars (24h) / 8 completed 1H bars (8h) after the signal bar
+  (counted to the last completed bar's close, not the clock), or grade C. Not yet:
   counter trend below grade A, price more than 2% past the signal price, or
   a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment
   rate, FOMC rate / statement / press conference, Fed Chair) due within 12
   hours for a 4H signal or 4 hours for a 1H signal, or printed in the last
   hour (`MACRO_BLOCKERS`, `MACRO_WAIT_H`). The other market movers never
-  block; one due within 24 hours shows as a `MACRO <name> in Xh` tag.
+  block; one due within 24 hours shows as a `MACRO <name> in Xh` tag, and so
+  does a USD print above that the answer does not name (e.g. CPI in 6h on a
+  1H row); the sooner one is shown.
   Otherwise `Yes (confirmed)`. A signal bar that is still
   forming is listed as provisional: `Yes (early)` if the lower timeframe (1H
   for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last
@@ -89,8 +93,8 @@ serves both the API and a browser dashboard.
   last completed day against the coin's 20-day baseline (volume spike, range
   expansion, at the 7-day high or low) and 7-day open-interest flow with
   funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
-  change the answer, and neither does `MACRO` (a non-blocking market mover
-  due within 24 hours). Pattern tags sit in the same column: TRIPLE,
+  change the answer, and neither does `MACRO` (a calendar print due within
+  24 hours that the answer does not name). Pattern tags sit in the same column: TRIPLE,
   W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS.
 - **Movers tab** (`/movers`): a separate scan of every liquid crypto perp for
   an unusual last completed day (5%+ move, 2x its 20-day volume, or 1.5x its
@@ -151,16 +155,17 @@ python macd_divergence_screener_v5.py --backtest --exchange okx --pairs 60
 python macd_divergence_screener_v5.py --backtest --symbols BTC,ETH,SOL --strictness strict
 ```
 
-Replays the same candles the scan uses (720 bars of 4H, 500 of 1H) bar by
-bar with the same detector and scoring, each bar seeing only the bars up to and
-including it. A signal is entered at the close of the bar it first appears on
+Fetches 1500 bars of 4H and of 1H (deeper than the scan's 720 / 500; 300
+daily bars for the 1D check) and replays them bar by bar with the same
+detector and scoring, each bar seeing only the bars up to and including it.
+The replay starts where the live scan would (300 completed bars) and stops
+30 bars (4H) / 48 bars (1H) before the end, so every trade resolves. A signal is entered at the close of the bar it first appears on
 plus 0.05% slippage against the trade, with the scan's stop. Fees of 0.10% of
 price round trip are converted to R and taken off every trade.
 
 Each target (1R, 2R, 3R) is its own exit: the target, the stop, or the close
 30 bars (4H) / 48 bars (1H) later, marked to market. A bar that touches both
-the stop and the target counts as the stop; a trade whose history runs out
-first is left out. Trades are in-sample when their entry falls in the first
+the stop and the target counts as the stop. Trades are in-sample when their entry falls in the first
 70% of the pair's replayed bars, out-of-sample otherwise.
 
 The report has one block per timeframe: an `ALL` line, then one line per grade
@@ -168,15 +173,18 @@ x regime, in-sample and out-of-sample side by side: n, win rate and expectancy
 (average R after fees) at 1R and 2R, and on the 2R exit the profit factor,
 median bars to outcome, average MAE in R and longest losing streak. Fewer than
 30 trades prints `insufficient`. It then checks the grade A cutoff on the 2R
-exit: the lowest in-sample score with 30+ trades at or above it averaging at
+exit, once per timeframe (their in / out-of-sample windows cover different
+dates): the lowest in-sample score with 30+ trades at or above it averaging at
 least +0.3R, kept only if out-of-sample trades at that cutoff average above 0
 and at least half the in-sample value. Otherwise it says 70 / 55 are kept. It
 only prints; `GRADE_A` / `GRADE_B` are not changed.
 
 Known gaps: open interest is not replayed (no bar-by-bar history), so the OI
 component is left out of the backtest score and the rest rescaled, as the live
-scan does when OI is missing. The lower-timeframe triggers, the spread / OI
-thin-coin filters and funding are not replayed. A saved run is in
+scan does when OI is missing. The lower-timeframe triggers and funding are
+not replayed, and neither are the scan's pair filters: the weekly volume
+floor, the 4H ATR% range and the spread / OI thin-coin filters (the pairs are
+today's most liquid). A saved run is in
 `docs/superpowers/backtests/`.
 
 ## API

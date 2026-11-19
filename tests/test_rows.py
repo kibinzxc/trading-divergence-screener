@@ -45,11 +45,11 @@ class EntryVerdict(unittest.TestCase):
     def test_old_signal_bar_is_no(self):
         v = m.entry_verdict(sig(fresh=False, bars_ago=20))
         self.assertEqual(v["verdict"], "skip")
-        self.assertIn("closed 20h ago", v["reason"])
-        self.assertIn("limit on 1H is 8h", v["reason"])
+        self.assertIn("20 completed 1H bars (20h) have closed after the signal bar", v["reason"])
+        self.assertIn("limit on 1H is 8 bars, 8h", v["reason"])
         v = m.entry_verdict(sig(tf="4h", fresh=False, bars_ago=7))
-        self.assertIn("closed 28h ago", v["reason"])
-        self.assertIn("limit on 4H is 24h", v["reason"])
+        self.assertIn("7 completed 4H bars (28h)", v["reason"])
+        self.assertIn("limit on 4H is 6 bars, 24h", v["reason"])
 
     def test_grade_c_is_no(self):
         v = m.entry_verdict(sig(grade="C", score=41))
@@ -236,6 +236,22 @@ class BuildRows(unittest.TestCase):
         r = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bullish")],
                          blocker=(6.0, "CPI m/m"))[0]
         self.assertEqual((r["primary_tf"], r["entry"]["verdict"]), ("1h", "enter"))
+        self.assertEqual(r["macro"], "MACRO CPI m/m in 6h")      # due, and the answer does not say so
+
+    def test_a_blocker_due_within_24h_that_the_answer_does_not_name_is_the_macro_tag(self):
+        def tag(sigs, blocker, macro=None):
+            return m.build_rows(sigs, blocker=blocker, macro=macro)[0]["macro"]
+        h4 = [full_sig("4h", "bullish")]
+        self.assertEqual(tag(h4, (13.0, "CPI m/m")), "MACRO CPI m/m in 13h")
+        self.assertIsNone(tag(h4, (3.0, "CPI m/m")))                       # the answer names it
+        self.assertIsNone(tag(h4, (25.0, "CPI m/m")))                      # beyond 24h
+        self.assertIsNone(tag(h4, (-0.5, "CPI m/m")))                      # already printed
+        self.assertEqual(tag([full_sig("4h", "bullish", grade="C")], (3.0, "CPI m/m")),
+                         "MACRO CPI m/m in 3h")                            # No for another reason
+        self.assertEqual(tag(h4, (13.0, "CPI m/m"), (2.0, "BOJ Policy Rate")),
+                         "MACRO BOJ Policy Rate in 2h")                    # the sooner one
+        self.assertEqual(tag(h4, (13.0, "CPI m/m"), (20.0, "BOJ Policy Rate")),
+                         "MACRO CPI m/m in 13h")
 
 
 if __name__ == "__main__":

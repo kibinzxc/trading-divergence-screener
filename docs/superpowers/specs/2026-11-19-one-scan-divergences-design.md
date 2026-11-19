@@ -86,6 +86,7 @@ Signals are grouped by `(pair, side)` into one row:
 {
   "pair", "base", "side", "current_price", "weekly_volume",
   "tfs": ["4h", "1h"],           # which timeframes diverge, 4h first
+  "primary_tf": "4h" | "1h",
   "signals": {"4h": {...}, "1h": {...}},   # existing signal records
   "score": max of the signals' scores,
   "fresh": any signal fresh,
@@ -97,7 +98,7 @@ Signals are grouped by `(pair, side)` into one row:
 }
 ```
 
-The **primary signal** is the 4H one when present, otherwise the 1H one. The
+The **primary signal** is the one with the best entry verdict (enter, then wait, then skip), 4H winning ties; the row records it as `primary_tf`. (Changed after final review: always preferring 4H hid fresh 1H setups behind a played-out 4H signal.) The
 table's age, stop and 1R/2R/3R columns show the primary signal. Expanding a
 row shows the pivots and levels of every timeframe in the row.
 
@@ -110,7 +111,7 @@ All.
 
 ### 3a. Entry verdict
 
-A pure function `entry_verdict(sig, hours_to_event)` over the primary signal,
+A pure function `entry_verdict(sig, hours_to_event)` run over each signal; the row shows the best one,
 where `hours_to_event` is the time to the next curated market mover from the
 calendar cache (`None` if unknown). The first matching rule wins:
 

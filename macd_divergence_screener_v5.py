@@ -29,7 +29,8 @@ WHAT CHANGED FROM v3.3 (and why)
 
 3. RSI: REMOVED EVERYWHERE.
    No RSI30 timing gate, no RSI trigger-price alert, no 1H fetch (which also
-   removes one API call per pair — a third of the old scan cost). Entry
+   removes one API call per pair — a third of the old scan cost) (v5 brings 1H
+   back as its own divergence timeframe.). Entry
    judgement is yours. What replaced it is mechanical and needs no second
    indicator: a signal is dead when price traded through the stop, and the
    screener reports how far it has run in R since the pivot.
@@ -199,13 +200,14 @@ SPEED = {
     "fast":   {"workers": 10, "rps": {"okx": 14, "binance": 22, "bybit": 22}},
 }
 
-# ── Watchlist (OI flow) ────────────────────────────────────────────────────────
-# The "check OI on Sunday" routine, mechanised. A pair makes the watchlist when
-# its open interest moved meaningfully over the lookback; direction of price and
+# ── OI flow (context tags) ─────────────────────────────────────────────────────
+# The "check OI on Sunday" routine, mechanised. These thresholds classify OI flow
+# for a coin that already has a divergence: whether its open interest moved
+# meaningfully over the lookback; direction of price and
 # OI together give the quadrant, and funding says whether the move is spot-led
 # or leveraged-crowded. Thresholds are heuristics, stated here once:
 OI_LOOKBACK_D      = 7      # compare OI now vs ~7 days ago
-OI_MIN_CHANGE_PCT  = 5.0    # below this the pair is "quiet" and not listed
+OI_MIN_CHANGE_PCT  = 5.0    # below this the pair's OI flow is "quiet" and gets no tag
 OI_MIN_HISTORY     = 6      # fewer OI points than this = fresh listing → skip.
                             # A new listing's OI always ramps from zero; that is
                             # the classic false positive of this method.
@@ -217,6 +219,7 @@ FUND_SQUEEZE_MAX   = -0.10  # ≤ this with price down + OI up: shorts crowded �
 OI_VOL_RATIO_HIGH  = 1.5    # OI larger than 1.5x average daily volume = crowded either way
 
 # ── Daily movers ───────────────────────────────────────────────────────────────
+# Used for context tags only since v5: classify_mover's flags are shown on divergence rows; its qualifies/score outputs are no longer used by the app.
 # A different question from everything above: no MACD, no divergence, no OI.
 # "Which liquid perps did something UNUSUAL in the last completed day, and what
 # level is that move sitting against?" — i.e. what a daily watchlist post is
@@ -852,7 +855,7 @@ def weekly_usd_volume(df, usd_24h, tf_minutes):
     return usd_24h * (w / d)
 
 
-# ── Watchlist helpers ──────────────────────────────────────────────────────────
+# ── OI flow helpers ────────────────────────────────────────────────────────────
 def fetch_funding_map(ex):
     """symbol → funding rate normalised to % PER DAY, from ONE bulk call.
 
@@ -1623,12 +1626,16 @@ def dedupe(sigs):
     return sorted(best.values(), key=lambda s: s["bars_ago"])
 
 
+_VERDICT_RANK = {"enter": 0, "wait": 1, "skip": 2}
+
+
 def build_rows(sigs, mover=None, flow=None, context_error=None,
                hours_to_event=None, event_title=""):
     """One row per side for ONE pair's signals across timeframes.
 
     The primary signal — the one whose status, levels and entry verdict the
-    table shows — is the highest timeframe present (TF_CFG order).
+    table shows — is the one with the best entry verdict (enter, then wait,
+    then skip); on a tie the earlier timeframe in TF_CFG order (4H) wins.
     """
     order = list(TF_CFG)
     rows = {}
@@ -1641,11 +1648,14 @@ def build_rows(sigs, mover=None, flow=None, context_error=None,
         r["tfs"].append(s["tf"])
         r["signals"][s["tf"]] = s
     for r in rows.values():
-        primary = r["signals"][r["tfs"][0]]
+        verdicts = {tf: entry_verdict(r["signals"][tf], hours_to_event, event_title)
+                    for tf in r["tfs"]}
+        best = min(r["tfs"], key=lambda tf: _VERDICT_RANK[verdicts[tf]["verdict"]])
+        r["primary_tf"] = best
         r["score"]  = max(s["score"] for s in r["signals"].values())
         r["fresh"]  = any(s["fresh"] for s in r["signals"].values())
-        r["status"] = primary["status"]
-        r["entry"]  = entry_verdict(primary, hours_to_event, event_title)
+        r["status"] = r["signals"][best]["status"]
+        r["entry"]  = verdicts[best]
     return list(rows.values())
 
 
@@ -1736,8 +1746,6 @@ def index():
         "__MOVER_VOL__":   format(MOVER_VOL_MULT, "g"),
         "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
         "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
-        "__OI_LB__":       str(OI_LOOKBACK_D),
-        "__OI_MIN__":      format(OI_MIN_CHANGE_PCT, "g"),
         "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
         "__FUND_SPOT__":   format(FUND_SPOT_LED_MAX, "g"),
         "__FUND_CROWD__":  format(FUND_CROWDED_MIN, "g"),
@@ -1912,7 +1920,8 @@ def scan_route():
             return ex
 
         q = queue.Queue()
-        counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0}
+        counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0,
+                   "no_1h": 0}
         clock = threading.Lock()
 
         def with_indicators(df):
@@ -1958,6 +1967,9 @@ def scan_route():
                     live_price = float(raw1["close"].iloc[-1])    # the newer tick
                     df1 = drop_forming_candle(raw1, TF_CFG["1h"]["minutes"])
                     df1 = with_indicators(df1) if df1 is not None else None
+                if df1 is None or len(df1) < 80:
+                    with clock:
+                        counter["no_1h"] += 1
 
                 with clock:
                     counter["analysed"] += 1
@@ -2006,7 +2018,7 @@ def scan_route():
                     "min_weekly_vol": min_vol, "universe": len(perps),
                     "dispatched": len(pairs), "scanned": c["analysed"],
                     "vol_rejected": c["vol_reject"], "no_data": c["no_data"],
-                    "errors": c["errors"], "no_ticker": no_ticker,
+                    "errors": c["errors"], "no_1h": c["no_1h"], "no_ticker": no_ticker,
                     "complete": done.is_set() and q.empty()}
             with _lock:
                 _state["results"] = results
@@ -2161,6 +2173,7 @@ th.sorted{color:var(--acc)}
 td{padding:10px 12px;border-bottom:1px solid var(--bd);vertical-align:middle;transition:background .2s}
 tr.rb{background:#0D201018}tr.rr{background:#2D0F1818}
 tr.dim td{opacity:.45}
+tr.dim td:nth-child(2){opacity:1}
 tr:hover td{background:var(--sf2)}
 @keyframes ri{from{opacity:0;transform:translateX(-5px)}to{opacity:1;transform:translateX(0)}}
 tbody tr{animation:ri .3s var(--eout) both}
@@ -2170,7 +2183,6 @@ tbody tr{animation:ri .3s var(--eout) both}
 .bdg{display:inline-flex;align-items:center;padding:3px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.04em;white-space:nowrap}
 .bb{background:var(--bull-bg);color:var(--bull);border:1px solid #1a4020}
 .br{background:var(--bear-bg);color:var(--bear);border:1px solid #4a1a22}
-.bx{background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500}
 .ptm{font-family:var(--mono);font-size:10px;color:var(--tx3)}
 .sl{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);z-index:10;opacity:0;pointer-events:none;transition:opacity .35s ease}
 .sl.vis{opacity:1;pointer-events:auto}.sl.diss{opacity:0;pointer-events:none}
@@ -2190,13 +2202,8 @@ tbody tr{animation:ri .3s var(--eout) both}
 .qnum{font-family:var(--mono);font-size:12px;font-weight:600}
 .qbar{height:3px;background:var(--bd2);border-radius:2px;overflow:hidden}
 .qfill{height:100%;border-radius:2px;transition:width .4s}
-.status{display:inline-flex;flex-direction:column;gap:1px;padding:5px 9px;border-radius:5px;font-family:var(--mono);min-width:118px;max-width:100%;overflow:hidden}
 .tlbl{font-size:11px;font-weight:700;white-space:nowrap}
 .tsub{font-size:9px;font-weight:400;opacity:.8;margin-top:1px;white-space:normal;line-height:1.3}
-.st-active{background:#0D2E1F;color:#34D399;border:1px solid #1a4020}
-.st-extended{background:#2D1500;color:#FB923C;border:1px solid #4a2800}
-.st-ran{background:#2D1F06;color:#FBBF24;border:1px solid #4a3500}
-.st-invalidated{background:#1A2438;color:#4F6380;border:1px solid var(--bd2)}
 .ev{display:inline-flex;flex-direction:column;gap:1px;padding:5px 9px;border-radius:5px;font-family:var(--mono);min-width:150px;max-width:260px}
 .ev .tsub{white-space:normal;line-height:1.35}
 .ev-enter{background:#0D2E1F;color:#34D399;border:1px solid #1a4020}
@@ -2206,6 +2213,7 @@ table.stale .ev{opacity:.4}
 tbody tr.main-row{cursor:pointer}
 tr.det td{background:var(--sf);font-family:var(--mono);font-size:10px;color:var(--tx2);line-height:1.8;padding:10px 16px}
 tr.det b{color:var(--tx)}
+.tfb-on{color:var(--tx);border-color:var(--tx3)}
 .tfb{display:inline-block;margin-left:4px;padding:2px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
 .volc{font-family:var(--mono);font-size:11px;color:var(--tx2)}
 .volc small{display:block;font-size:9px;color:var(--tx3)}
@@ -2409,7 +2417,7 @@ tr.det b{color:var(--tx)}
       <table id="resT" style="display:none">
         <thead><tr>
           <th>Pair</th>
-          <th title="A checklist, not a prediction. ENTER: second pivot is recent, price is within 2% of the signal, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on the 4H signal when there is one, else the 1H.">Entry</th>
+          <th title="A checklist, not a prediction. ENTER: second pivot is recent, price has not run more than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. WAIT names the one thing still missing. SKIP: stopped out, already ran 1R, or too old. Judged at scan time on whichever timeframe's signal is furthest along: Enter beats Wait beats Skip, 4H wins a tie. The highlighted timeframe tag shows which one.">Entry</th>
           <th title="Regular bullish: price makes a lower low while the MACD line makes a higher low. Regular bearish: price makes a higher high while the MACD line makes a lower high. The tags show which timeframes diverge; 4H+1H agreeing sorts first.">Side &middot; TF</th>
           <th title="Not part of the verdict. Movers tags describe the last completed day against this coin's own 20-day baseline. OI tags describe 7-day open-interest flow and funding. Hover a tag for its definition.">Context</th>
           <th class="sortable sorted" data-sort="score" title="Default order: Enter, then Wait, then Skip; within each, 4H+1H first, then setup score. The score is how textbook the structure is, 0-100. Not a win rate, not backtested.">Setup score &#8595;</th>
@@ -2535,11 +2543,12 @@ tr.det b{color:var(--tx)}
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">Entry verdict &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>ENTER means five things are true at scan time.</b> The second pivot is within the last 12 bars, price is within 2% of the signal price, the stop has not been touched, the MACD line has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. It does not mean the trade works.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>ENTER means five things are true at scan time.</b> The second pivot is within the last 12 bars, price has not run more than 2% past the signal price, the stop has not been touched, the MACD line has crossed its signal line since the pivot, and no market-mover print is due inside 24 hours. It does not mean the trade works.</div></div>
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>WAIT names the one thing missing.</b> A pullback to the signal price after price ran, the MACD cross, or a CPI / FOMC-class print that is too close. A divergence is listed as WAIT as soon as its second pivot is confirmed, so you see it before it is enterable.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>SKIP is history.</b> The stop was hit, the move already made 1R or more, or the second pivot is older than 12 bars. These rows only appear under the All filter.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>The verdict ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old, one full 1H bar has closed since, the verdicts dim and the page asks for a re-run.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags, sorts first, and takes its verdict, stop and targets from the 4H signal. Click a row for each timeframe's pivots and levels.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags, sorts first, and takes its verdict, stop and targets from whichever signal is furthest along (Enter beats Wait beats Skip, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's pivots and levels.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>When a divergence is listed, and when it leaves.</b> A pivot is confirmed once 3 closed bars follow it, so a 4H divergence appears about 12 hours after its second pivot and a 1H one after 3 hours. The two pivots are at most 60 bars apart. A row is dropped once its second pivot is 30 bars old on 4H (5 days) or 24 bars old on 1H (1 day).</div></div>
     </div>
   </div>
 
@@ -2576,10 +2585,10 @@ tr.det b{color:var(--tx)}
 var TFM = __TF_CFG_JSON__;
 
 var SC = {
-  active:      {icon:'&#9679;',  lbl:'At the signal', sub:'Price still near the pivot', cls:'st-active'},
-  extended:    {icon:'&#9651;',  lbl:'Extended',      sub:'Already moved from the signal', cls:'st-extended'},
-  ran:         {icon:'&#9650;',  lbl:'Ran',           sub:'Reached 1R or better', cls:'st-ran'},
-  invalidated: {icon:'&#10005;', lbl:'Invalidated',   sub:'Traded through the stop', cls:'st-invalidated'}
+  active:      {lbl:'At the signal'},
+  extended:    {lbl:'Extended'},
+  ran:         {lbl:'Ran'},
+  invalidated: {lbl:'Invalidated'}
 };
 
 function qcolor(q){ return q >= 70 ? 'var(--bull)' : q >= 50 ? 'var(--fresh)' : 'var(--tx3)'; }
@@ -2620,7 +2629,7 @@ var EV = {
 };
 var EV_RANK = {enter:0, wait:1, skip:2};
 function verdict(r){ return (r.entry && r.entry.verdict) || 'skip'; }
-function primary(r){ return r.signals[r.tfs[0]]; }
+function primary(r){ return r.signals[r.primary_tf || r.tfs[0]]; }
 
 function matches(r, f){
   var v = verdict(r);
@@ -2665,6 +2674,7 @@ function auditLine(m){
   bits.push(m.scanned + ' of ' + m.dispatched + ' candidate pairs analysed');
   if(m.vol_rejected) bits.push(m.vol_rejected + ' below the 7-day volume floor');
   if(m.no_data)      bits.push(m.no_data + ' returned no usable candles');
+  if(m.no_1h)        bits.push(m.no_1h + ' analysed on 4H only (no usable 1H candles)');
   if(m.errors)       bits.push(m.errors + ' errored');
   if(m.no_ticker)    bits.push(m.no_ticker + ' had no 24h volume to pre-filter on');
   var txt = bits.join(' · ');
@@ -2685,7 +2695,7 @@ document.querySelectorAll('.nav-btn').forEach(function(b){
   b.addEventListener('click', function(){ showPg(b.dataset.pg); });
 });
 
-/* ── Watchlist (OI flow) ──────────────────────────────────────────────────── */
+/* ── OI flow tags ─────────────────────────────────────────────────────────── */
 var WQ = {
   'NEW LONGS':      {cls:'bdg bb'},
   'NEW SHORTS':     {cls:'bdg br'},
@@ -2715,7 +2725,7 @@ var TIP = {
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 
-/* ── Movers (daily watchlist) ─────────────────────────────────────────────── */
+/* ── Movers tags ──────────────────────────────────────────────────────────── */
 var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-move',
              'AT RANGE HIGH':'mf-hi','ABOVE 7D HIGH':'mf-hi',
              'AT RANGE LOW':'mf-lo','BELOW 7D LOW':'mf-lo'};
@@ -2893,10 +2903,10 @@ function detailRow(r){
   return tr;
 }
 function buildRow(r){
-  var bull = r.side === 'bullish', p = primary(r), tf = r.tfs[0];
+  var bull = r.side === 'bullish', p = primary(r), tf = r.primary_tf || r.tfs[0];
   var tr = document.createElement('tr');
   tr.className = 'main-row ' + (bull ? 'rb' : 'rr') + (verdict(r) === 'skip' ? ' dim' : '');
-  var tfs = r.tfs.map(function(t){ return '<span class="tfb">' + tfLabel(t) + '</span>'; }).join('');
+  var tfs = r.tfs.map(function(t){ return '<span class="tfb' + (t === tf ? ' tfb-on' : '') + '">' + tfLabel(t) + '</span>'; }).join('');
   tr.innerHTML =
     '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP</span></div></td>' +
     '<td>' + evCell(r) + '</td>' +
@@ -2914,7 +2924,7 @@ function buildRow(r){
   });
   return tr;
 }
-function ageMin(r){ var tf = r.tfs[0]; return primary(r).bars_ago * ((TFM[tf] && TFM[tf].minutes) || 240); }
+function ageMin(r){ var tf = r.primary_tf || r.tfs[0]; return primary(r).bars_ago * ((TFM[tf] && TFM[tf].minutes) || 240); }
 
 function renderAll(results){
   var rows = (results || []).filter(function(d){ return matches(d, af); });
@@ -2935,7 +2945,10 @@ function renderAll(results){
     document.getElementById('resT').style.display = 'none';
     var em = document.getElementById('emS');
     em.style.display = 'flex';
-    em.innerHTML = '<span class="empty-icon">&#9676;</span><span>No divergences match this filter</span>';
+    var N = (results || []).length;
+    em.innerHTML = '<span class="empty-icon">&#9676;</span><span>' + (N > 0 && af !== 'all'
+      ? 'No live setups right now. ' + N + ' divergence' + (N !== 1 ? 's' : '') + ' found, all played out, stopped or too old: see All.'
+      : 'No divergences match this filter') + '</span>';
   } else {
     document.getElementById('emS').style.display = 'none';
     document.getElementById('resT').style.display = 'table';

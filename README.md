@@ -32,11 +32,12 @@ serves both the API and a browser dashboard.
   the scan actually completed — so a quiet-looking result can't be mistaken
   for "the market is quiet" when it was actually a partial/failed scan.
 - **One row per coin and side**: when 4H and 1H diverge the same way they
-  share a row, which sorts first and takes its stop and targets from the 4H
-  signal.
+  share a row, which sorts first and takes its verdict, stop and targets
+  from whichever signal is furthest along (Enter beats Wait beats Skip, 4H
+  wins a tie); the highlighted tag shows which.
 - **Entry verdict**: every row is `ENTER`, `WAIT` or `SKIP` with the reason.
-  `ENTER` means the second pivot is within 12 bars, price is within 2% of the
-  signal price, the stop is untouched, MACD has crossed its signal line since
+  `ENTER` means the second pivot is within 12 bars, price has not run more
+  than 2% past the signal price, the stop is untouched, MACD has crossed its signal line since
   the pivot, and no market-mover print is due inside 24 hours. It is a
   checklist judged at scan time, not a prediction; the page dims verdicts
   once the scan is over an hour old.

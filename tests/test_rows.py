@@ -123,19 +123,28 @@ class BuildRows(unittest.TestCase):
                              full_sig("4h", "bullish", score=70)])
         self.assertEqual(len(rows), 1)
         r = rows[0]
-        self.assertEqual((r["tfs"], r["score"], sorted(r["signals"])),
-                         (["4h", "1h"], 80, ["1h", "4h"]))
+        self.assertEqual((r["tfs"], r["score"], sorted(r["signals"]), r["primary_tf"]),
+                         (["4h", "1h"], 80, ["1h", "4h"], "4h"))
 
     def test_opposite_sides_are_two_rows(self):
         rows = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bearish")])
         self.assertEqual(sorted((r["side"], r["tfs"][0]) for r in rows),
                          [("bearish", "1h"), ("bullish", "4h")])
 
-    def test_verdict_and_status_come_from_the_4h_signal(self):
-        rows = m.build_rows([full_sig("4h", "bullish", status="invalidated"),
-                             full_sig("1h", "bullish")])
-        self.assertEqual((rows[0]["status"], rows[0]["entry"]["verdict"], rows[0]["fresh"]),
-                         ("invalidated", "skip", True))
+    def test_fresh_1h_is_primary_when_the_4h_signal_is_dead(self):
+        r = m.build_rows([full_sig("4h", "bullish", status="invalidated"),
+                          full_sig("1h", "bullish")])[0]
+        self.assertEqual((r["primary_tf"], r["entry"]["verdict"], r["status"], r["tfs"]),
+                         ("1h", "enter", "active", ["4h", "1h"]))
+
+    def test_4h_is_primary_on_a_verdict_tie(self):
+        r = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bullish")])[0]
+        self.assertEqual(r["primary_tf"], "4h")
+
+    def test_wait_beats_skip(self):
+        r = m.build_rows([full_sig("4h", "bullish", fresh=False),
+                          full_sig("1h", "bullish", macd_cross=False)])[0]
+        self.assertEqual((r["primary_tf"], r["entry"]["verdict"]), ("1h", "wait"))
 
     def test_context_and_event_are_carried_onto_the_row(self):
         rows = m.build_rows([full_sig("1h", "bearish")], mover={"flags": ["VOLUME SPIKE"]},

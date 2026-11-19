@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""MACD Divergence Screener v4.0 — full-market · regular divergences only
+"""MACD Divergence Screener v5 — 4H + 1H regular divergences, one scan, one table
+
+WHAT CHANGED IN v5
+──────────────────
+One scan instead of three. /scan reads 4H and 1H for every pair, groups the
+signals into one row per coin and side, and attaches an entry verdict
+(entry_verdict: a checklist, not a prediction). The OI-flow and daily-movers
+scans no longer exist as lists; their classifiers run only for coins that
+have a divergence and show up as context tags. 1D and the Loose preset are
+gone. A pivot is confirmed 3 closed bars after it instead of 5, the two
+pivots may be at most 60 bars apart, and Balanced needs the MACD pivots to
+differ by 15% of the leg's range. Those last two numbers are a first guess,
+not tuned against missed examples.
 
 WHAT CHANGED FROM v3.3 (and why)
 ────────────────────────────────
@@ -71,8 +83,7 @@ draw:
 
 Strictness is selectable. STRICT adds the classic zero-line condition
 (both bullish MACD pivots below zero, both bearish above) and a larger
-minimum divergence. LOOSE drops the MACD-pivot-alignment and clean-line
-requirements — more signals, more junk.
+minimum divergence.
 
 NOTHING GETS SILENTLY SKIPPED
 ─────────────────────────────
@@ -356,7 +367,7 @@ def _macd_anchor(macd, macd_piv_set, idx, mode, need_pivot):
     on the same bar throws away good setups; demanding nothing accepts bars
     where MACD was not swinging at all.
 
-    In loose mode (need_pivot=False) this falls back to the MACD value at the
+    With need_pivot=False this falls back to the MACD value at the
     price pivot bar, which is what v3 always did.
     """
     cands = [j for j in macd_piv_set if abs(j - idx) <= PIVOT_SYNC]
@@ -1555,7 +1566,7 @@ def drop_forming_candle(df, tf_minutes):
     ccxt returns the in-progress bar as the last row. Leaving it in means MACD
     and ATR are computed partly from a bar that will change, so a scan run at
     14:05 and one at 15:55 can disagree about the same setup. Pivots need
-    pivot_lb bars either side so the open bar can't create one — but it can
+    pivot_rb closed bars after it, so the open bar can't create one — but it can
     still shift the indicator values everything else is measured against.
     """
     if df is None or df.empty:

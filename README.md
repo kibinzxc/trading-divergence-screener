@@ -1,11 +1,12 @@
 # trading-divergence-screener
 
 A self-contained Flask app that scans linear USDT perpetuals on OKX, Binance,
-and Bybit for **regular MACD divergences** (bullish and bearish), plus two
-companion scans — an open-interest flow watchlist and a daily-movers scan —
-and a news calendar of the scheduled macro prints that move crypto.
-Everything runs from one file: `macd_divergence_screener_v5.py` serves both
-the API and a browser dashboard.
+and Bybit for **regular MACD divergences** (bullish and bearish) on the **4H
+and 1H** timeframes in one run. Each result row says whether the setup is
+enterable right now, and carries daily-movers and open-interest context for
+that coin. A news calendar covers the scheduled macro prints that move
+crypto. Everything runs from one file: `macd_divergence_screener_v5.py`
+serves both the API and a browser dashboard.
 
 ## What it does
 
@@ -18,30 +19,32 @@ the API and a browser dashboard.
   universe filter — there's no trend/regime gate, since regular divergences
   are counter-trend by definition.
 - **Divergence detection**: price pivots are found on real swing highs/lows
-  (not closes), matched to a MACD pivot within a few bars, required to have a
+  (not closes), matched to a MACD pivot within a few bars, confirmed once 3 closed bars follow it (5 bars before, 3 after), required to have a
   "clean" line between the two pivots, and sized against both a percentage
-  floor and ATR/MACD-range fractions to filter out micro-divergences. The
+  floor and ATR/MACD-range fractions to filter out micro-divergences. The two pivots are at most 60 bars apart, and a divergence is dropped once its second pivot is 30 bars old on 4H or 24 bars old on 1H. The
   still-forming candle is always dropped so nothing repaints between scans.
-- **Strictness presets**: `loose`, `balanced` (default), `strict` — control
-  how much of the above is enforced and whether a zero-line condition is
-  required. See the module docstring in the script for the full rationale.
+- **Strictness presets**: `balanced` (default) and `strict`. Strict adds the
+  zero-line condition and a larger minimum divergence.
 - **Setup score, not a win-rate**: each signal gets a score describing how
   textbook the divergence structure is. It is not a backtested probability.
 - **Transparent scan accounting**: every run reports pairs dispatched,
   analysed, rejected on volume, errored, or missing volume data, and whether
   the scan actually completed — so a quiet-looking result can't be mistaken
   for "the market is quiet" when it was actually a partial/failed scan.
-- **OI flow watchlist** (`/watchlist`): a lighter, ~7-day open-interest vs.
-  price-change scan that classifies pairs into quadrants (e.g. spot-led,
-  crowded-long, short squeeze fuel) using funding rate as a leverage signal.
-- **Daily movers** (`/movers`): a cheap, ~1-call-per-pair scan for pairs
-  moving significantly off their recent volume/range baseline. An opt-in
-  **thin band** (`thin=1`, the *Include thin coins* toggle) also measures
-  pairs from $20M/week up to the floor. They are listed in their own
-  section with a daily dollar volume badge, and only when volume spike *and*
-  range expansion fire together: on a thin coin one big order is a volume
-  spike by itself, and the slippage and stop-hunting costs that justify the
-  floor still apply.
+- **One row per coin and side**: when 4H and 1H diverge the same way they
+  share a row, which sorts first and takes its stop and targets from the 4H
+  signal.
+- **Entry verdict**: every row is `ENTER`, `WAIT` or `SKIP` with the reason.
+  `ENTER` means the second pivot is within 12 bars, price is within 2% of the
+  signal price, the stop is untouched, MACD has crossed its signal line since
+  the pivot, and no market-mover print is due inside 24 hours. It is a
+  checklist judged at scan time, not a prediction; the page dims verdicts
+  once the scan is over an hour old.
+- **Context tags**: for coins that have a divergence, the scan also reads the
+  last completed day against the coin's 20-day baseline (volume spike, range
+  expansion, at the 7-day high or low) and 7-day open-interest flow with
+  funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
+  change the verdict.
 - **News calendar** (`/calendar`): the scheduled macro prints that actually
   move crypto perps — US CPI/PCE/PPI, the jobs report, FOMC and Powell, GDP,
   retail sales, ISM, plus the BoJ/ECB/BoE rate decisions — on a two-week grid
@@ -75,7 +78,7 @@ python macd_divergence_screener_v5.py
 ```
 
 Serves on `http://localhost:5099`. Open `/` in a browser for the dashboard,
-which drives the scans below via Server-Sent Events and shows live progress,
+which drives the scan below via Server-Sent Events and shows live progress,
 results, and any partial/incomplete-scan warnings.
 
 To extend the calendar beyond the current week, put your JBlanked key in a
@@ -90,32 +93,26 @@ export needed. A real environment variable `JBLANKED_API_KEY` also works.
 
 ## API
 
-All scan endpoints stream progress via SSE (`log`, `progress`, `result`,
-`error`, `done` events) and cache their last completed result, retrievable
+The scan endpoint streams progress via SSE (`log`, `progress`, `result`,
+`error`, `done` events) and caches its last completed result, retrievable
 without re-scanning.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/` | GET | Dashboard UI |
-| `/scan` | GET (SSE) | Run a MACD divergence scan |
-| `/signals` | GET | Last cached `/scan` result |
-| `/watchlist` | GET (SSE) | Run an OI-flow scan |
-| `/watch_signals` | GET | Last cached `/watchlist` result |
-| `/movers` | GET (SSE) | Run a daily-movers scan |
-| `/mover_signals` | GET | Last cached `/movers` result |
+| `/scan` | GET (SSE) | Run the 4H + 1H divergence scan |
+| `/signals` | GET | Last cached `/scan` result (`rows`, `meta`, `ts`) |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
 | `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 
 Common query params (all optional, sane defaults apply):
 
 - `exchange` — `okx` (default), `binance`, or `bybit`
-- `tf` — timeframe for `/scan`: `4h` (default) or `1d`
-- `strictness` — `loose`, `balanced` (default), `strict` (`/scan` only)
+- `strictness` — `balanced` (default) or `strict`
 - `speed` — `safe`, `normal` (default), `fast`
 - `min_weekly_vol` — liquidity floor in USD (default `70000000`)
 - `max_pairs` — cap on pairs scanned (default `400`)
-- `symbols` — comma-separated symbol allowlist (`/scan` only)
-- `thin` — `1` adds the low-liquidity band to `/movers`
+- `symbols` — comma-separated symbol allowlist
 
 ## News calendar
 
@@ -168,74 +165,29 @@ forecast and previous, so the tab links out to ForexFactory in two places:
 the header opens the calendar, and the selected day opens that same day
 there, which is where the number appears once a print lands.
 
-**The Dashboard strip** repeats the next market mover with a countdown and
+**The Scan-page strip** repeats the next market mover with a countdown and
 turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
 
-## Daily routine
+## Reading a row
 
-The three scans answer three different questions. Movers finds what moved,
-the Scanner finds where momentum disagrees with price, and the Watchlist says
-whether new money is behind it. Run them in that order once a day. The same
-guide lives in the dashboard under the **Routine** tab, drawn as a step-by-step
-flow (Prep, Movers, Scanner, Watchlist, Shortlist) that shows how far each
-step narrows the list. Click a step for its rules, or press Play to walk
-through them.
+1. **Check the calendar strip first.** If a market mover is inside 24 hours,
+   every otherwise-ready row reads `WAIT` and names the event.
+2. **Read the audit line.** A short list from an unfinished scan is not a
+   quiet market.
+3. **Start with `ENTER` rows, 4H+1H first.** Click a row for both
+   timeframes' pivots and check the line on your chart before anything else.
+4. **`WAIT` rows are the ones to keep an eye on.** The reason says what to wait for: the
+   MACD cross, a pullback to the signal price, or the macro print.
+5. **Weigh the context tags.** A bearish divergence `AT RANGE HIGH` with
+   `CROWDED LONGS` is a stronger fade than the same divergence mid-range.
+   `SQUEEZE FUEL` under a bearish row is a warning. `HIGH OI/VOL` means size
+   down.
+6. **Re-run before acting on an old table.** Verdicts use the price at scan
+   time.
 
-**Before you run anything**
-
-1. Run after the daily close. Perp daily candles close at 00:00 UTC (08:00
-   Manila). Every scan reads the last *completed* daily bar, so aim for
-   08:00 to 10:00 Manila.
-2. Use the exchange with the deepest book (Binance for most pairs). Some
-   majors trade thinly elsewhere and get volume-rejected for no chart reason.
-3. The Min 7-day volume box on the Scanner tab applies to all three scans.
-   Default `$70M/week` is roughly `$10M/day`. Names under it do not exist to
-   the screener.
-4. Read the audit line under every table. A short list from an unfinished
-   scan is not a quiet market.
-5. Check the Calendar tab. A fresh entry sized into a CPI or FOMC print is a
-   coin flip, not a setup. If the next market mover is inside 24 hours, wait
-   for it or size for it.
-
-**Step 1 — Movers: what did something unusual yesterday**
-
-- Keep the *All* filter and read by score. *Top 4* is a shortcut, not the list.
-- Extended runs: `ABOVE 7D HIGH` / `AT RANGE HIGH` plus a big 1-day change.
-  Treat as fade-or-wait candidates, not chases. Breakdowns are the mirror.
-- Every row carries PDH, PDL, the 7-day range and where price sits in it.
-  Write the level down.
-- Blind spot: a coin that had a quiet day is dropped even if it is in a clean
-  consolidation after a breakout. Step 2 covers that.
-
-**Step 2 — Scanner on 4H: where momentum disagrees with price**
-
-- Run 4H on *Balanced*. On the Signals tab look at *Fresh* (second pivot
-  within the last 12 bars) and *At the signal* (price still within ~2% of
-  the signal). Those are the entry candidates.
-- *Ran* and *invalidated* are history, not entries.
-- Bullish rows are pullback candidates. Bearish rows on names that Step 1
-  flagged as extended are fade candidates.
-- Then run 1D for context (*Fresh* there means within 3 bars).
-- The Symbols box scans only the tickers you type and skips the volume
-  floor, so a thin name can still be checked on demand.
-
-**Step 3 — Watchlist (OI flow): is new money behind it**
-
-- Ranked by 7-day OI change; reads best on a Sunday. Use it to qualify names
-  from Steps 1 and 2, not to find new ones.
-- Extended run: you want `NEW LONGS` + `SPOT-LED`. `CROWDED LONGS` makes a
-  fade stronger.
-- Breakdown: `NEW SHORTS` + `SQUEEZE FUEL` is the warning; a pullback long
-  beats a short there.
-- `HIGH OI/VOL` means violent moves either way. Size down.
-
-**Step 4 — Build the shortlist**
-
-- Three to five names, split into *extended* (wait for a fade signal or a
-  reclaim) and *pullback* (fresh bullish divergence or a held prior-day low).
-- Each name needs a level, a stop and a target before the session: PDH/PDL
-  and the 7-day range from Movers, the stop and 1R/2R/3R from the Scanner.
-- Scores rank, they do not predict. Neither score is a backtested win rate.
+The *Specific coins* box scans only the tickers you type and skips the
+volume floor, so a thin name can still be checked on demand. Use the
+exchange with the deepest book (Binance for most pairs).
 
 ## Disclaimer
 

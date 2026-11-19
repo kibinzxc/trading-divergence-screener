@@ -22,6 +22,7 @@ user:
 - Movers and OI flow survive only as context badges on divergence rows.
 - List a divergence sooner, and stop listing it once it is old.
 - Reject divergences whose line is too long or too shallow to see.
+- Say, per row, whether the setup is enterable as of the scan.
 
 ## Non-goals
 
@@ -89,6 +90,7 @@ Signals are grouped by `(pair, side)` into one row:
   "score": max of the signals' scores,
   "fresh": any signal fresh,
   "status": status of the primary signal,
+  "entry": {"verdict": "enter" | "wait" | "skip", "reason": str},
   "mover": {...} | null,         # classify_mover output
   "flow": {...} | null,          # classify_flow output
   "context_error": str | null
@@ -99,11 +101,42 @@ The **primary signal** is the 4H one when present, otherwise the 1H one. The
 table's age, stop and 1R/2R/3R columns show the primary signal. Expanding a
 row shows the pivots and levels of every timeframe in the row.
 
-Sort order: rows with both timeframes first, then by score.
+Sort order: `enter` rows first, then `wait`, then `skip`; within each, rows
+with both timeframes first, then by score.
 
-Filters: **Live** (default: fresh and status `active` or `extended`),
-**Bullish**, **Bearish**, **4H+1H**, **All**. Invalidated and ran signals
-appear only under All.
+Filters: **Live** (default: verdict `enter` or `wait`), **Enter now**,
+**Bullish**, **Bearish**, **4H+1H**, **All**. `skip` rows appear only under
+All.
+
+### 3a. Entry verdict
+
+A pure function `entry_verdict(sig, hours_to_event)` over the primary signal,
+where `hours_to_event` is the time to the next curated market mover from the
+calendar cache (`None` if unknown). The first matching rule wins:
+
+| # | Condition | Verdict | Reason shown |
+|---|---|---|---|
+| 1 | status `invalidated` | skip | Stop was hit |
+| 2 | status `ran` | skip | Already ran N R |
+| 3 | not `fresh` | skip | Too old (N bars) |
+| 4 | status `extended` | wait | Moved N% from signal, wait for a pullback to P |
+| 5 | no MACD cross since the second pivot | wait | Momentum has not turned, wait for the MACD cross |
+| 6 | market mover within 24 hours | wait | EVENT in N h |
+| 7 | otherwise | enter | Near signal, MACD crossed, stop S (risk N%) |
+
+So `enter` means all of: second pivot within the fresh window, price within
+2% of the signal price (`MOVED_PCT`), stop not touched, MACD crossed its
+signal line after the pivot, and no curated macro print inside 24 hours (the
+same threshold that turns the calendar strip amber).
+
+The verdict is a checklist, not a prediction, and the Method tab says so. It
+is computed at scan time from the live price at that moment. The table shows
+the scan's age next to the verdict column and dims the verdicts once the scan
+is older than one bar of the fastest timeframe (1 hour), with a prompt to
+re-run.
+
+OI flow and Movers badges do not change the verdict. They stay as context for
+the user to weigh.
 
 ### 4. Timeliness
 
@@ -174,6 +207,9 @@ row" section.
 - A divergence whose pivots are more than `max_dist` apart is not returned.
 - Row grouping: 4H and 1H signals on the same pair and side produce one row
   with `tfs == ["4h", "1h"]`; opposite sides produce two rows.
+- `entry_verdict`: one test per rule in the table, plus rule order (an
+  invalidated signal with a macro print inside 24 hours is `skip`, not
+  `wait`) and `hours_to_event=None` not blocking `enter`.
 - An old-shape state file loads as empty.
 - Manual: run one live scan, confirm the audit line balances and that a row's
   pivots match the chart.

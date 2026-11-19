@@ -747,8 +747,8 @@ def oi_change_pct(hist, t0_ms, t1_ms):
     """% change in open interest between two times, or None when the history
     does not cover both. One unit is used for both points (coin amount when the
     venue reports it, else USD value) so a price move is not read as OI."""
-    # shortcut: nearest point at or before each time, so daily OI on a wave
-    # shorter than a day gives None; fetch finer OI history if 4H scores need it.
+    # shortcut: nearest point at or before each time, so a history coarser than
+    # the wave gives None; grade_signals then tries the daily one after the hourly.
     pts = sorted((p for p in (hist or []) if p.get("timestamp")), key=lambda p: p["timestamp"])
     for key in ("openInterestAmount", "openInterestValue"):
         a = [p for p in pts if p["timestamp"] <= t0_ms and p.get(key)]
@@ -771,6 +771,21 @@ def add_context(sig, htf, ltf, oi_hist, fund, btc):
     return finish_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], sig["side"]),
                          oi_change_pct(oi_hist, sig["b_start_ms"], sig["b_ms"]),
                          fund, btc_rsi, trig)
+
+
+def grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, fund, btc):
+    """Give each signal the context that belongs to its timeframe.
+
+    4H signal: higher timeframe = 1D (d1), lower = 1H (df1).
+    1H signal: higher timeframe = 4H (df4), lower = 15m (df15).
+    Open interest: hourly history when it covers wave B, else daily.
+    Any frame may be None.
+    """
+    for s in sigs:
+        four = s["tf"] == "4h"
+        hist = oi_h if oi_change_pct(oi_h, s["b_start_ms"], s["b_ms"]) is not None else oi_d
+        add_context(s, d1 if four else df4, df1 if four else df15, hist, fund, btc)
+    return sigs
 
 
 # ── Entry verdict ──────────────────────────────────────────────────────────────
@@ -1118,8 +1133,8 @@ def classify_mover(m, thin=False):
     """(qualifies, flags, score) for one analysed pair.
 
     The score ranks how UNUSUAL the day was and how close price sits to a
-    decision level. It carries NO direction and is NOT a win rate — the same
-    caveat as setup_score, for the same reason: nothing here was backtested.
+    decision level. It carries NO direction and is NOT a win rate. It is a
+    description, not a prediction.
 
     thin=True is the stricter test for the low-liquidity band: volume spike
     AND range expansion, where a liquid pair needs any one trigger.
@@ -1667,9 +1682,9 @@ def drop_forming_candle(df, tf_minutes):
 
     ccxt returns the in-progress bar as the last row. Leaving it in means MACD
     and ATR are computed partly from a bar that will change, so a scan run at
-    14:05 and one at 15:55 can disagree about the same setup. Pivots need
-    pivot_rb closed bars after it, so the open bar can't create one — but it can
-    still shift the indicator values everything else is measured against.
+    14:05 and one at 15:55 can disagree about the same setup. A signal needs a
+    closed cross, so the open bar cannot create one, but it can still shift the
+    indicator values.
     """
     if df is None or df.empty:
         return df
@@ -1900,7 +1915,8 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
 
     A signal is taken the first time the detector reports it, at that bar's
     close. Not replayed: open interest (no bar-by-bar history) and the
-    lower-timeframe trigger, so scores here run up to 10 points below live.
+    lower-timeframe trigger, so a score here can differ from the live one by up
+    to 10 points either way.
     """
     cfg, seen, trades = TF_CFG[tf], set(), []
     close = df["close"].values
@@ -1917,14 +1933,15 @@ def backtest_pair(df, tf, rules, htf=None, btc=None):
                 entry, stop = float(close[i]), sig["stop_price"]
                 if (entry - stop) * k <= 0:
                     continue                       # already through the stop when first seen
-                close_ts = view.index[-1] + pd.Timedelta(minutes=cfg["minutes"])
+                # Graded as of the signal bar's close, exactly like add_context.
+                close_ts = pd.Timestamp(sig["signal_close_ms"], unit="ms")
                 btc_rsi = asof(btc["rsi"], close_ts - pd.Timedelta(minutes=240)) \
                     if btc is not None else None
                 score, grade = score_signal(sig, htf_agrees(htf, close_ts, cfg["htf_minutes"], side))
                 trades.append(dict(
                     trade_outcome(df, i, side, entry, stop), tf=tf, side=side,
                     score=score, grade=grade, time=str(view.index[-1]),
-                    regime=regime_tag(side, entry > float(view["ema200"].iloc[-1]), btc_rsi)))
+                    regime=regime_tag(side, sig["above_ema200"], btc_rsi)))
     return trades
 
 
@@ -1954,6 +1971,9 @@ def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
     perps = usdt_perps(mkts)
     if symbols:
         pairs = [s for s in perps if s.split("/")[0] in symbols]
+        if not pairs:
+            print(f"No matching USDT perps on {exid.upper()}.")
+            return
     else:
         tickers = ex.fetch_tickers()
         pairs = sorted(perps, key=lambda s: usd_volume(tickers.get(s)) or 0, reverse=True)[:n_pairs]
@@ -1985,8 +2005,8 @@ def run_backtest(exid="okx", n_pairs=30, symbols=(), strictness="balanced"):
     print("\nwin@NR = share of resolved trades that reached N x risk before the stop; "
           "avgR@NR = average result of exiting there.\n"
           "Entry is the close of the bar the signal first appears on. Open interest and the "
-          "lower-timeframe trigger are not replayed,\nso grades here can sit up to 10 points "
-          "below the live scan's.")
+          "lower-timeframe trigger are not replayed,\nso a score here can differ from the "
+          "live scan's by up to 10 points either way.")
 
 
 # ── State persistence ──────────────────────────────────────────────────────────
@@ -2293,16 +2313,14 @@ def scan_route():
                                                            funding.get(sym), wk_vol)
                 d1 = with_indicators(d1) if d1 is not None else None
                 oi_h = df15 = None
-                if any(s["tf"] == "1h" for s in sigs):
+                if any(s["fresh"] for s in sigs):       # stale signals answer No whatever the grade
                     oi_h = fetch_oi_history(ex, limiter, sym, 100, tf="1h")
                 if any(s["tf"] == "1h" and s["fresh"] for s in sigs):
                     df15 = drop_forming_candle(
                         fetch_df_deep(ex, limiter, sym, "15m", LTF_BARS_15M), 15)
                     df15 = with_indicators(df15) if df15 is not None and len(df15) >= 80 else None
+                grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, funding.get(sym), btc)
                 for s in sigs:
-                    four = s["tf"] == "4h"
-                    add_context(s, d1 if four else df4, df1 if four else df15,
-                                oi_d if four else oi_h, funding.get(sym), btc)
                     _charts[f"{sym}|{s['side']}|{s['tf']}"] = (s.pop("_df"), s.pop("_d"), dict(s))
                 for row in build_rows(sigs, mover, flow, cerr, ev_h, ev_title):
                     q.put(("result", row))
@@ -2334,7 +2352,7 @@ def scan_route():
             # that failed the weekly-volume gate, came back with no candles or
             # threw were all counted as scanned, so the headline could be
             # nearly double the number of coins actually analysed. It now
-            # reports what reached detect_divergences, and every other bucket
+            # reports what reached the detector, and every other bucket
             # is reported alongside it instead of disappearing.
             with clock:
                 c = dict(counter)
@@ -2746,8 +2764,6 @@ tr.det b{color:var(--tx)}
 tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1px solid var(--bd2);border-radius:4px}
 .tfb-on{color:var(--tx);border-color:var(--tx3)}
 .tfb{display:inline-block;margin-left:4px;padding:2px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
-.volc{font-family:var(--mono);font-size:11px;color:var(--tx2)}
-.volc small{display:block;font-size:9px;color:var(--tx3)}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;color:var(--tx3);font-family:var(--mono);font-size:12px}
 .empty-icon{font-size:28px;opacity:.3}
 .greet{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;padding:48px 40px}
@@ -2965,11 +2981,11 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
           <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
           <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
           <th title="WITH TREND: BTC 4H RSI and this coin's 200 EMA both agree with the side. COUNTER TREND setups need grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
-          <th class="sortable" data-sort="age" title="Close of the signal bar: the MACD cross that ends the second wave.">Signal</th>
+          <th class="sortable" data-sort="age" title="The signal bar is the MACD cross that ends the second wave. Shown: its closing price, and the bar's time as a chart labels it (the bar's open).">Signal</th>
           <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
           <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
           <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
-          <th title="Never part of the answer. Pattern tags (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS), then the daily-movers and open-interest tags. Hover a tag for its definition.">Tags</th>
+          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 5 score points and LTF TRIGGER is what allows Yes (early). Then the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition.">Tags</th>
         </tr></thead>
         <tbody id="resB"></tbody>
       </table>
@@ -3137,7 +3153,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   <div class="dash-sec" style="margin-top:28px">
     <div class="dash-sec-ttl">Context tags &mdash; what else is true about this coin</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Context never changes the verdict.</b> It is fetched only for coins that already have a divergence, and it is yours to weigh.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Movers and OI-flow tags never change the answer.</b> They are fetched only for coins that already have a divergence, and they are yours to weigh. The grade does use some of the same data: the higher timeframe's MACD and the change in open interest into B are score components.</div></div>
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Movers tags describe the last completed day.</b> VOLUME SPIKE and RANGE EXPANSION are measured against the coin's own 20-day baseline, BIG MOVE is a 5%+ day, and the range tags say price is at or through its 7-day high or low. A bearish divergence AT RANGE HIGH is the textbook fade; the same divergence mid-range is weaker.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>OI tags describe 7-day positioning.</b> Price and open interest together give the quadrant: NEW LONGS, NEW SHORTS, SHORT COVERING, CAPITULATION. Funding refines it: SPOT-LED is the healthy version of new longs, CROWDED LONGS is leverage arriving late, SQUEEZE FUEL is shorts crowded and paying. No OI tag means open interest moved less than 5% or the contract is too new to judge.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>HIGH OI/VOL is a crowding warning, not a direction.</b> Open interest above about 1.5x average daily volume means positions cannot exit without moving the price. Size down.</div></div>
@@ -3220,9 +3236,9 @@ function b2t(bars, tf){
 }
 
 var EV = {
-  enter: {lbl:'&#10003; ENTER', cls:'ev-enter'},
-  wait:  {lbl:'&#9203; WAIT',   cls:'ev-wait'},
-  skip:  {lbl:'&#10005; SKIP',  cls:'ev-skip'}
+  enter: {lbl:'&#10003; YES',     cls:'ev-enter'},
+  wait:  {lbl:'&#9203; NOT YET', cls:'ev-wait'},
+  skip:  {lbl:'&#10005; NO',     cls:'ev-skip'}
 };
 var EV_RANK = {enter:0, wait:1, skip:2};
 function verdict(r){ return (r.entry && r.entry.verdict) || 'skip'; }
@@ -3667,6 +3683,8 @@ function detailRow(r){
       ' &rarr; B ' + s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price) +
       ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
       ' &nbsp;&middot;&nbsp; grade ' + s.grade + ' (' + s.score + ') &middot; ' + s.regime +
+      ' &nbsp;&middot;&nbsp; HTF ' + (s.htf_ok ? 'agrees' : 'no') + ', OI ' + (s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
+      ', volume ' + (s.vol_dry ? 'drying' : 'not drying') + ', wick ' + (s.wick ? 'yes' : 'no') + (s.triple ? ', triple' : '') +
       ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
       (s.trigger_price != null ? ' &nbsp;&middot;&nbsp; lower-timeframe trigger at ' + fmtPx(s.trigger_price) : '') +
       ' &nbsp;&middot;&nbsp; stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)' +

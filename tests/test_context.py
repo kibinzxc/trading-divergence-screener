@@ -113,5 +113,74 @@ class AddContext(unittest.TestCase):
         self.assertEqual((self.sig["score"], self.sig["regime"]), (53, "COUNTER TREND"))
 
 
+def trend_frame(freq, direction):
+    idx = pd.date_range("2025-12-01", periods=900, freq=freq)
+    return pd.DataFrame({"macd": direction * np.arange(900.0)}, index=idx)
+
+
+def ltf_for(sig):
+    """15m frame whose MACD crosses up 2 bars after the signal bar opens and
+    whose close clears the swing high (bar 10) 4 bars later. It starts at B."""
+    n, i0 = 70, int((sig["signal_ms"] - sig["b_ms"]) // 900_000)
+    high = np.full(n, 101.0); high[10] = 105; high[i0 + 6:] = 107
+    close = np.full(n, 100.0); close[i0 + 6:] = 106
+    d = np.full(n, -1.0); d[i0 + 2:] = 1
+    return pd.DataFrame({"high": high, "low": 99.0, "close": close, "macd": d, "signal": 0.0},
+                        index=pd.date_range(pd.Timestamp(sig["b_ms"], unit="ms"), periods=n, freq="15min"))
+
+
+class GradeSignals(unittest.TestCase):
+    R = m.STRICTNESS["balanced"]
+    UP, DOWN = trend_frame("4h", 1), trend_frame("4h", -1)
+    UP_D, DOWN_D = trend_frame("D", 1), trend_frame("D", -1)
+
+    def sig(self, tf="1h", n=97, **kw):
+        df = wave_df(LONG, freq="4h" if tf == "4h" else "1h")
+        return m.signals_for_tf(df.iloc[:n], tf, self.R, 100.5, "ENS/USDT:USDT", 9e7, **kw)[0]
+
+    def grade(self, s, df4=None, df1=None, d1=None, df15=None, oi_d=None, oi_h=None, btc=None):
+        return m.grade_signals([s], df4, df1, d1, df15, oi_d, oi_h, 0.0, btc)[0]
+
+    def test_a_4h_signal_takes_its_higher_timeframe_from_d1_not_df4(self):
+        self.assertTrue(self.grade(self.sig("4h"), df4=self.DOWN, d1=self.UP_D)["htf_ok"])
+        self.assertFalse(self.grade(self.sig("4h"), df4=self.UP, d1=self.DOWN_D)["htf_ok"])
+
+    def test_a_1h_signal_takes_its_higher_timeframe_from_df4_not_d1(self):
+        self.assertTrue(self.grade(self.sig(), df4=self.UP, d1=self.DOWN_D)["htf_ok"])
+        self.assertFalse(self.grade(self.sig(), df4=self.DOWN, d1=self.UP_D)["htf_ok"])
+
+    def test_a_1h_fresh_signal_takes_its_trigger_from_the_15m_frame(self):
+        s = self.sig()
+        self.assertTrue(s["fresh"])
+        ok = self.grade(self.sig(), df15=ltf_for(s))
+        self.assertIsNotNone(ok["trigger_price"])
+        self.assertIn("LTF TRIGGER", ok["tags"])
+        wrong = self.grade(self.sig(), df1=ltf_for(s))            # 15m frame in the 1H slot
+        self.assertIsNone(wrong["trigger_price"])
+        self.assertNotIn("LTF TRIGGER", wrong["tags"])
+
+    def test_oi_uses_hourly_when_it_covers_wave_b_else_daily(self):
+        s = self.sig()
+        def hist(change):
+            return [{"timestamp": s["b_start_ms"] - 1, "openInterestAmount": 100},
+                    {"timestamp": s["b_ms"] - 1, "openInterestAmount": 100 + change}]
+        hourly, daily = hist(-10), hist(20)
+        self.assertEqual(self.grade(self.sig(), oi_d=daily, oi_h=hourly)["oi_chg_pct"], -10.0)
+        self.assertEqual(self.grade(self.sig(), oi_d=daily, oi_h=None)["oi_chg_pct"], 20.0)
+        self.assertEqual(self.grade(self.sig(), oi_d=daily, oi_h=[{"timestamp": 1, "openInterestAmount": 5}])["oi_chg_pct"], 20.0)
+
+    def test_forming_signal_with_a_trigger_is_trigger_first_and_a_yes_early(self):
+        df = wave_df(LONG)
+        s = self.sig(n=94, forming_df=df.iloc[:95])
+        self.assertTrue(s["forming"])
+        btc = pd.DataFrame({"rsi": 60.0}, index=pd.date_range("2025-12-01", periods=900, freq="4h"))
+        hist = [{"timestamp": s["b_start_ms"] - 1, "openInterestAmount": 100},
+                {"timestamp": s["b_ms"] - 1, "openInterestAmount": 90}]
+        s = self.grade(s, df4=self.UP, df15=ltf_for(s), oi_h=hist, btc=btc)
+        self.assertTrue(s["trigger_first"])
+        self.assertEqual(s["grade"], "A")
+        self.assertTrue(m.entry_verdict(s)["reason"].startswith("Yes (early)"))
+
+
 if __name__ == "__main__":
     unittest.main()

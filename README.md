@@ -122,7 +122,7 @@ python macd_divergence_screener_v5.py --backtest --symbols BTC,ETH,SOL --strictn
 ```
 
 Replays the same candles the scan uses (720 bars of 4H, 500 of 1H) bar by
-bar with the same detector, each bar seeing only the bars before it. A
+bar with the same detector, each bar seeing only the bars up to and including it. A
 signal is entered at the close of the bar it first appears on, with the
 scan's stop. The report gives, per grade and per regime, how many signals
 there were and, for 1R, 2R and 3R targets, the share that got there before
@@ -130,8 +130,7 @@ the stop and the average R of exiting there. Use it to check whether grade A
 actually beats grade B before trusting the cutoffs.
 
 Limits: open interest and the lower-timeframe trigger are not replayed (no
-bar-by-bar history), so backtest grades can sit up to 10 points below live
-ones; when one bar touches both the stop and a target, the stop is counted.
+bar-by-bar history), so a backtest score can differ from the live one by up to 10 points either way; when one bar touches both the stop and a target, the stop is counted.
 
 ## API
 

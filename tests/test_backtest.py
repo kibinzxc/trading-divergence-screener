@@ -59,6 +59,26 @@ class Replay(unittest.TestCase):
         self.assertEqual([a[k] for k in keys], [b[k] for k in keys])
 
 
+class SameMomentAsLive(unittest.TestCase):
+    def test_context_is_judged_at_the_signal_bar_close_not_the_first_seen_bar(self):
+        df = frame()
+        # signal bar 124 closes 05:00; first seen at bar 126, whose close is 07:00.
+        # The 4H bar opening 02:00 completes at 06:00: between the two moments.
+        hi = pd.date_range("2026-01-04 18:00", periods=20, freq="4h")
+        htf = pd.DataFrame({"macd": [float(i) if t < pd.Timestamp("2026-01-06 02:00") else -100.0
+                                     for i, t in enumerate(hi)]}, index=hi)
+        # BTC 4H RSI is read 4h before the close: 01:00 vs 03:00. Above 50 only up to 01:00.
+        bi = pd.date_range("2026-01-05", periods=72, freq="h")
+        btc = pd.DataFrame({"rsi": [60.0 if t <= pd.Timestamp("2026-01-06 01:00") else 40.0
+                                    for t in bi]}, index=bi)
+        sig = m.signals_for_tf(df, "1h", RULES, 100.5, "X/USDT:USDT", 9e7)[0]
+        m.add_context(sig, htf, None, None, None, btc)
+        t = m.backtest_pair(df, "1h", RULES, htf, btc)[0]
+        self.assertEqual((sig["htf_ok"], sig["regime"]), (True, "WITH TREND"))   # the moments differ
+        self.assertEqual((t["score"], t["grade"], t["regime"]),
+                         (sig["score"], sig["grade"], sig["regime"]))
+
+
 class Summary(unittest.TestCase):
     def test_win_rate_and_average_r_per_group(self):
         trades = [{"grade": "A", "hit": 3, "stopped": False},

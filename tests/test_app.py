@@ -67,7 +67,9 @@ class SavedState(unittest.TestCase):
         self.assertEqual(m._state["results"], [{"pair": "X", "tfs": ["4h"]}])
         m.save_state()
         with open(m.STATE_FILE) as f:
-            self.assertEqual(sorted(json.load(f)), ["meta", "results", "ts"])
+            saved = json.load(f)
+        self.assertEqual(sorted(saved), ["meta", "results", "ts"])
+        self.assertEqual(saved["meta"]["v"], 2)
 
 
 import re  # noqa: E402

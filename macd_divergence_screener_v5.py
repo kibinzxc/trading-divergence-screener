@@ -109,6 +109,18 @@ app = Flask(__name__)
 # ── Indicator constants ────────────────────────────────────────────────────────
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ATR_PERIOD  = 14
+EMA_TREND   = 200
+RSI_PERIOD  = 14
+
+# ── Wave detection (spec v2, Steps 1-4) ───────────────────────────────────────
+MIN_WAVE    = 3        # bars; a shorter wave is merged into its neighbours
+WHIP_FRAC   = 0.05     # a cross counts once |MACD - signal| reaches this share...
+WHIP_RANGE  = 50       # ...of the MACD range over this many bars...
+WHIP_BARS   = 3        # ...within this many bars, the cross bar being the first
+SPACING     = (8, 80)  # bars allowed between MACD trough A and MACD trough B
+BUMP_MIN    = 0.25     # height of the middle of the W, as a share of the leg's MACD range
+PRICE_TAIL  = 2        # a wave's price extreme may print up to 2 bars after the wave ends
+MAX_BUMPS   = 1        # 2 = the spec's extended mode (off by default)
 PIVOT_SYNC  = 3      # bars of slack allowed between a price pivot and its MACD pivot
 
 # Per-timeframe geometry. A pivot must be the extreme of pivot_lb bars to its
@@ -322,7 +334,7 @@ def ema(s, p):
 
 
 def compute_indicators(df):
-    """MACD line / signal / histogram plus ATR14 (Wilder), on completed bars."""
+    """MACD line / signal / histogram, ATR14 (Wilder) and EMA 200, on completed bars."""
     close = df["close"]
     ml = ema(close, MACD_FAST) - ema(close, MACD_SLOW)
     sl = ema(ml, MACD_SIG)
@@ -333,8 +345,16 @@ def compute_indicators(df):
                     (df["low"] - prev).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean()
 
-    return pd.DataFrame({"macd": ml, "signal": sl, "hist": ml - sl, "atr": atr},
-                        index=df.index)
+    return pd.DataFrame({"macd": ml, "signal": sl, "hist": ml - sl, "atr": atr,
+                         "ema200": ema(close, EMA_TREND)}, index=df.index)
+
+
+def rsi(close, p=RSI_PERIOD):
+    """Wilder RSI. Used on BTC 4H only, for the regime tag."""
+    d = close.diff()
+    up = d.clip(lower=0).ewm(alpha=1.0 / p, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1.0 / p, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn)
 
 
 # ── Pivots ─────────────────────────────────────────────────────────────────────
@@ -372,6 +392,115 @@ def swing_pivots(high, low, lb, rb=None):
     ph, _ = find_pivots(high, lb, rb)
     _, pl = find_pivots(low, lb, rb)
     return ph, pl
+
+
+# ── Wave divergence (spec v2) ─────────────────────────────────────────────────
+def macd_crosses(macd, signal):
+    """Confirmed MACD/signal crossovers as [(bar, +1 bullish | -1 bearish)].
+
+    The list alternates direction, so consecutive entries bound one wave. A
+    cross that never opens a real gap (the whipsaw filter) is dropped, and a
+    wave shorter than MIN_WAVE bars is removed together with the two crosses
+    around it. Either way the waves on both sides join into one, which is what
+    stops a tiny double dot from splitting one trough into two.
+    """
+    d = macd - signal
+    m = pd.Series(macd)
+    rng = (m.rolling(WHIP_RANGE, min_periods=1).max()
+           - m.rolling(WHIP_RANGE, min_periods=1).min()).values
+    raw = np.flatnonzero(((d[1:] > 0) & (d[:-1] <= 0)) | ((d[1:] < 0) & (d[:-1] >= 0))) + 1
+    out = []
+    for i in raw:
+        i = int(i)
+        s = 1 if d[i] > 0 else -1
+        if out and out[-1][1] == s:
+            continue                                   # already on that side
+        if (s * d[i:i + WHIP_BARS]).max() < WHIP_FRAC * rng[i]:
+            continue                                   # whipsaw
+        if out and i - out[-1][0] < MIN_WAVE:
+            out.pop()                                  # the wave it would close is too short
+            continue
+        out.append((i, s))
+    return out
+
+
+def detect_wave_divergence(df, side, preset):
+    """REGULAR divergences of one side, read trough to trough on the MACD line.
+
+    Bullish : two bear waves (MACD below signal) A then B with one bull wave,
+              the bump, between them. Price low B < price low A while MACD
+              trough B > MACD trough A.
+    Bearish : the same picture upside down, so it is computed as the bullish
+              case on a negated MACD line and negated highs.
+
+    A divergence exists only once wave B has been closed by a cross; that
+    cross is the signal bar. The function reads nothing but `df`, so calling
+    it on df.iloc[:i + 1] is exactly what was knowable at bar i. The live scan
+    and the backtest both rely on that.
+    """
+    s = 1 if side == "bullish" else -1
+    macd = df["macd"].values * s
+    ext = df["low"].values if s > 0 else -df["high"].values
+    o, c, h, l = (df[k].values for k in ("open", "close", "high", "low"))
+    vol, atr = df["volume"].values, df["atr"].values
+    n = len(df)
+    crosses = macd_crosses(df["macd"].values, df["signal"].values)
+
+    waves = []                                         # closed waves on the trough side
+    for (c0, d0), (c1, _) in zip(crosses, crosses[1:]):
+        if d0 != -s:
+            continue
+        tm = c0 + int(np.argmin(macd[c0:c1]))
+        tp = c0 + int(np.argmin(ext[c0:min(c1 + PRICE_TAIL, n)]))
+        waves.append({"start": c0, "end": c1, "tm": tm, "tp": tp,
+                      "m": float(macd[tm]), "p": float(ext[tp])})
+
+    out = []
+    for k in range(1, len(waves)):
+        B = waves[k]
+        for j in range(k - 1, max(k - 1 - MAX_BUMPS, -1), -1):
+            A = waves[j]
+            if not (B["p"] < A["p"] and B["m"] > A["m"]):
+                continue
+            if not (SPACING[0] <= B["tm"] - A["tm"] <= SPACING[1]):
+                continue
+            seg = macd[A["tm"]:B["tm"] + 1]
+            leg = float(seg.max() - seg.min())
+            if leg <= 0:
+                continue
+            bump = A["end"] + int(np.argmax(macd[A["end"]:B["start"]]))
+            bump_frac = (float(macd[bump]) - B["m"]) / leg      # B is the higher trough
+            if bump_frac < BUMP_MIN:
+                continue
+            tp = B["tp"]
+            atr_pct = atr[tp] / c[tp] * 100 if c[tp] else 0.0
+            if (A["p"] - B["p"]) / abs(A["p"]) * 100 < max(preset["min_price_pct"],
+                                                         preset["atr_frac"] * atr_pct):
+                continue
+            macd_frac = (B["m"] - A["m"]) / leg
+            if macd_frac < preset["min_macd_frac"]:
+                continue
+            zero_ok = B["m"] < 0                                # then A, the lower one, is too
+            if preset["zero_line"] and not zero_ok:
+                continue
+            C = waves[j - 1] if j else None
+            bar_rng = h[tp] - l[tp]
+            wick = (min(o[tp], c[tp]) - l[tp]) if s > 0 else (h[tp] - max(o[tp], c[tp]))
+            out.append({
+                "side": side, "a_m": A["tm"], "b_m": B["tm"], "a_p": A["tp"], "b_p": tp,
+                "a_macd": A["m"] * s, "b_macd": B["m"] * s,
+                "a_price": abs(A["p"]), "b_price": abs(B["p"]),
+                "a_start": A["start"], "b_start": B["start"], "signal_bar": B["end"],
+                "bump_bar": bump, "bump_frac": bump_frac, "macd_frac": macd_frac,
+                "price_atr": float((A["p"] - B["p"]) / atr[tp]) if atr[tp] > 0 else 0.0,
+                "zero_ok": bool(zero_ok),
+                "triple": bool(C and A["p"] < C["p"] and A["m"] > C["m"]),
+                "vol_dry": bool(vol[B["start"]:B["end"]].mean() < vol[A["start"]:A["end"]].mean()),
+                "wick": bool(bar_rng > 0 and wick >= 0.5 * bar_rng),
+                "crosses": [x for x in crosses if A["start"] <= x[0] <= B["end"]],
+            })
+            break
+    return out
 
 
 # ── Divergence detection ───────────────────────────────────────────────────────

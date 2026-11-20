@@ -4136,7 +4136,7 @@ function tfBlock(r, tf){
   var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf;
   return '<div class="dgrid">' +
     '<div><a href="' + src + '" target="_blank" rel="noopener" title="Open the chart full size"><img class="chart" loading="lazy" alt="' +
-      r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + '"></a></div>' +
+      r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + '" onerror="var p=document.createElement(\'p\');p.className=\'calm\';p.textContent=this.alt;this.parentNode.replaceWith(p)"></a></div>' +
     '<div><span class="lbl">' + tfLabel(tf) + ' levels</span><dl class="kv num">' +
       kv('Now', fmtPx(r.current_price)) +
       kv('Entry', fmtPx(s.entry_ref_price) + (trig ? ' (trigger price)' : ' (signal price)')) +

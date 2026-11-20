@@ -30,6 +30,11 @@ class Indicators(unittest.TestCase):
         df = wave_df(W)[["open", "high", "low", "close", "volume"]]
         self.assertIn("ema200", m.compute_indicators(df).columns)
 
+    def test_macd_in_atr_units(self):
+        df = wave_df(W)[["open", "high", "low", "close", "volume"]]
+        ind = m.compute_indicators(df)
+        np.testing.assert_allclose(ind["macd_atr"], ind["macd"] / ind["atr"])
+
     def test_rsi_extremes(self):
         up = pd.Series(np.arange(1.0, 60))
         self.assertEqual((m.rsi(up).iloc[-1], m.rsi(100 - up).iloc[-1]), (100.0, 0.0))
@@ -49,6 +54,13 @@ class Crosses(unittest.TestCase):
         df.iloc[15:17, df.columns.get_loc("macd")] = 1.0   # a decisive but 2-bar bull wave
         self.assertEqual(crosses(df), CROSSES)
 
+    def test_gap_must_also_reach_a_twentieth_of_atr(self):
+        df = wave_df(W)
+        tiny, sig = df["macd"].values * 0.01, df["signal"].values   # gaps top out at 0.02, ATR is 1
+        self.assertEqual(m.macd_crosses(tiny, sig), CROSSES)          # the range test alone passes
+        self.assertEqual(m.macd_crosses(tiny, sig, df["atr"].values), [])
+        self.assertEqual(m.macd_crosses(tiny, sig, np.zeros(len(df))), CROSSES)   # no ATR: no check
+
 
 class Detection(unittest.TestCase):
     def test_w_shape_is_found_on_its_own_side_only(self):
@@ -67,6 +79,11 @@ class Detection(unittest.TestCase):
         d = detect(W, "bearish")[0]
         self.assertEqual((round(d["a_price"], 2), round(d["b_price"], 2)), (104.96, 107.93))
         self.assertEqual((round(d["a_macd"], 2), round(d["b_macd"], 2)), (1.98, 0.99))
+
+    def test_detection_applies_the_atr_floor(self):
+        df = wave_df(W)
+        df["macd"] *= 0.01
+        self.assertEqual(m.detect_wave_divergence(df, "bullish", RULES), [])
 
     def test_not_reported_until_wave_b_is_closed_by_a_cross(self):
         df = wave_df(W)

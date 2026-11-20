@@ -4,6 +4,8 @@ Run with:  python -m unittest tests.test_app -v
 """
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -62,17 +64,49 @@ class SavedState(unittest.TestCase):
 
     def test_row_state_round_trips(self):
         self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
-                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 2}})
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 3}})
         m.load_state()
         self.assertEqual(m._state["results"], [{"pair": "X", "tfs": ["4h"]}])
         m.save_state()
         with open(m.STATE_FILE) as f:
             saved = json.load(f)
         self.assertEqual(sorted(saved), ["meta", "results", "ts"])
-        self.assertEqual(saved["meta"]["v"], 2)
+        self.assertEqual(saved["meta"]["v"], 3)
+
+    def test_state_from_before_the_v3_score_is_ignored(self):
+        self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 2}})
+        m.load_state()
+        self.assertEqual(m._state["results"], [])
 
 
 import re  # noqa: E402
+
+
+class BriefMeta(unittest.TestCase):
+    NOW = m.datetime.datetime(2026, 11, 20, 12, 0, tzinfo=m.datetime.timezone.utc)
+    MS = int(NOW.timestamp() * 1000)
+
+    def btc(self, rsi):
+        import pandas as pd
+        return pd.DataFrame({"rsi": [50.0, rsi], "close": [100.0, 110.0], "ema200": [100.0, 100.0]})
+
+    def test_btc_is_the_last_completed_bar(self):
+        d = m.brief_meta(self.btc(60.0), (None, None), self.NOW)
+        self.assertEqual(d["btc"], {"state": "BULL", "rsi": 60.0, "close": 110.0, "ema200": 100.0})
+        self.assertEqual(m.brief_meta(self.btc(50.0), (None, None), self.NOW)["btc"]["state"], "CHOP")
+
+    def test_calendar_entries_become_absolute_times(self):
+        d = m.brief_meta(None, ((6.0, "CPI m/m"), (-0.5, "BOJ Policy Rate")), self.NOW)
+        self.assertEqual(d, {"btc": None,
+                             "blocker": {"ts_ms": self.MS + 6 * 3_600_000, "title": "CPI m/m"},
+                             "macro": {"ts_ms": self.MS - 1_800_000, "title": "BOJ Policy Rate"}})
+        json.dumps(d)   # saved with the state
+
+    def test_nothing_due_is_null_and_no_calendar_leaves_the_keys_out(self):
+        self.assertEqual(m.brief_meta(None, (None, None), self.NOW),
+                         {"btc": None, "blocker": None, "macro": None})
+        self.assertEqual(m.brief_meta(None, None, self.NOW), {"btc": None})
 
 
 class Chart(unittest.TestCase):
@@ -91,6 +125,17 @@ class Chart(unittest.TestCase):
     def test_render_is_a_png(self):
         self.assertEqual(m.render_chart(*self.hit)[:4], b"\x89PNG")
 
+    def test_level_labels_keep_plain_digits(self):
+        self.assertEqual([m._plain(v) for v in (65432.1, 1.25, 0.0000098)],
+                         ["65432.1", "1.25", "0.0000098"])
+
+    def test_level_labels_are_nudged_apart_in_their_own_order(self):
+        self.assertEqual(m.spread_labels([100.0, 100.2, 109.0], 2.0), [100.0, 102.0, 109.0])
+        self.assertEqual(m.spread_labels([109.0, 100.2, 100.0], 2.0), [109.0, 102.0, 100.0])
+        ys = sorted(m.spread_labels([1.0, 1.0, 1.0, 1.0, 1.0], 0.5))
+        self.assertTrue(all(b - a >= 0.5 for a, b in zip(ys, ys[1:])), ys)
+        self.assertEqual(m.spread_labels([5.0, 1.0, 9.0], 2.0), [5.0, 1.0, 9.0])   # nothing collides
+
     def test_route_serves_the_chart_of_a_scanned_row(self):
         r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"})
         self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"))
@@ -104,11 +149,23 @@ class Page(unittest.TestCase):
     def setUp(self):
         self.html = m.app.test_client().get("/").get_data(as_text=True)
 
-    def test_four_pages(self):
+    def test_five_pages(self):
         self.assertEqual(re.findall(r'class="nav-btn[^"]*" data-pg="(\w+)"', self.html),
-                         ["scan", "movers", "calendar", "learn"])
+                         ["scan", "movers", "calendar", "tags", "learn"])
         self.assertEqual(sorted(re.findall(r'<div id="pg-(\w+)"', self.html)),
-                         ["calendar", "learn", "movers", "scan"])
+                         ["calendar", "learn", "movers", "scan", "tags"])
+
+    def test_oi_column_and_tags_page(self):
+        for want in ('data-sort="oi"', "function oiCell", 'id="tagsBody"', 'colspan="7"'):
+            self.assertIn(want, self.html, want)
+        # every tag the Tags page lists has a definition
+        groups = re.search(r"var TAG_GROUPS = \[(.*?)\n\];", self.html, re.S).group(1)
+        tip = re.search(r"var TIP = \{(.*?)\n\};", self.html, re.S).group(1)
+        for k in ("'CHOP'", "'PARTIAL DATA'"):
+            self.assertIn(k, groups, k)
+        for line in groups.splitlines():
+            for k in re.findall(r"'([^']+)'", line.split(", [", 1)[-1]):
+                self.assertIn("'" + k + "':", tip, k)
 
     def test_no_unfilled_template_placeholders(self):
         self.assertEqual(re.findall(r"__[A-Z][A-Z_]+__", self.html), [])
@@ -119,14 +176,173 @@ class Page(unittest.TestCase):
             self.assertNotIn(gone, self.html, gone)
 
     def test_new_table_and_filters(self):
-        for want in ('data-f="enter"', 'data-f="both"', "function evCell", "function ctxCell",
+        for want in ('data-f="enter"', 'data-f="both"', "function evCell", "function tagChips",
                      'id="scan-age"', 'id="dash-cal"',
                      "function gradeCell", "/chart?pair=", "'W-PATTERN'", "'LTF TRIGGER'"):
             self.assertIn(want, self.html, want)
 
+    def test_seven_columns(self):
+        head = re.search(r'<table id="resT">\s*<thead>(.*?)</thead>', self.html, re.S).group(1)
+        self.assertEqual(re.findall(r"<th[^>]*>([^<]+)</th>", head),
+                         ["Coin", "Side and TF", "Grade", "Answer", "Entry", "Stop", "7d OI"])
+        for gone in ('colspan="11"', "function ctxCell", 'data-sort="age"'):
+            self.assertNotIn(gone, self.html, gone)
+
+    def test_brief_and_fold(self):
+        for want in ('id="briefH"', 'id="briefState"', 'id="picks"', "function renderBrief",
+                     "Worth a look", "Closest to qualifying", "No trade is a fine answer",
+                     "the backtest has not shown an edge yet",
+                     '<button class="fold" id="fold"', "that did not pass, newest first",
+                     # rows open with click, Enter or Space
+                     'tabindex="0"', "e.key === 'Enter' || e.key === ' '",
+                     # the brief copes with a scan saved before its meta fields existed
+                     "m.blocker === null", "b === null"):
+            self.assertIn(want, self.html, want)
+
+    def test_settings_live_in_a_closed_panel_on_the_scan_page(self):
+        scan = re.search(r'<div id="pg-scan".*?<div id="pg-movers"', self.html, re.S).group(0)
+        panel = re.search(r'<details class="set" id="scanSet"><summary>Scan settings</summary>(.*?)</details>',
+                          scan, re.S).group(1)
+        for cid in ("exchange", "minVol", "uniBtn", "uniOut", "strG", "strHint", "maxPairs", "spdG",
+                    "symOverride"):
+            self.assertIn('id="%s"' % cid, panel, cid)
+        for cid in ("runBtn", "pgSec", "pbFill", "pbLbl", "lc", "sl", "scan-audit"):
+            self.assertIn('id="%s"' % cid, scan, cid)
+        self.assertNotIn("<aside", self.html)
+
+    def test_the_look(self):
+        for token in ("--bg:#0C111B", "--sf:#121926", "--sf2:#182132", "--line:#222D40", "--tx:#DCE3EE",
+                      "--tx2:#9AA8BD", "--tx3:#6E7D94", "--acc:#8FB4E8",
+                      "--yes:#8FBF9F", "--yes-bg:#1B2A24", "--wait:#D8BE8A", "--wait-bg:#2B2619",
+                      "--no:#C9A0A5", "--no-bg:#2A2023", "--short:#D99AA0", "--short-bg:#2E1F23",
+                      "--blue:#9DB7DA", "--blue-bg:#1C2636", "--violet:#B3A6D6", "--violet-bg:#252238",
+                      "--teal:#8CC2C0", "--teal-bg:#18292B",
+                      "font-size:15px", ":focus-visible", "prefers-reduced-motion"):
+            self.assertIn(token, self.html, token)
+        # nothing below 12px (the Method drawings are SVG user units, scaled up on screen)
+        css = "\n".join(l for l in self.html.splitlines() if not l.startswith(".lp-"))
+        small = [v for v in re.findall(r"font-size:\s*([\d.]+)px", css) if float(v) < 12]
+        self.assertEqual(small, [])
+        # the old palette is gone
+        for gone in ("var(--bull", "var(--bear", "var(--fresh", "var(--bd", "var(--sf3"):
+            self.assertNotIn(gone, self.html, gone)
+
+    def test_matte_pills_chips_and_tag_families(self):
+        for want in (".side-long{", ".side-short{", ".gr-A{", ".gr-B{", ".gr-C{", ".oi-up{", ".oi-dn{",
+                     ".tag.t-pattern{", ".tag.t-flow{", ".tag.t-mover{", ".tag.t-caution{", ".tag.t-venue{",
+                     ".mkt-bear{", ".mkt-bull{", ".mkt-chop{"):
+            self.assertIn(want, self.html, want)
+        self.assertNotIn("Kevin", self.html)
+
+    def test_text_on_the_tints_keeps_4_5_to_1(self):
+        tok = dict(re.findall(r"--([a-z0-9-]+):(#[0-9A-Fa-f]{6})", self.html))
+
+        def lum(h):
+            c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            r, g, b = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+        for fg, bg in [(k, k + "-bg") for k in ("yes", "wait", "no", "short", "blue", "violet", "teal")] + \
+                      [("tx", "short-bg"), ("tx", "yes-bg"), ("tx", "wait-bg"), ("tx2", "sf2"), ("acc-ink", "acc")]:
+            hi, lo = sorted((lum(tok[fg]), lum(tok[bg])), reverse=True)
+            self.assertGreaterEqual((hi + 0.05) / (lo + 0.05), 4.5, (fg, bg))
+
     def test_pivot_era_ui_is_gone(self):
         for gone in ("macd_cross", "volCell", "FROM CURRENT PRICE", "MACD pivot must align"):
             self.assertNotIn(gone, self.html, gone)
+
+
+# The page script run in node against a stub DOM: enough to call its pure helpers
+# and read back what the brief writes.
+STUB = """
+var P = new Proxy(function(){}, {get: function(){ return P; }, apply: function(){ return P; }, set: function(){ return true; }});
+var els = {};
+var document = {getElementById: function(id){ return els[id] || (els[id] = {style: {}, dataset: {}, classList: P,
+                  addEventListener: function(){}, setAttribute: function(){}, querySelectorAll: function(){ return []; }}); },
+                querySelectorAll: function(){ return []; }, querySelector: function(){ return P; }, addEventListener: function(){}};
+var location = {hash: ''}, fetch = P;
+globalThis.setInterval = function(){};
+"""
+ROWS = """
+function row(base, v, reason, extra){
+  var s = Object.assign({grade: 'A', score: 74, regime: 'WITH TREND', status: 'active', bars_ago: 1, fresh: true,
+    forming: false, trigger_first: false, entry_ref_price: 10, stop_price: 9.5, risk_pct: 5, tags: ['TRIPLE'],
+    targets: {'1r': 10.5, '2r': 11, '3r': 11.5, structure: 10.8}}, extra || {});
+  return {pair: base + '/USDT:USDT', base: base, side: 'bullish', tfs: ['4h'], primary_tf: '4h', signals: {'4h': s},
+          score: s.score, current_price: 10.1, entry: {verdict: v, reason: reason, level: v === 'skip' ? null : 9.5}};
+}
+var YES = row('AAA', 'enter', 'Yes (confirmed). The signal bar has closed, the grade is A and the stop is untouched. Risk 5% to the stop at');
+var BEST = row('BBB', 'enter', 'Yes (early). The lower timeframe triggered while the signal bar is still forming. Risk 5% to the stop at', {score: 90, forming: true, trigger_first: true});
+var WAIT = row('CCC', 'wait', 'Not yet. Price has already moved 3% away from the signal. Wait for it to pull back to', {grade: 'B', score: 60, status: 'extended', pct_chg: 3});
+var NO = row('DDD', 'skip', 'No. Weak setup: grade C, score 40 of 100.', {grade: 'C', score: 40});
+function brief(rows, meta){ pendR = rows; scanMeta = meta; scanTs = Date.now(); renderBrief();
+  return {h: els.briefH.textContent, lbl: els.briefLbl.textContent, state: els.briefState.innerHTML, picks: els.picks.innerHTML}; }
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class PageLogic(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        html = m.app.test_client().get("/").get_data(as_text=True)
+        cls.js = STUB + re.search(r"<script>(.*?)</script>", html, re.S).group(1) + ROWS
+
+    def js_value(self, expr):
+        path = os.path.join(tempfile.mkdtemp(), "page.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.js + "\nprocess.stdout.write(JSON.stringify(" + expr + "));")
+        out = subprocess.run(["node", path], capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_tag_family_comes_from_the_tags_page_groups(self):
+        got = self.js_value("[tag('TRIPLE'), tag('CAPITULATION'), tag('HIGH OI/VOL'), tag('BIG MOVE'), "
+                            "tag('PARTIAL DATA'), tag('MACRO', 'MACRO CPI m/m in 3h'), tag('NOT ON BINANCE'), "
+                            "tag('ALSO ON', 'ALSO ON OKX'), tag('WITH TREND')]")
+        fams = [(re.search(r'class="tag t-(\w+)"', h) or [None, None])[1] for h in got]
+        self.assertEqual(fams, ["pattern", "flow", "flow", "mover", "caution", "caution", "caution", "venue",
+                                None])
+        self.assertIn(">MACRO CPI m/m in 3h<", got[5])
+
+    def test_answer_cell_shows_the_first_sentence_only(self):
+        self.assertEqual(self.js_value("[shortWhy(YES), shortWhy(BEST), shortWhy(WAIT), shortWhy(NO)]"),
+                         ["The signal bar has closed, the grade is A and the stop is untouched",
+                          "The lower timeframe triggered while the signal bar is still forming",
+                          "Price has already moved 3% away from the signal",
+                          "Weak setup: grade C, score 40 of 100"])
+        self.assertTrue(self.js_value("reason(WAIT)").endswith("pull back to 9.5"))
+
+    def test_brief_with_yes_rows(self):
+        b = self.js_value("brief([NO, WAIT, YES, BEST], {btc: {state: 'BEAR', rsi: 32.4, close: 61959.3, ema200: 73736.56},"
+                          " blocker: {ts_ms: Date.now() + 3 * 3600000 + 10000, title: 'CPI m/m'}, macro: null})")
+        self.assertIn("2 setups pass the checklist; the rest can wait.", b["h"])
+        self.assertEqual(b["lbl"], "Worth a look")
+        self.assertEqual(re.findall(r'class="coin">(\w+)<', b["picks"]), ["BBB", "AAA"])   # highest score first
+        self.assertIn('class="mkt mkt-bear"', b["state"])
+        self.assertIn("61959.30</span>, below its 200 EMA at <span class=\"num\">73736.56<", b["state"])
+        self.assertIn("<b>CPI m/m in 3h 0m.</b> All entries wait until an hour after it prints.", b["state"])
+
+    def test_brief_with_only_not_yet_rows_and_a_far_print(self):
+        b = self.js_value("brief([NO, WAIT], {btc: null,"
+                          " blocker: {ts_ms: Date.now() + 8 * 3600000 + 10000, title: 'FOMC Statement'},"
+                          " macro: {ts_ms: Date.now() + 2 * 3600000 + 10000, title: 'BOJ Policy Rate'}})")
+        self.assertIn("Nothing passes yet. 1 setup is close.", b["h"])
+        self.assertEqual(b["lbl"], "Closest to qualifying")
+        self.assertIn("BTC data is unavailable.", b["state"])
+        self.assertIn("4H setups wait until it is out. 1H setups are clear for now.", b["state"])
+        self.assertIn("Also due: BOJ Policy Rate in 2h 0m.", b["state"])
+
+    def test_brief_of_a_scan_saved_before_the_brief_says_nothing_about_market_or_macro(self):
+        b = self.js_value("brief([NO], {})")
+        self.assertIn("No trade is a fine answer.", b["h"])
+        self.assertEqual((b["state"], re.findall(r'class="coin">(\w+)<', b["picks"])), ("", ["DDD"]))
+
+    def test_checks_follow_the_row(self):
+        got = self.js_value("(scanMeta = {blocker: {ts_ms: 3 * 3600000, title: 'CPI m/m'}}, scanTs = 1,"
+                            " [checks(YES), checks(WAIT), checks(NO)])")
+        self.assertEqual([c[0] for c in got[0]], ["", "", "", "", "w"])       # the print is inside the 12h window
+        self.assertEqual([c[0] for c in got[1]], ["", "", "", "w", "w"])
+        self.assertEqual(got[2][1], ["x", "Grade C (40) is too weak"])
 
 
 if __name__ == "__main__":

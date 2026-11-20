@@ -14,54 +14,104 @@ serves both the API and a browser dashboard.
   exchange, minus stablecoin bases and TradFi perps (stocks/ETFs/commodities
   listed as perps — filtered via exchange instrument metadata, with a name
   backstop). No hardcoded coin basket.
+- **All exchanges (default)**: one row per coin, Binance first. A coin
+  Binance does not list is read on whichever of OKX / Bybit has the larger
+  24h volume and tagged `NOT ON BINANCE`. Each row's primary timeframe is
+  then re-detected on the other venues listing the coin; where the same side
+  fires within one bar the row is tagged `ALSO ON OKX, BYBIT` (only the
+  venues that confirmed). A tag, not points; a venue that fails to fetch
+  never costs the row. The venue the data came from is shown under the pair.
+  Picking one exchange scans only that one, without venue tags.
 - **Liquidity gate**: a pair is only scanned if its true rolling 7-day traded
-  value clears a floor (default $70M/week ≈ $10M/day). This is the only
-  universe filter — there's no trend/regime gate, since regular divergences
-  are counter-trend by definition.
+  value clears a floor (default $70M/week ≈ $10M/day).
+- **Thin-coin filters**: a top-of-book spread above 0.10% or a 4H ATR outside
+  0.6%–8% of price keeps a pair out of the scan; a timeframe with fewer than
+  300 completed bars is not analysed on that timeframe; a pair with a setup
+  but under $5M open interest (latest daily OI point) has its rows dropped.
+  On OKX that OI (and the 7d OI column) is the whole coin's, all contracts.
+  Unknown spread or OI never filters, a symbol override skips all four, and
+  the audit line counts each. There's no trend/regime gate, since regular
+  divergences are counter-trend by definition.
 - **Divergence detection**: the MACD/signal crossovers split the MACD line
   into waves. Each wave below the signal line is one trough (above it, one
   peak). Two neighbouring troughs A and B, 8 to 80 bars apart with a real
   bump between them, are compared with the lowest wicks inside those same
   waves: price lower, MACD trough higher is a regular bullish divergence
-  (bearish is the mirror). A cross that never opens a gap and a wave shorter
+  (bearish is the mirror). A cross that never opens a gap (5% of the 50-bar
+  MACD range and 0.05 ATR, within 3 bars) and a wave shorter
   than 3 bars are merged away, so a double dot cannot split a trough. A
   divergence is reported only once the cross that ends wave B has closed;
   that bar is the signal bar. The still-forming candle is dropped, with one
   labelled exception (see *Good to enter?*).
 - **Strictness presets**: `balanced` (default) and `strict`. Strict needs a
   larger divergence and both troughs below the zero line (peaks above it).
-- **Quality score and grade**: 0-100, graded A (70+), B (55-69) or C. Points
-  for the size of the price and MACD differences, the height of the bump,
-  the zero-line side, the higher timeframe's MACD agreeing (1D for a 4H
-  signal, 4H for a 1H signal), volume drying up in wave B, a rejection wick
-  at B, open interest falling into B, and a triple divergence. It describes
-  the setup; the backtest below is what measures it.
-- **Regime tag**: `WITH TREND` when BTC 4H RSI is on the signal's side of 50
-  and the coin is on the right side of its 200 EMA, else `COUNTER TREND`. It
-  never hides a row; a counter-trend setup needs grade A to answer Yes.
+- **Quality score and grade**: 0-100, graded A (70+), B (55-69) or C.
+  Pattern points (up to 70) for the size of the price and MACD differences,
+  the height of the bump, the zero-line side, volume drying up in wave B, a
+  rejection wick at B and a triple divergence. Context points (10 each) for
+  the higher timeframe's MACD agreeing (1D for a 4H signal, 4H for a 1H
+  signal), open interest falling into B with funding against the crowd, and
+  the BTC 4H state on the signal's side; OI rising more than 5% against the
+  signal costs 10. Context the data cannot check is left out and the score
+  rescaled to 100 (tag `PARTIAL DATA`). It describes the setup; the backtest
+  below is what measures it.
+- **Regime tag**: BTC 4H is BULL (RSI > 55 and close above its 200 EMA),
+  BEAR (RSI < 45 and close below it) or CHOP. `WITH TREND` when the BTC state
+  and the coin's own 200 EMA both agree with the side, `CHOP` when BTC is
+  CHOP, else `COUNTER TREND` (also when BTC data is missing). It never hides
+  a row; a counter-trend setup needs grade A to answer Yes, a CHOP reversal
+  keeps the normal cutoff.
 - **Transparent scan accounting**: every run reports pairs dispatched,
   analysed, rejected on volume, errored, or missing volume data, and whether
   the scan actually completed — so a quiet-looking result can't be mistaken
   for "the market is quiet" when it was actually a partial/failed scan.
 - **One row per coin and side**: when 4H and 1H diverge the same way they
   share a row, which takes its answer, grade and levels from the better
-  signal (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag
-  shows which. Click a row for each timeframe's levels and a chart of the
-  A-to-B leg with the troughs, crossovers, stop and 1R / 2R / 3R drawn in.
-- **Good to enter?**: every row answers Yes, Not yet or No in plain language.
-  First matching rule wins. No: stop hit, already ran 1R, signal bar older
-  than 6 bars (4H) or 12 bars (1H), or grade C. Not yet: counter trend below
-  grade A, price more than 2% past the signal price, or a market-mover print
-  inside 24 hours. Otherwise `Yes (confirmed)`. A signal bar that is still
+  signal (Yes beats Not yet beats No, 4H wins a tie); the brighter timeframe
+  shows which. Click a row (or focus it and press Enter or Space) for each
+  timeframe's levels, setup, score inputs and a chart of the A-to-B leg: A and
+  B labelled with their price and MACD value, the crossovers, and the entry,
+  stop and 1R / 2R / 3R lines with their prices. The primary timeframe also
+  lists "Why this answer" (a tick, wait or cross per check, then the full
+  reason) and every tag.
+- **The brief**: the Scan page opens with plain sentences built from the last
+  scan: how many setups pass, BTC's 4H state (close, 200 EMA, RSI) and what it
+  means for entries, the nearest blocking USD print with a live countdown and
+  what waits on it, and up to three cards (the Yes rows, highest score first;
+  failing that the two closest Not yet rows; failing that the three newest
+  signals and why each is a No). A card opens its row in the table.
+- **A seven-column table**: Coin (with two tags and +N), Side and TF, Grade,
+  Answer (with the first sentence of the reason), Entry, Stop, 7d OI. No rows
+  are folded under "Show N that did not pass, newest first" until you unfold
+  them or pick the All filter. The scan controls (exchange, volume floor,
+  strictness, max pairs, speed, specific coins) are in the closed
+  "Scan settings" panel next to the Run Scan button.
+- **Good to enter?** (the Answer column): every row answers Yes, Not yet or No in plain language.
+  First matching rule wins. No: stop hit, already ran 1R, more than 6
+  completed 4H bars (24h) / 8 completed 1H bars (8h) after the signal bar
+  (counted to the last completed bar's close, not the clock), or grade C. Not yet:
+  counter trend below grade A, price more than 2% past the signal price, or
+  a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment
+  rate, FOMC rate / statement / press conference, Fed Chair) due within 12
+  hours for a 4H signal or 4 hours for a 1H signal, or printed in the last
+  hour (`MACRO_BLOCKERS`, `MACRO_WAIT_H`). The other market movers never
+  block; one due within 24 hours shows as a `MACRO <name> in Xh` tag, and so
+  does a USD print above that the answer does not name (e.g. CPI in 6h on a
+  1H row); the sooner one is shown.
+  Otherwise `Yes (confirmed)`. A signal bar that is still
   forming is listed as provisional: `Yes (early)` if the lower timeframe (1H
   for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last
-  swing since B, otherwise Not yet. It is a checklist judged at scan time,
+  swing since B, otherwise Not yet. A 4H signal also checks 15m (tag
+  `15M TRIGGER`, counted only if it closes within 8 hours of the 4H close);
+  the trigger price is whichever trigger closed first. It is a checklist judged at scan time,
   not a prediction; the page dims answers once the scan is over an hour old.
 - **Context tags**: for coins that have a divergence, the scan also reads the
   last completed day against the coin's 20-day baseline (volume spike, range
   expansion, at the 7-day high or low) and 7-day open-interest flow with
   funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
-  change the answer. Pattern tags sit in the same column: TRIPLE, W-PATTERN, LTF TRIGGER, ZERO-LINE CROSS.
+  change the answer, and neither does `MACRO` (a calendar print due within
+  24 hours that the answer does not name). Pattern tags sit with them under the coin name: TRIPLE,
+  W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS.
 - **Movers tab** (`/movers`): a separate scan of every liquid crypto perp for
   an unusual last completed day (5%+ move, 2x its 20-day volume, or 1.5x its
   ATR20), whether or not the coin diverges. Each row lists the prior-day and
@@ -116,21 +166,42 @@ export needed. A real environment variable `JBLANKED_API_KEY` also works.
 ## Backtest
 
 ```bash
-python macd_divergence_screener_v5.py --backtest                      # 30 most liquid pairs on OKX
-python macd_divergence_screener_v5.py --backtest --exchange binance --pairs 60
+python macd_divergence_screener_v5.py --backtest                      # 30 most liquid pairs on Binance
+python macd_divergence_screener_v5.py --backtest --exchange okx --pairs 60
 python macd_divergence_screener_v5.py --backtest --symbols BTC,ETH,SOL --strictness strict
 ```
 
-Replays the same candles the scan uses (720 bars of 4H, 500 of 1H) bar by
-bar with the same detector, each bar seeing only the bars up to and including it. A
-signal is entered at the close of the bar it first appears on, with the
-scan's stop. The report gives, per grade and per regime, how many signals
-there were and, for 1R, 2R and 3R targets, the share that got there before
-the stop and the average R of exiting there. Use it to check whether grade A
-actually beats grade B before trusting the cutoffs.
+Fetches 1500 bars of 4H and of 1H (deeper than the scan's 720 / 500; 300
+daily bars for the 1D check) and replays them bar by bar with the same
+detector and scoring, each bar seeing only the bars up to and including it.
+The replay starts where the live scan would (300 completed bars) and stops
+30 bars (4H) / 48 bars (1H) before the end, so every trade resolves. A signal is entered at the close of the bar it first appears on
+plus 0.05% slippage against the trade, with the scan's stop. Fees of 0.10% of
+price round trip are converted to R and taken off every trade.
 
-Limits: open interest and the lower-timeframe trigger are not replayed (no
-bar-by-bar history), so a backtest score can differ from the live one by up to 10 points either way; when one bar touches both the stop and a target, the stop is counted.
+Each target (1R, 2R, 3R) is its own exit: the target, the stop, or the close
+30 bars (4H) / 48 bars (1H) later, marked to market. A bar that touches both
+the stop and the target counts as the stop. Trades are in-sample when their entry falls in the first
+70% of the pair's replayed bars, out-of-sample otherwise.
+
+The report has one block per timeframe: an `ALL` line, then one line per grade
+x regime, in-sample and out-of-sample side by side: n, win rate and expectancy
+(average R after fees) at 1R and 2R, and on the 2R exit the profit factor,
+median bars to outcome, average MAE in R and longest losing streak. Fewer than
+30 trades prints `insufficient`. It then checks the grade A cutoff on the 2R
+exit, once per timeframe (their in / out-of-sample windows cover different
+dates): the lowest in-sample score with 30+ trades at or above it averaging at
+least +0.3R, kept only if out-of-sample trades at that cutoff average above 0
+and at least half the in-sample value. Otherwise it says 70 / 55 are kept. It
+only prints; `GRADE_A` / `GRADE_B` are not changed.
+
+Known gaps: open interest is not replayed (no bar-by-bar history), so the OI
+component is left out of the backtest score and the rest rescaled, as the live
+scan does when OI is missing. The lower-timeframe triggers and funding are
+not replayed, and neither are the scan's pair filters: the weekly volume
+floor, the 4H ATR% range and the spread / OI thin-coin filters (the pairs are
+today's most liquid). A saved run is in
+`docs/superpowers/backtests/`.
 
 ## API
 
@@ -151,7 +222,8 @@ without re-scanning.
 
 Common query params (all optional, sane defaults apply):
 
-- `exchange` — `okx` (default), `binance`, or `bybit`
+- `exchange` — `all` (default for `/scan` and `/universe`: Binance first, see
+  above), `okx`, `binance`, or `bybit`. `/movers` takes one exchange (default `okx`)
 - `strictness` — `balanced` (default) or `strict`
 - `speed` — `safe`, `normal` (default), `fast`
 - `min_weekly_vol` — liquidity floor in USD (default `70000000`)
@@ -209,17 +281,21 @@ forecast and previous, so the tab links out to ForexFactory in two places:
 the header opens the calendar, and the selected day opens that same day
 there, which is where the number appears once a print lands.
 
-**The Scan-page strip** repeats the next market mover with a countdown and
-turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
+**The Scan-page strip** (under the table) repeats the next market mover with a
+countdown and turns amber when it is inside 24 hours. The brief above the
+table names the nearest blocking USD print as of the last scan. `/#calendar` opens the tab directly.
 
 ## Reading a row
 
-1. **Check the calendar strip first.** If a market mover is inside 24 hours,
-   every otherwise-ready row answers Not yet and names the event.
+1. **Read the brief's macro line first.** A high-impact USD print within 12
+   hours holds every otherwise-ready 4H row at Not yet (within 4 hours, the
+   1H rows too), and so does one printed in the last hour; the reason names
+   the event. The other movers show as a `MACRO` tag on the row instead.
 2. **Read the audit line.** A short list from an unfinished scan is not a
    quiet market.
-3. **Start with the Yes rows, highest grade first.** Click a row and check
-   the chart: the two troughs, the bump between them and the stop.
+3. **Start with the Yes rows, highest grade first** (the brief's cards).
+   Click a row and check the chart: the two troughs, the bump between them
+   and the stop.
 4. **Not yet rows are the ones to keep an eye on.** The reason says what to
    wait for: a pullback to the signal price, the macro print, the signal bar
    closing, or (counter trend, grade B) nothing: watch only.
@@ -231,8 +307,9 @@ turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
    time.
 
 The *Specific coins* box scans only the tickers you type and skips the
-volume floor, so a thin name can still be checked on demand. Use the
-exchange with the deepest book (Binance for most pairs).
+volume floor and the thin-coin filters, so a thin name can still be checked
+on demand. Use the exchange with the deepest book (Binance for most pairs),
+or All.
 
 ## Disclaimer
 

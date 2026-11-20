@@ -26,9 +26,9 @@ class HigherTimeframe(unittest.TestCase):
         self.assertFalse(m.htf_agrees(self.D, T("2026-01-04"), 1440, "bullish"))
         self.assertTrue(m.htf_agrees(self.D, T("2026-01-04"), 1440, "bearish"))
 
-    def test_too_little_history_or_none_is_no_agreement(self):
-        self.assertFalse(m.htf_agrees(self.D, T("2026-01-02"), 1440, "bullish"))
-        self.assertFalse(m.htf_agrees(None, T("2026-01-04"), 1440, "bullish"))
+    def test_too_little_history_or_none_is_unavailable(self):
+        self.assertIsNone(m.htf_agrees(self.D, T("2026-01-02"), 1440, "bullish"))
+        self.assertIsNone(m.htf_agrees(None, T("2026-01-04"), 1440, "bullish"))
 
     def test_asof(self):
         s = self.D["macd"]
@@ -92,11 +92,11 @@ class AddContext(unittest.TestCase):
                                     100.5, "ENS/USDT:USDT", 9e7)[0]
         idx = pd.date_range("2025-12-25", periods=80, freq="4h")
         self.h4 = pd.DataFrame({"macd": np.arange(80.0)}, index=idx)        # rising
-        self.btc = pd.DataFrame({"rsi": 60.0}, index=idx)
+        self.btc = pd.DataFrame({"rsi": 60.0, "close": 110.0, "ema200": 100.0}, index=idx)
 
-    def test_without_context_it_is_the_bare_structure_grade(self):
-        self.assertEqual((self.sig["score"], self.sig["grade"], self.sig["regime"]),
-                         (53, "C", "COUNTER TREND"))
+    def test_without_context_it_is_the_pattern_alone_rescaled(self):
+        self.assertEqual((self.sig["score"], self.sig["grade"], self.sig["regime"], self.sig["partial"]),
+                         (66, "B", "COUNTER TREND", True))
 
     def test_context_lifts_the_grade_and_sets_the_regime(self):
         s = self.sig
@@ -104,13 +104,22 @@ class AddContext(unittest.TestCase):
                 {"timestamp": s["b_ms"] - 1, "openInterestAmount": 90}]
         m.add_context(s, self.h4, None, hist, 0.0, self.btc)
         self.assertEqual((s["score"], s["grade"], s["regime"], s["htf_ok"], s["oi_chg_pct"]),
-                         (78, "A", "WITH TREND", True, -10.0))
+                         (77, "A", "WITH TREND", True, -10.0))
+        self.assertEqual((s["btc_state"], s["partial"]), ("BULL", False))
         self.assertEqual((s["tags"], s["trigger_price"], s["targets_from"]),
                          (["W-PATTERN"], None, "signal"))
 
+    def test_btc_chop_earns_no_btc_points_but_stays_in_the_score(self):
+        s = self.sig
+        m.add_context(s, self.h4, None, None, None, self.btc.assign(rsi=50.0))
+        self.assertEqual((s["btc_state"], s["regime"], s["score"], s["partial"]),
+                         ("CHOP", "CHOP", 63, True))                    # 56.5 / 90: OI is missing
+
     def test_missing_context_changes_nothing(self):
         m.add_context(self.sig, None, None, None, None, None)
-        self.assertEqual((self.sig["score"], self.sig["regime"]), (53, "COUNTER TREND"))
+        self.assertEqual((self.sig["score"], self.sig["regime"], self.sig["btc_state"]),
+                         (66, "COUNTER TREND", None))
+        self.assertIn("PARTIAL DATA", self.sig["tags"])
 
 
 def trend_frame(freq, direction):
@@ -118,15 +127,18 @@ def trend_frame(freq, direction):
     return pd.DataFrame({"macd": direction * np.arange(900.0)}, index=idx)
 
 
-def ltf_for(sig):
-    """15m frame whose MACD crosses up 2 bars after the signal bar opens and
-    whose close clears the swing high (bar 10) 4 bars later. It starts at B."""
-    n, i0 = 70, int((sig["signal_ms"] - sig["b_ms"]) // 900_000)
-    high = np.full(n, 101.0); high[10] = 105; high[i0 + 6:] = 107
-    close = np.full(n, 100.0); close[i0 + 6:] = 106
+def ltf_for(sig, minutes=15, price=106.0, delay=4):
+    """Lower-timeframe frame whose MACD crosses up 2 bars after the signal bar
+    opens and whose close (`price`) clears the swing high (bar 10, 105) `delay`
+    bars later. It starts at B."""
+    i0 = int((sig["signal_ms"] - sig["b_ms"]) // (minutes * 60_000))
+    n, t = i0 + delay + 30, i0 + 2 + delay
+    high = np.full(n, 101.0); high[10] = 105; high[t:] = price + 1
+    close = np.full(n, 100.0); close[t:] = price
     d = np.full(n, -1.0); d[i0 + 2:] = 1
     return pd.DataFrame({"high": high, "low": 99.0, "close": close, "macd": d, "signal": 0.0},
-                        index=pd.date_range(pd.Timestamp(sig["b_ms"], unit="ms"), periods=n, freq="15min"))
+                        index=pd.date_range(pd.Timestamp(sig["b_ms"], unit="ms"), periods=n,
+                                            freq=f"{minutes}min"))
 
 
 class GradeSignals(unittest.TestCase):
@@ -155,9 +167,37 @@ class GradeSignals(unittest.TestCase):
         ok = self.grade(self.sig(), df15=ltf_for(s))
         self.assertIsNotNone(ok["trigger_price"])
         self.assertIn("LTF TRIGGER", ok["tags"])
+        self.assertNotIn("15M TRIGGER", ok["tags"])               # 15m IS a 1H signal's LTF
         wrong = self.grade(self.sig(), df1=ltf_for(s))            # 15m frame in the 1H slot
         self.assertIsNone(wrong["trigger_price"])
         self.assertNotIn("LTF TRIGGER", wrong["tags"])
+
+    def test_a_4h_signal_takes_both_triggers_and_the_price_of_the_first_to_close(self):
+        s = self.sig("4h")
+        self.assertTrue(s["fresh"])
+        h1, m15 = ltf_for(s, 60, price=108.0), ltf_for(s, 15, price=106.0)   # 15m closes first
+        both = self.grade(self.sig("4h"), df1=h1, df15=m15)
+        self.assertEqual([t for t in both["tags"] if "TRIGGER" in t], ["LTF TRIGGER", "15M TRIGGER"])
+        self.assertEqual((both["trigger_price"], both["trigger_first"]), (106.0, True))
+        only_1h = self.grade(self.sig("4h"), df1=h1)
+        self.assertEqual([t for t in only_1h["tags"] if "TRIGGER" in t], ["LTF TRIGGER"])
+        self.assertEqual((only_1h["trigger_price"], only_1h["trigger_first"]), (108.0, False))
+        late_1h = self.grade(self.sig("4h"), df1=ltf_for(s, 60, price=108.0, delay=40), df15=m15)
+        self.assertEqual(late_1h["trigger_price"], 106.0)
+
+    def test_a_15m_trigger_counts_only_within_8h_of_the_4h_close(self):
+        s = self.sig("4h")
+        # trigger bar index i0+2+delay closes (delay+3) x 15m after the 4H bar opens
+        on_time = self.grade(self.sig("4h"), df15=ltf_for(s, delay=45))     # closes at +8h
+        self.assertIn("15M TRIGGER", on_time["tags"])
+        late = self.grade(self.sig("4h"), df15=ltf_for(s, delay=46))        # +8h15m
+        self.assertNotIn("15M TRIGGER", late["tags"])
+        self.assertIsNone(late["trigger_price"])
+
+    def test_a_stale_4h_signal_gets_no_15m_trigger(self):
+        s = self.sig("4h", n=102)
+        self.assertFalse(s["fresh"])
+        self.assertNotIn("15M TRIGGER", self.grade(s, df15=ltf_for(s))["tags"])
 
     def test_oi_uses_hourly_when_it_covers_wave_b_else_daily(self):
         s = self.sig()
@@ -173,7 +213,8 @@ class GradeSignals(unittest.TestCase):
         df = wave_df(LONG)
         s = self.sig(n=94, forming_df=df.iloc[:95])
         self.assertTrue(s["forming"])
-        btc = pd.DataFrame({"rsi": 60.0}, index=pd.date_range("2025-12-01", periods=900, freq="4h"))
+        btc = pd.DataFrame({"rsi": 60.0, "close": 110.0, "ema200": 100.0},
+                           index=pd.date_range("2025-12-01", periods=900, freq="4h"))
         hist = [{"timestamp": s["b_start_ms"] - 1, "openInterestAmount": 100},
                 {"timestamp": s["b_ms"] - 1, "openInterestAmount": 90}]
         s = self.grade(s, df4=self.UP, df15=ltf_for(s), oi_h=hist, btc=btc)

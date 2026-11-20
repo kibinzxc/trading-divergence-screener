@@ -2049,6 +2049,17 @@ def _plain(v):
     return np.format_float_positional(v, trim="-")
 
 
+def spread_labels(ys, gap):
+    """Label positions for values `ys`, in the same order, moved up where
+    needed so that no two are closer than `gap`. The lowest never moves."""
+    out, last = list(ys), None
+    for i in sorted(range(len(ys)), key=lambda i: ys[i]):
+        if last is not None and out[i] - last < gap:
+            out[i] = last + gap
+        last = out[i]
+    return out
+
+
 def render_chart(df, d, sig):
     """PNG of the A-to-B leg: candles with the entry, stop and R lines (each
     labelled with its price) over the MACD panel with its trough and crossover
@@ -2058,7 +2069,7 @@ def render_chart(df, d, sig):
     v = df.iloc[lo:min(len(df), d["signal_bar"] + 30)]
     x = np.arange(len(v))
     bg, fg, mut, line = "#0C111B", "#DCE3EE", "#9AA8BD", "#222D40"      # the page's tokens
-    green, red, amber, acc = "#6FCF9F", "#E58C98", "#E2B866", "#8FB4E8"
+    green, red, amber, acc = "#8FBF9F", "#D99AA0", "#D8BE8A", "#8FB4E8"
     fig = Figure(figsize=(6.4, 4.6), tight_layout=True, facecolor=bg)   # shown about 460px wide
     ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
     for a in (ax, am):
@@ -2084,12 +2095,16 @@ def render_chart(df, d, sig):
     ax.margins(y=0.15)      # room for the A / B labels
     am.margins(y=0.2)
     t = sig["targets"]
-    for lvl, col, ls, lbl in ((sig["entry_ref_price"], acc, "-", "Entry"),
-                              (sig["stop_price"], red, "--", "Stop"), (t["1r"], mut, ":", "1R"),
-                              (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R")):
+    levels = ((sig["entry_ref_price"], acc, "-", "Entry"), (sig["stop_price"], red, "--", "Stop"),
+              (t["1r"], mut, ":", "1R"), (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R"))
+    for lvl, col, ls, _ in levels:
         ax.axhline(lvl, color=col, lw=0.8, ls=ls)
-        ax.text(1.01, lvl, f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
+    y0, y1 = ax.get_ylim()
+    # a 10pt label is about 6% of the price panel's height; the line stays where it is
+    for (lvl, col, _, lbl), y in zip(levels, spread_labels([l[0] for l in levels], (y1 - y0) * 0.065)):
+        ax.text(1.01, y, f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
                 transform=ax.get_yaxis_transform())      # right of the panel, clear of the candles
+    ax.set_ylim(y0, y1)
     ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']} divergence, "
                  f"grade {sig['grade']} ({sig['score']})", fontsize=11, color=fg)
 
@@ -2994,10 +3009,11 @@ HTML = r"""<!DOCTYPE html>
   --bg:#0C111B;--sf:#121926;--sf2:#182132;--line:#222D40;
   --tx:#DCE3EE;--tx2:#9AA8BD;--tx3:#6E7D94;
   --acc:#8FB4E8;--acc-ink:#0C111B;
-  --yes:#6FCF9F;--yes-bg:#12291F;
-  --wait:#E2B866;--wait-bg:#2A2212;
-  --no:#8E9BB0;--no-bg:#1A2231;
-  --short:#E58C98;
+  --yes:#8FBF9F;--yes-bg:#1B2A24;
+  --wait:#D8BE8A;--wait-bg:#2B2619;
+  --no:#C9A0A5;--no-bg:#2A2023;
+  --short:#D99AA0;--short-bg:#2E1F23;
+  --blue:#9DB7DA;--blue-bg:#1C2636;--violet:#B3A6D6;--violet-bg:#252238;--teal:#8CC2C0;--teal-bg:#18292B;
   --sans:'Inter',system-ui,sans-serif;--mono:'JetBrains Mono',ui-monospace,monospace;
 }
 body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.55;padding:0 16px 64px}
@@ -3039,12 +3055,26 @@ button{cursor:pointer}
 .pick:hover{border-color:var(--acc)}
 .pick .head{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px}
 .pick .coin{font-size:17px;font-weight:600}
-.pick .gr{color:var(--tx2)}
 .pick .old{color:var(--tx3);font-size:13px}
 .pick .why{grid-column:1/-1;color:var(--tx2);font-size:14px}
 .pick .lv{grid-column:1/-1;font-size:13px;color:var(--tx2)}
 .pick .lv span{color:var(--tx)}
-.side-long{color:var(--yes)}.side-short{color:var(--short)}
+.side-long,.side-short{display:inline-block;padding:1px 9px;border-radius:20px;font-size:13px}
+.side-long{color:var(--yes);background:var(--yes-bg)}
+.side-short{color:var(--short);background:var(--short-bg)}
+.gr{display:inline-block;padding:1px 8px;border-radius:6px;font-family:var(--mono);font-size:13px;white-space:nowrap}
+.gr-A{color:var(--yes);background:var(--yes-bg)}
+.gr-B{color:var(--blue);background:var(--blue-bg)}
+.gr-C{color:var(--tx2);background:var(--sf2)}
+.brief p.mkt{max-width:none;padding:14px 16px;border-radius:10px;color:var(--tx);align-self:stretch}
+.mkt-bear{background:var(--short-bg)}
+.mkt-bear b{color:var(--short)}
+.mkt-bull{background:var(--yes-bg)}
+.mkt-bull b{color:var(--yes)}
+.mkt-chop{background:var(--wait-bg)}
+.mkt-chop b{color:var(--wait)}
+.oi-up{color:var(--yes)}
+.oi-dn{color:var(--short)}
 .ans{display:inline-block;padding:3px 10px;border-radius:20px;font-size:13px;font-weight:500;white-space:nowrap}
 .ans.enter{background:var(--yes-bg);color:var(--yes)}.ans.wait{background:var(--wait-bg);color:var(--wait)}.ans.skip{background:var(--no-bg);color:var(--no)}
 table.stale .ans{opacity:.45}
@@ -3125,11 +3155,20 @@ tr.row:hover td{background:var(--sf)}
 td .sub{display:block;font-size:13px;color:var(--tx3)}
 td.none{color:var(--tx3);cursor:default}
 td.coin{white-space:nowrap}
-td.why{min-width:250px}
+td.why{min-width:200px}
+#resT th,#resT td{padding-inline:12px}
 .tf{font-size:12px;color:var(--tx3);margin-left:6px}
 .tf.on{color:var(--tx2)}
 .tag,.bdg,.thin-badge,.cal-imp{display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin:4px 4px 0 0;white-space:nowrap}
+/* tags by family: pattern, open interest and funding, daily mover, caution, venue confirmation */
+.tag.t-pattern{color:var(--blue);background:var(--blue-bg);border-color:transparent}
+.tag.t-flow{color:var(--violet);background:var(--violet-bg);border-color:transparent}
+.tag.t-mover{color:var(--teal);background:var(--teal-bg);border-color:transparent}
+.tag.t-caution{color:var(--wait);background:var(--wait-bg);border-color:transparent}
+.tag.t-venue{color:var(--yes);background:var(--yes-bg);border-color:transparent}
 tr.det td{background:var(--sf);padding:18px 16px}
+/* the table scrolls sideways on a narrow screen; the opened row stays as wide as the screen */
+.detw{position:sticky;left:16px;max-width:calc(100vw - 66px)}
 .dgrid{display:grid;grid-template-columns:minmax(0,1.9fr) minmax(0,1fr) minmax(0,1fr);gap:20px}
 .dgrid + .dgrid{margin-top:20px;padding-top:20px;border-top:1px solid var(--line)}
 @media (max-width:820px){.dgrid{grid-template-columns:minmax(0,1fr)}}
@@ -3152,7 +3191,7 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
 .mv-thin{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--tx2);cursor:pointer;user-select:none}
 .mv-thin input{accent-color:var(--acc)}
 .mv-sep td{background:var(--wait-bg);color:var(--wait);font-size:13px;padding:8px 16px}
-.thin-badge{color:var(--wait);border-color:var(--wait-bg)}
+.thin-badge{color:var(--wait);background:var(--wait-bg);border-color:transparent}
 .mrank{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:5px;background:var(--sf2);font-family:var(--mono);font-size:12px;color:var(--tx2)}
 .mrank.top{background:var(--acc);color:var(--acc-ink);font-weight:600}
 .mpos{position:relative;width:88px;height:5px;background:var(--sf2);border-radius:3px;margin-top:8px}
@@ -3166,7 +3205,9 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
 .qc{display:flex;flex-direction:column;gap:4px;min-width:56px}
 .qbar{height:3px;background:var(--sf2);border-radius:2px;overflow:hidden}
 .qfill{height:100%;border-radius:2px;background:var(--tx3)}
-.hl{color:var(--tx);font-weight:600}
+.up{color:var(--yes)}
+.dn{color:var(--short)}
+.hit{color:var(--wait);font-weight:600}
 .lo{color:var(--tx2)}
 
 /* ── Calendar ── */
@@ -3210,7 +3251,8 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
 .learn-card.lc-bear{border-left:3px solid var(--short)}
 .learn-card-hdr{display:flex;align-items:center;gap:8px;margin-bottom:12px}
 .learn-card-hdr .bdg{margin:0}
-.bb{color:var(--yes)}.br{color:var(--short)}
+.bb{color:var(--yes);background:var(--yes-bg);border-color:transparent}
+.br{color:var(--short);background:var(--short-bg);border-color:transparent}
 .learn-panels{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .lp-lbl{text-align:center;margin-bottom:4px}
 .lp-svg{width:100%;display:block;background:var(--sf2);border-radius:5px}
@@ -3582,7 +3624,7 @@ function qcell(q){
   return '<div class="qc"><span class="num">' + q + ' <span class="lo">' + (q >= 70 ? 'HIGH' : q >= 50 ? 'MED' : 'LOW') +
     '</span></span><div class="qbar"><div class="qfill" style="width:' + q + '%"></div></div></div>';
 }
-function gradeCell(p){ return '<span class="num">' + p.grade + ' ' + p.score + '</span>'; }
+function gradeCell(p){ return '<span class="gr gr-' + p.grade + '">' + p.grade + ' ' + p.score + '</span>'; }
 // Sub-cent tokens round to values like 9.8e-06, and JS stringifies anything
 // below 1e-6 with an exponent — an unusable price level. Force plain digits.
 function fmtPx(v){
@@ -3635,7 +3677,8 @@ function sideHtml(r){
   return '<span class="side-' + s + '">' + s + '</span>' + r.tfs.map(function(t){
     return '<span class="tf' + (t === primaryTf(r) ? ' on' : '') + '">' + tfLabel(t) + '</span>'; }).join('');
 }
-function tag(k, txt){ return '<span class="tag"' + tip(k) + '>' + (txt || k) + '</span>'; }
+/* k is the tag's name in TIP / TAG_GROUPS (tooltip and colour family); txt is what it says when that differs */
+function tag(k, txt){ return '<span class="tag' + (FAM[k] ? ' t-' + FAM[k] : '') + '"' + tip(k) + '>' + (txt || k) + '</span>'; }
 /* Every tag of a row, pattern tags first. The Coin cell shows two; the opened row shows all. */
 function tagChips(r){
   var h = (primary(r).tags || []).map(function(f){ return tag(f); });
@@ -3720,19 +3763,23 @@ var TIP = {
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
 
 /* ── Tags page: built from TIP so it cannot drift from the hover text ─────── */
+/* [heading, colour family ('' = plain), tags] */
 var TAG_GROUPS = [
-  ['Pattern tags (about the divergence itself)', ['TRIPLE','W-PATTERN','LTF TRIGGER','15M TRIGGER','ZERO-LINE CROSS']],
-  ['Regime (sets how high the grade must be)', ['WITH TREND','CHOP','COUNTER TREND']],
-  ['Score', ['PARTIAL DATA']],
-  ['Exchanges (All scan only, e.g. ALSO ON OKX, BYBIT)', ['NOT ON BINANCE','ALSO ON']],
-  ['Calendar (shown with the print and its countdown, e.g. MACRO BOJ Policy Rate in 6h)', ['MACRO']],
-  ['Open interest: 7-day positioning', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
-  ['Open interest: funding and crowding', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
-  ['Daily movers (the last completed day)', ['VOLUME SPIKE','RANGE EXPANSION','BIG MOVE','AT RANGE HIGH','ABOVE 7D HIGH','AT RANGE LOW','BELOW 7D LOW']]
+  ['Pattern tags (about the divergence itself)', 'pattern', ['TRIPLE','W-PATTERN','LTF TRIGGER','15M TRIGGER','ZERO-LINE CROSS']],
+  ['Regime (sets how high the grade must be)', '', ['WITH TREND','CHOP','COUNTER TREND']],
+  ['Score', 'caution', ['PARTIAL DATA']],
+  ['Exchanges (All scan only, e.g. ALSO ON OKX, BYBIT)', 'caution', ['NOT ON BINANCE','ALSO ON']],
+  ['Calendar (shown with the print and its countdown, e.g. MACRO BOJ Policy Rate in 6h)', 'caution', ['MACRO']],
+  ['Open interest: 7-day positioning', 'flow', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
+  ['Open interest: funding and crowding', 'flow', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
+  ['Daily movers (the last completed day)', 'mover', ['VOLUME SPIKE','RANGE EXPANSION','BIG MOVE','AT RANGE HIGH','ABOVE 7D HIGH','AT RANGE LOW','BELOW 7D LOW']]
 ];
+var FAM = {};
+TAG_GROUPS.forEach(function(g){ g[2].forEach(function(k){ FAM[k] = g[1]; }); });
+FAM['ALSO ON'] = 'venue';     /* a confirmation, unlike its group-mate NOT ON BINANCE */
 document.getElementById('tagsBody').innerHTML = TAG_GROUPS.map(function(g){
   return '<div class="dash-sec"><div class="dash-sec-ttl">' + g[0] + '</div><div class="rules">' +
-    g[1].map(function(k){
+    g[2].map(function(k){
       return '<div class="rule"><div class="rule-k">' + tag(k) + '</div><div class="rule-b">' + TIP[k] + '</div></div>';
     }).join('') + '</div></div>';
 }).join('');
@@ -3784,7 +3831,7 @@ function moversAudit(m){
 }
 function mvRow(r, i, thin){
   var flags = (r.flags || []).map(function(f){ return tag(f); }).join('') || '&mdash;';
-  var hl = function(on){ return on ? 'hl' : 'lo'; };
+  var hit = function(on, other){ return on ? 'hit' : other; };
   var badge = thin ? '<span class="thin-badge" title="Below the volume floor. Thin book: expect worse fills and slippage through stops. Size down.">THIN &middot; ' +
                      fmtVol(r.daily_volume) + '/day</span>' : '';
   var tr = document.createElement('tr');
@@ -3792,10 +3839,10 @@ function mvRow(r, i, thin){
     '<td><span class="mrank' + (!thin && i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
     '<td><b>' + r.base + '</b><span class="sub num">' + fmtPx(r.current_price) + '</span>' + badge + '</td>' +
     '<td>' + qcell(r.score) + '</td>' +
-    '<td class="num"><span class="' + hl(Math.abs(r.chg_1d_pct || 0) >= TH.chg) + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
+    '<td class="num"><span class="' + hit(Math.abs(r.chg_1d_pct || 0) >= TH.chg, r.chg_1d_pct >= 0 ? 'up' : 'dn') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
       '<span class="sub">today ' + fmtPct(r.chg_live_pct) + '</span></td>' +
-    '<td class="num ' + hl((r.vol_mult || 0) >= TH.vol) + '">' + fmtX(r.vol_mult) + '</td>' +
-    '<td class="num ' + hl((r.range_mult || 0) >= TH.rng) + '">' + fmtX(r.range_mult) + '</td>' +
+    '<td class="num ' + hit((r.vol_mult || 0) >= TH.vol, 'lo') + '">' + fmtX(r.vol_mult) + '</td>' +
+    '<td class="num ' + hit((r.range_mult || 0) >= TH.rng, 'lo') + '">' + fmtX(r.range_mult) + '</td>' +
     '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
       '<span class="sub num">' + r.pos_in_range + '% of range</span></td>' +
     '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + '</div><div class="mlv"><small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
@@ -4125,7 +4172,7 @@ function tfBlock(r, tf){
 }
 function detailRow(r){
   var tfs = [primaryTf(r)].concat(r.tfs.filter(function(t){ return t !== primaryTf(r); }));
-  return '<tr class="det"><td colspan="7">' + tfs.map(function(tf){ return tfBlock(r, tf); }).join('') + '</td></tr>';
+  return '<tr class="det"><td colspan="7"><div class="detw">' + tfs.map(function(tf){ return tfBlock(r, tf); }).join('') + '</div></td></tr>';
 }
 var openKey = null, showNo = false;
 function buildRow(r){
@@ -4135,7 +4182,7 @@ function buildRow(r){
     '<td>' + sideHtml(r) + '</td><td>' + gradeCell(p) + '</td><td class="why">' + evCell(r) + '</td>' +
     '<td class="num">' + fmtPx(p.entry_ref_price) + '</td>' +
     '<td class="num">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
-    '<td class="num">' + oiCell(r) + '</td></tr>';
+    '<td class="num ' + (oiVal(r) > 0 ? 'oi-up' : oiVal(r) < 0 ? 'oi-dn' : '') + '">' + oiCell(r) + '</td></tr>';
 }
 function ageMin(r){ return primary(r).bars_ago * ((TFM[primaryTf(r)] && TFM[primaryTf(r)].minutes) || 240); }
 
@@ -4191,8 +4238,10 @@ function briefState(){
     var means = b.state === 'BULL' ? 'Longs are with the trend when the coin is also above its 200 EMA. Shorts are counter trend and need grade A.'
       : b.state === 'BEAR' ? 'Shorts are with the trend when the coin is also below its 200 EMA. Longs are counter trend and need grade A.'
       : 'BTC is neither trending up nor down, so reversals keep the normal bar: grade B or better.';
-    s += '<p><b>Market is ' + (b.state === 'CHOP' ? 'in chop' : b.state.toLowerCase()) + '.</b> BTC 4H closed at <span class="num">' + fmtPx(b.close) +
-      '</span>, ' + (b.close > b.ema200 ? 'above' : 'below') + ' its 200 EMA at <span class="num">' + fmtPx(b.ema200) +
+    var dp = function(v){ return (fmtPx(v).split('.')[1] || '').length; }, d = Math.max(dp(b.close), dp(b.ema200));
+    s += '<p class="mkt mkt-' + b.state.toLowerCase() + '"><b>Market is ' + (b.state === 'CHOP' ? 'in chop' : b.state.toLowerCase()) +
+      '.</b> BTC 4H closed at <span class="num">' + b.close.toFixed(d) +
+      '</span>, ' + (b.close > b.ema200 ? 'above' : 'below') + ' its 200 EMA at <span class="num">' + b.ema200.toFixed(d) +
       '</span>, with RSI <span class="num">' + Math.round(b.rsi) + '</span>. ' + means + '</p>';
   } else if(b === null) s += '<p><b>BTC data is unavailable.</b> Every setup is treated as counter trend.</p>';
   if(m.blocker){
@@ -4224,7 +4273,7 @@ function renderBrief(){
   document.getElementById('picks').innerHTML = list.map(function(r){
     var p = primary(r);
     return '<button class="pick" data-k="' + rowKey(r) + '"><span class="head"><span class="coin">' + r.base + '</span><span>' + sideHtml(r) +
-      '</span><span class="num gr">' + p.grade + ' ' + p.score + '</span><span class="old">' +
+      '</span>' + gradeCell(p) + '<span class="old">' +
       (p.forming ? 'signal bar still forming' : 'signal ' + b2t(p.bars_ago, primaryTf(r))) + '</span></span>' +
       ansPill(r) + '<span class="why">' + reason(r) + '</span>' +
       '<span class="lv num">Entry <span>' + fmtPx(p.entry_ref_price) + '</span> &middot; Stop <span>' + fmtPx(p.stop_price) + '</span> (' + p.risk_pct +
@@ -4377,7 +4426,7 @@ function renderWelcome(){
               '4H and 1H, regular divergences only.',
               'Every liquid perp, one scan, one table.',
               'Set the volume floor and hit Run.'];
-  document.getElementById('briefH').textContent = (h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening') + ', Kevin';
+  document.getElementById('briefH').textContent = (h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening') + '.';
   document.getElementById('briefState').innerHTML = '<p>' + subs[Math.floor(Math.random()*subs.length)] + '</p>';
 }
 

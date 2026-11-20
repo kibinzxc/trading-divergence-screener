@@ -153,6 +153,8 @@ TF_CFG = {
            "htf_minutes": 240, "ltf": "15m", "ltf_minutes": 15},
 }
 LTF15_WINDOW_H = 8    # a 4H signal's 15m trigger must close within this many hours of the 4H close
+MAX_SIGNAL_AGE_H = 72  # the live scan does not list a signal whose signal bar closed longer ago than this
+OI_H_POINTS = 200      # hourly open-interest history per pair: covers wave B of any listed signal (Bybit's cap)
 
 # Minimum divergence size. Strict also wants both troughs below zero
 # (both peaks above zero for bearish).
@@ -861,6 +863,12 @@ def grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, fund, btc):
         add_context(s, d1 if four else df4, df1 if four else df15, hist, fund, btc,
                     df15 if four else None)
     return sigs
+
+
+def signal_too_old(sig):
+    """Live scan only: more than MAX_SIGNAL_AGE_H of completed bars have closed
+    after the signal bar (counted in bars like freshness, not by the clock)."""
+    return sig["bars_ago"] * TF_CFG[sig["tf"]]["minutes"] / 60 > MAX_SIGNAL_AGE_H
 
 
 # ── Entry verdict ──────────────────────────────────────────────────────────────
@@ -2060,69 +2068,111 @@ def spread_labels(ys, gap):
     return out
 
 
-def render_chart(df, d, sig):
-    """PNG of the A-to-B leg: candles with the entry, stop and R lines (each
-    labelled with its price) over the MACD panel with its trough and crossover
-    dots; A and B carry their price and MACD value. `d` is the raw detection
-    (bar indexes into `df`), `sig` the finished signal (levels)."""
-    lo = max(0, d["a_start"] - 10)
-    v = df.iloc[lo:min(len(df), d["signal_bar"] + 30)]
+CHART_DPI = 180
+
+
+def chart_figure(df, d, sig, narrow=False):
+    """The A-to-B leg as a figure: candles with the entry, stop and R lines
+    (each labelled with its price) over the MACD panel with its trough and
+    crossover dots; A and B carry their price and MACD value. `d` is the raw
+    detection (bar indexes into `df`), `sig` the finished signal (levels).
+
+    Sized for the opened row: 5.2in wide and drawn about 460px wide there, so
+    10pt text reads at 12px without opening the chart full size. `narrow` is the
+    phone render (4.1in for a 360px column): the same chart, taller, with the A
+    and B values moved from the points into the panel titles."""
+    end = min(len(df), d["signal_bar"] + 30)
+    price_lbl = [_plain(px(d["a_price"])), _plain(px(d["b_price"]))]
+    macd_lbl = [f"{d['a_macd']:.3g}", f"{d['b_macd']:.3g}"]
+    # A's label sits left of A and B's right of B, so each needs its own width of view on that side:
+    # about 6.5pt a character of a panel some 220pt wide (140pt on a phone, where the label is
+    # just the letter). Past the last bar that is empty space.
+    panel_pt = 140 if narrow else 220
+    chars = 1 if narrow else max(map(len, price_lbl + macd_lbl)) + 2
+    need = min(0.32, chars * 6.5 / panel_pt + 0.05)
+    left, right = d["a_start"] - 10, end
+    for _ in range(8):      # widening the view widens the share each label needs; this converges
+        w = need * (right - left)
+        left = min(left, min(d["a_p"], d["a_m"]) - w)
+        right = max(right, max(d["b_p"], d["b_m"]) + w)
+    lo = max(0, int(left))
+    v = df.iloc[lo:end]
     x = np.arange(len(v))
+    bull = d["side"] == "bullish"
     bg, fg, mut, line = "#0C111B", "#DCE3EE", "#9AA8BD", "#222D40"      # the page's tokens
     green, red, amber, acc = "#8FBF9F", "#D99AA0", "#D8BE8A", "#8FB4E8"
-    fig = Figure(figsize=(6.4, 4.6), tight_layout=True, facecolor=bg)   # shown about 460px wide
+    fig = Figure(figsize=(4.1, 5.0) if narrow else (5.2, 4.2), dpi=CHART_DPI, tight_layout=True, facecolor=bg)
     ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
     for a in (ax, am):
         a.set_facecolor(bg)
-        a.tick_params(colors=mut, labelsize=9)
+        a.tick_params(colors=mut, labelsize=10)
         for sp in a.spines.values():
             sp.set_color(line)
 
-    def ab(a, ia, ib, ya, yb, fmt):
-        """The A-to-B line with each end labelled with its value, on the side
-        away from the line (below the troughs of a bullish one, above peaks)."""
+    def ab(a, ia, ib, ya, yb, lbl):
+        """The A-to-B line with each end labelled with its value: A's label ends
+        left of A and B's starts right of B, both on the side away from the line
+        (below the troughs of a bullish one, above peaks), so they can touch
+        neither each other nor the line however close A and B are."""
         a.plot([ia - lo, ib - lo], [ya, yb], color=amber, lw=1.5, marker="o")
-        dy, va = (-12, "top") if d["side"] == "bullish" else (8, "bottom")
-        for name, i, y in (("A", ia, ya), ("B", ib, yb)):
-            a.annotate(f"{name} {fmt(y)}", (i - lo, y), xytext=(0, dy), textcoords="offset points",
-                       color=fg, fontsize=10, ha="center", va=va)
+        k, va = (-1, "top") if bull else (1, "bottom")
+        if narrow:
+            a.set_title(f"A {lbl[0]}  \u2192  B {lbl[1]}", fontsize=10, color=fg, loc="left")
+        for txt, i, y, dx, ha in (("A" if narrow else "A " + lbl[0], ia, ya, -6, "right"),
+                                  ("B" if narrow else "B " + lbl[1], ib, yb, 6, "left")):
+            a.annotate(txt, (i - lo, y), xytext=(dx, 8 * k), textcoords="offset points",
+                       color=fg, fontsize=10, ha=ha, va=va)
+
+    def room(a, frac):
+        """Grow the panel on the side the A / B labels sit, once all its data is in."""
+        y0, y1 = a.get_ylim()
+        a.set_ylim(y0 - frac * (y1 - y0) if bull else y0, y1 if bull else y1 + frac * (y1 - y0))
 
     up = (v["close"] >= v["open"]).values
+    body = float(np.clip(0.68 * panel_pt / (right - left), 0.7, 3))       # points: the view shares the panel's width
     for mask, col in ((up, green), (~up, red)):
-        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=1)
-        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=3)
-    ab(ax, d["a_p"], d["b_p"], d["a_price"], d["b_price"], lambda y: _plain(px(y)))
-    ax.margins(y=0.15)      # room for the A / B labels
-    am.margins(y=0.2)
+        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=max(0.5, body / 3))
+        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=body)
+    ab(ax, d["a_p"], d["b_p"], d["a_price"], d["b_price"], price_lbl)
     t = sig["targets"]
     levels = ((sig["entry_ref_price"], acc, "-", "Entry"), (sig["stop_price"], red, "--", "Stop"),
               (t["1r"], mut, ":", "1R"), (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R"))
     for lvl, col, ls, _ in levels:
         ax.axhline(lvl, color=col, lw=0.8, ls=ls)
+    room(ax, 0.2)
     y0, y1 = ax.get_ylim()
-    # a 10pt label is about 6% of the price panel's height; the line stays where it is
-    for (lvl, col, _, lbl), y in zip(levels, spread_labels([l[0] for l in levels], (y1 - y0) * 0.065)):
+    # a 10pt label is about a tenth of the price panel's height; the line stays where it is
+    for (lvl, col, _, lbl), y in zip(levels, spread_labels([l[0] for l in levels], (y1 - y0) * 0.11)):
         ax.text(1.01, y, f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
                 transform=ax.get_yaxis_transform())      # right of the panel, clear of the candles
-    ax.set_ylim(y0, y1)
-    ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']} divergence, "
-                 f"grade {sig['grade']} ({sig['score']})", fontsize=11, color=fg)
+    head = f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']}, grade {sig['grade']} ({sig['score']})"
+    if narrow:
+        fig.suptitle(head, fontsize=11, color=fg)      # the panel's own title carries A and B
+    else:
+        ax.set_title(head, fontsize=11, color=fg)
 
     am.plot(x, v["macd"].values, color=acc, lw=1.2, label="MACD")
     am.plot(x, v["signal"].values, color=mut, lw=1, label="signal")
     am.axhline(0, color=line, lw=0.8)
-    ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], lambda y: f"{y:.3g}")
+    ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], macd_lbl)
     for bar, direction in d["crosses"]:
         am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
                 color=green if direction > 0 else red)
-    am.legend(loc="upper left", fontsize=9, facecolor=bg, edgecolor=line, labelcolor=mut)
-    step = max(1, len(v) // 4)
+    room(am, 0.32)
+    am.legend(loc="upper left" if bull else "lower left", fontsize=10, facecolor=bg, edgecolor=line,
+              labelcolor=mut)      # the corner the A / B labels are not in
+    step = max(1, len(v) // (2 if narrow else 4))      # date labels must not run into each other
     shown = v.index[::step] + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
     am.set_xticks(x[::step])
-    am.set_xticklabels([ts.strftime("%b %d %H:%M") for ts in shown])
+    am.set_xticklabels([ts.strftime("%b %d\n%H:%M") for ts in shown])
+    ax.set_xlim(left - lo, right - lo)
+    return fig
 
+
+def render_chart(df, d, sig, narrow=False):
+    """chart_figure() as PNG bytes."""
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
+    chart_figure(df, d, sig, narrow).savefig(buf, format="png")
     return buf.getvalue()
 
 
@@ -2382,6 +2432,8 @@ def index():
         "__MOVER_RNG__":   format(MOVER_RANGE_MULT, "g"),
         "__MOVER_EDGE__":  format(MOVER_EDGE_PCT, "g"),
         "__MOVER_THIN_M__": str(int(MOVER_THIN_MIN_WEEKLY_VOL / 1e6)),
+        "__MAX_AGE_H__": format(MAX_SIGNAL_AGE_H, "g"),
+        "__MAX_AGE_D__": format(MAX_SIGNAL_AGE_H / 24, "g"),
         "__OI_VOL__":      format(OI_VOL_RATIO_HIGH, "g"),
         "__FUND_SPOT__":   format(FUND_SPOT_LED_MAX, "g"),
         "__FUND_CROWD__":  format(FUND_CROWDED_MIN, "g"),
@@ -2406,7 +2458,7 @@ def chart_route():
     hit = _charts.get("|".join(request.args.get(k, "") for k in ("pair", "side", "tf")))
     if hit is None:
         return "No chart data for this row. Run the scan again.", 404
-    return Response(render_chart(*hit), mimetype="image/png")
+    return Response(render_chart(*hit, narrow=request.args.get("w") == "narrow"), mimetype="image/png")
 
 
 @app.route("/universe")
@@ -2584,7 +2636,7 @@ def scan_route():
 
         q = queue.Queue()
         counter = {"n": 0, "analysed": 0, "vol_reject": 0, "no_data": 0, "errors": 0,
-                   "no_1h": 0, "atr_reject": 0, "short_history": 0, "oi_reject": 0}
+                   "no_1h": 0, "atr_reject": 0, "short_history": 0, "oi_reject": 0, "old_hidden": 0}
         clock = threading.Lock()
         hist_min = 80 if only_syms else MIN_HISTORY
 
@@ -2679,6 +2731,13 @@ def scan_route():
                                        live_price, sym, wk_vol, f4) +
                         signals_for_tf(df1 if df1 is not None and len(df1) >= hist_min else None,
                                        "1h", rules, live_price, sym, wk_vol, f1))
+                # Signals past the age cutoff are counted and dropped here, before any
+                # of the context below is fetched for them.
+                kept = [s for s in sigs if not signal_too_old(s)]
+                if len(kept) < len(sigs):
+                    with clock:
+                        counter["old_hidden"] += len(sigs) - len(kept)
+                sigs = kept
                 if not sigs:
                     return
                 # Everything below is fetched only for pairs worth a row.
@@ -2689,9 +2748,10 @@ def scan_route():
                         counter["oi_reject"] += 1
                     return
                 d1 = with_indicators(d1) if d1 is not None else None
-                oi_h = df15 = None
-                if any(s["fresh"] for s in sigs):       # stale signals answer No whatever the grade
-                    oi_h = fetch_oi_history(ex, limiter, sym, 100, tf="1h")
+                # Hourly OI for every listed signal: the daily history cannot see a wave B
+                # shorter than a day, and the grade is shown on No rows too.
+                oi_h, df15 = fetch_oi_history(ex, limiter, sym, OI_H_POINTS, tf="1h"), None
+                if any(s["fresh"] for s in sigs):       # the 15m trigger only matters while fresh
                     df15 = drop_forming_candle(
                         fetch_df_deep(ex, limiter, sym, "15m", LTF_BARS_15M), 15)
                     df15 = with_indicators(df15) if df15 is not None and len(df15) >= 80 else None
@@ -2743,7 +2803,7 @@ def scan_route():
                     "errors": c["errors"], "no_1h": c["no_1h"], "no_ticker": no_ticker,
                     "venues": list(V), "spread_rejected": spread_reject,
                     "atr_rejected": c["atr_reject"], "short_history": c["short_history"],
-                    "oi_rejected": c["oi_reject"],
+                    "oi_rejected": c["oi_reject"], "old_hidden": c["old_hidden"],
                     "complete": done.is_set() and q.empty(),
                     **brief_meta(btc, window, cal_now)}
             with _lock:
@@ -3273,6 +3333,30 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
 .rule-n{font-family:var(--mono);font-size:12px;color:var(--tx3);flex-shrink:0;width:22px;padding-top:3px}
 .rule-k{flex-shrink:0;width:170px}
 .rule-b{font-size:14px;color:var(--tx2)}
+/* Phone: each scan row stacks (coin and tags, then side / grade / answer, then entry / stop / 7d OI with
+   their labels) and the two sortable headers stay as a sort bar. Nothing on any page scrolls the body sideways. */
+@media (max-width:640px){
+  #resT{display:block;min-width:0}
+  #resT thead,#resT tbody,#resT tr.det,#resT tr.det td,#resT td.none{display:block}
+  #resT thead tr{display:flex;align-items:center;gap:4px;padding:4px 12px;border-bottom:1px solid var(--line)}
+  #resT thead tr::before{content:"Sort by";font-size:12px;color:var(--tx3);margin-right:8px}
+  #resT th{display:none;border:0;padding:8px}
+  #resT th.sortable{display:block}
+  #resT tr.row{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px 12px;padding:14px 12px;border-bottom:1px solid var(--line)}
+  #resT tr.row td{display:block;padding:0;border:0}
+  #resT tr.row td.coin{flex:0 0 100%;white-space:normal}
+  #resT tr.row td.why{flex:1 1 50%;min-width:0}      /* wide enough to push entry / stop / OI to their own line */
+  #resT tr.row td[data-l]{flex:1 1 28%}
+  #resT td[data-l]::before{content:attr(data-l);display:block;font-family:var(--sans);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3)}
+  #resT tr.row:hover td{background:none}
+  #resT tr.det td{padding:16px 12px}
+  .detw{position:static;max-width:none}
+  .cal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .rule{flex-wrap:wrap}
+  .rule-b{flex:1 1 240px}
+  .learn-panels{grid-template-columns:1fr}
+  .cal-out{margin-left:0!important}
+}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -3372,7 +3456,7 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
           <button class="ftab" data-f="bull" onclick="setF(this)" title="Bullish divergences (long side) answering Yes or Not yet.">Bullish</button>
           <button class="ftab" data-f="bear" onclick="setF(this)" title="Bearish divergences (short side) answering Yes or Not yet.">Bearish</button>
           <button class="ftab" data-f="both" onclick="setF(this)" title="The same side diverging on 4H and 1H at once.">4H+1H</button>
-          <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence found, including the No rows: ones that already played out, were stopped, or are too old. Until you pick this, those are folded under the table.">All</button>
+          <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence listed, including the No rows: ones that already played out, were stopped, or are too old to act on. A signal whose signal bar closed more than __MAX_AGE_H__ hours ago is not listed at all; the audit line under the table counts those. Until you pick this, those are folded under the table.">All</button>
         </div>
       </div>
       <div class="tw">
@@ -3553,6 +3637,7 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be at least 15% of the leg's MACD range. This is what kills micro-divergences.</div></div>
       <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>Reported only when wave B is closed.</b> The cross that ends wave B is the signal bar and its close is the signal price. Before that cross there is no signal.</div></div>
       <div class="rule"><div class="rule-n">07</div><div class="rule-b"><b>Liquidity gate.</b> Rolling 7-day traded value must clear the floor you set. Measured from the candles as a ratio against the exchange's own 24h figure, so it does not depend on guessing whether a venue reports volume in coins, contracts or dollars. Thin coins are left out too: a top-of-book spread above 0.1%, a 4H ATR outside 0.6% to 8% of price, or (for a coin with a setup) open interest under $5M. On OKX that open interest is the whole coin's, across all its contracts. A timeframe with fewer than 300 completed bars is not analysed, so the 200 EMA has settled. Unknown spread or OI never excludes a coin, and a symbol override skips all of these. The audit line under the table counts each.</div></div>
+      <div class="rule"><div class="rule-n">09</div><div class="rule-b"><b>Three days, then gone.</b> A signal whose signal bar closed more than __MAX_AGE_H__ hours ago is not listed by the live scan (counted in completed bars, like freshness: 18 on 4H, 72 on 1H). A row disappears when none of its timeframes has a signal inside that. Nothing else is fetched for a hidden signal, and the audit line under the table says how many there were. The backtest still replays every signal.</div></div>
       <div class="rule"><div class="rule-n">08</div><div class="rule-b"><b>One row per coin, Binance first.</b> The All exchange setting reads Binance; a coin Binance does not list is read on whichever of OKX / Bybit trades more of it and tagged NOT ON BINANCE. For each row the same detection then runs on the other venues listing the coin, and the row is tagged ALSO ON with those where the same side fires within one bar. A tag, never points. Picking one exchange scans only that one, with no venue tags.</div></div>
     </div>
   </div>
@@ -3670,7 +3755,11 @@ function reason(r){
 }
 /* Its first sentence, without the leading Yes / Not yet / No the pill already says. */
 function shortWhy(r){ return reason(r).replace(/^(No|Not yet|Yes[^.]*)\.\s*/, '').split('. ')[0].replace(/\.$/, ''); }
-function ansPill(r){ var v = verdict(r); return '<span class="ans ' + v + '">' + ANS[v] + '</span>'; }
+/* A Yes on a signal bar that is still forming is the early one (the lower timeframe triggered first). */
+function ansPill(r){
+  var v = verdict(r);
+  return '<span class="ans ' + v + '">' + (v === 'enter' && primary(r).forming ? 'Yes (early)' : ANS[v]) + '</span>';
+}
 function evCell(r){ return ansPill(r) + '<span class="sub">' + shortWhy(r) + '</span>'; }
 function sideHtml(r){
   var s = r.side === 'bullish' ? 'long' : 'short';
@@ -3705,6 +3794,7 @@ function auditLine(m){
   if(m.atr_rejected)    bits.push(m.atr_rejected + ' 4H ATR outside 0.6-8% of price');
   if(m.short_history)   bits.push(m.short_history + ' timeframe(s) skipped: under 300 completed bars');
   if(m.oi_rejected)     bits.push(m.oi_rejected + ' with a setup dropped: open interest under $5M');
+  if(m.old_hidden)      bits.push(m.old_hidden + ' signal' + (m.old_hidden === 1 ? '' : 's') + ' older than __MAX_AGE_D__ days hidden');
   if(m.no_data)      bits.push(m.no_data + ' returned no usable candles');
   if(m.no_1h)        bits.push(m.no_1h + ' analysed on 4H only (no usable 1H candles)');
   if(m.errors)       bits.push(m.errors + ' errored');
@@ -3756,7 +3846,7 @@ var TIP = {
   'WITH TREND':      'The BTC 4H state agrees with the signal (BULL: RSI above 55 and close above its 200 EMA; BEAR: RSI below 45 and close below it) and so does the coin\'s own 200 EMA. Grade B is enough for Yes.',
   'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
   'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
-  'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100.',
+  'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100. In practice it is the open interest change into B: unreadable when price extreme B falls on the first bar of wave B (there is no interval to measure), when the exchange has no hourly OI history that far back, or when the venue reports no funding.',
   'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is Data from in the opened row).',
   'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.'
 };
@@ -4135,8 +4225,11 @@ function tfBlock(r, tf){
   var s = r.signals[tf], t = s.targets || {}, main = tf === primaryTf(r), trig = s.targets_from === 'trigger';
   var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf;
   return '<div class="dgrid">' +
-    '<div><a href="' + src + '" target="_blank" rel="noopener" title="Open the chart full size"><img class="chart" loading="lazy" alt="' +
-      r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + '" onerror="var p=document.createElement(\'p\');p.className=\'calm\';p.textContent=this.alt;this.parentNode.replaceWith(p)"></a></div>' +
+    /* A phone gets the narrow render, readable at its width. Chosen when the row opens: a <picture> would
+       refetch the uncached image every time the window is resized. */
+    '<div><a href="' + src + '" target="_blank" rel="noopener" title="Open the chart full size"><img class="chart" alt="' +
+      r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + (matchMedia('(max-width:640px)').matches ? '&w=narrow' : '') +
+      '" onerror="var p=document.createElement(\'p\');p.className=\'calm\';p.textContent=this.alt;this.parentNode.replaceWith(p)"></a></div>' +
     '<div><span class="lbl">' + tfLabel(tf) + ' levels</span><dl class="kv num">' +
       kv('Now', fmtPx(r.current_price)) +
       kv('Entry', fmtPx(s.entry_ref_price) + (trig ? ' (trigger price)' : ' (signal price)')) +
@@ -4180,9 +4273,9 @@ function buildRow(r){
   return '<tr class="row" data-k="' + k + '" tabindex="0" aria-expanded="' + (openKey === k) + '">' +
     '<td class="coin"><b>' + r.base + '</b><span class="sub">' + tags.slice(0, 2).join('') + (more > 0 ? '<span class="tag">+' + more + '</span>' : '') + '</span></td>' +
     '<td>' + sideHtml(r) + '</td><td>' + gradeCell(p) + '</td><td class="why">' + evCell(r) + '</td>' +
-    '<td class="num">' + fmtPx(p.entry_ref_price) + '</td>' +
-    '<td class="num">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
-    '<td class="num ' + (oiVal(r) > 0 ? 'oi-up' : oiVal(r) < 0 ? 'oi-dn' : '') + '">' + oiCell(r) + '</td></tr>';
+    '<td class="num" data-l="Entry">' + fmtPx(p.entry_ref_price) + '</td>' +
+    '<td class="num" data-l="Stop">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
+    '<td class="num ' + (oiVal(r) > 0 ? 'oi-up' : oiVal(r) < 0 ? 'oi-dn' : '') + '" data-l="7d OI">' + oiCell(r) + '</td></tr>';
 }
 function ageMin(r){ return primary(r).bars_ago * ((TFM[primaryTf(r)] && TFM[primaryTf(r)].minutes) || 240); }
 

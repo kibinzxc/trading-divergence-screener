@@ -89,6 +89,10 @@ serves both the API and a browser dashboard.
   Yes, Yes (early), Not yet or No. On a screen narrower than 640px each row
   stacks (coin and tags, then side / grade / answer, then entry / stop /
   7d OI with their labels) and the two sortable headers become a sort bar.
+- **Three days, then gone**: the live scan does not list a signal whose signal
+  bar closed more than 72 hours ago (`MAX_SIGNAL_AGE_H`, counted in completed
+  bars). Nothing further is fetched for it, and the audit line says how many
+  were hidden. The backtest still replays every signal.
 - **Good to enter?** (the Answer column): every row answers Yes, Not yet or No in plain language.
   First matching rule wins. No: stop hit, already ran 1R, more than 6
   completed 4H bars (24h) / 8 completed 1H bars (8h) after the signal bar

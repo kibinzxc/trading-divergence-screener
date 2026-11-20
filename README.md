@@ -67,10 +67,26 @@ serves both the API and a browser dashboard.
   for "the market is quiet" when it was actually a partial/failed scan.
 - **One row per coin and side**: when 4H and 1H diverge the same way they
   share a row, which takes its answer, grade and levels from the better
-  signal (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag
-  shows which. Click a row for each timeframe's levels and a chart of the
-  A-to-B leg with the troughs, crossovers, stop and 1R / 2R / 3R drawn in.
-- **Good to enter?**: every row answers Yes, Not yet or No in plain language.
+  signal (Yes beats Not yet beats No, 4H wins a tie); the brighter timeframe
+  shows which. Click a row (or focus it and press Enter or Space) for each
+  timeframe's levels, setup, score inputs and a chart of the A-to-B leg: A and
+  B labelled with their price and MACD value, the crossovers, and the entry,
+  stop and 1R / 2R / 3R lines with their prices. The primary timeframe also
+  lists "Why this answer" (a tick, wait or cross per check, then the full
+  reason) and every tag.
+- **The brief**: the Scan page opens with plain sentences built from the last
+  scan: how many setups pass, BTC's 4H state (close, 200 EMA, RSI) and what it
+  means for entries, the nearest blocking USD print with a live countdown and
+  what waits on it, and up to three cards (the Yes rows, highest score first;
+  failing that the two closest Not yet rows; failing that the three newest
+  signals and why each is a No). A card opens its row in the table.
+- **A seven-column table**: Coin (with two tags and +N), Side and TF, Grade,
+  Answer (with the first sentence of the reason), Entry, Stop, 7d OI. No rows
+  are folded under "Show N that did not pass, newest first" until you unfold
+  them or pick the All filter. The scan controls (exchange, volume floor,
+  strictness, max pairs, speed, specific coins) are in the closed
+  "Scan settings" panel next to the Run Scan button.
+- **Good to enter?** (the Answer column): every row answers Yes, Not yet or No in plain language.
   First matching rule wins. No: stop hit, already ran 1R, more than 6
   completed 4H bars (24h) / 8 completed 1H bars (8h) after the signal bar
   (counted to the last completed bar's close, not the clock), or grade C. Not yet:
@@ -94,7 +110,7 @@ serves both the API and a browser dashboard.
   expansion, at the 7-day high or low) and 7-day open-interest flow with
   funding (new longs, crowded longs, squeeze fuel, spot-led). Tags never
   change the answer, and neither does `MACRO` (a calendar print due within
-  24 hours that the answer does not name). Pattern tags sit in the same column: TRIPLE,
+  24 hours that the answer does not name). Pattern tags sit with them under the coin name: TRIPLE,
   W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS.
 - **Movers tab** (`/movers`): a separate scan of every liquid crypto perp for
   an unusual last completed day (5%+ move, 2x its 20-day volume, or 1.5x its
@@ -265,19 +281,21 @@ forecast and previous, so the tab links out to ForexFactory in two places:
 the header opens the calendar, and the selected day opens that same day
 there, which is where the number appears once a print lands.
 
-**The Scan-page strip** repeats the next market mover with a countdown and
-turns amber when it is inside 24 hours. `/#calendar` opens the tab directly.
+**The Scan-page strip** (under the table) repeats the next market mover with a
+countdown and turns amber when it is inside 24 hours. The brief above the
+table names the nearest blocking USD print as of the last scan. `/#calendar` opens the tab directly.
 
 ## Reading a row
 
-1. **Check the calendar strip first.** A high-impact USD print within 12
+1. **Read the brief's macro line first.** A high-impact USD print within 12
    hours holds every otherwise-ready 4H row at Not yet (within 4 hours, the
    1H rows too), and so does one printed in the last hour; the reason names
    the event. The other movers show as a `MACRO` tag on the row instead.
 2. **Read the audit line.** A short list from an unfinished scan is not a
    quiet market.
-3. **Start with the Yes rows, highest grade first.** Click a row and check
-   the chart: the two troughs, the bump between them and the stop.
+3. **Start with the Yes rows, highest grade first** (the brief's cards).
+   Click a row and check the chart: the two troughs, the bump between them
+   and the stop.
 4. **Not yet rows are the ones to keep an eye on.** The reason says what to
    wait for: a pullback to the signal price, the macro print, the signal bar
    closing, or (counter trend, grade B) nothing: watch only.

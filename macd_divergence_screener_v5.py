@@ -949,6 +949,26 @@ def macro_window(events, now):
     return blocker, other
 
 
+def brief_meta(btc, window, now):
+    """Scan-meta fields for the page's brief.
+
+    btc: the last completed BTC 4H bar of the fetch_btc() frame as {state, rsi,
+    close, ema200}, or None without a frame. blocker / macro: the two halves of
+    macro_window() (`window`, taken at `now`) as {ts_ms, title} or None; the
+    time is absolute so the page can count down live. `window` None (calendar
+    unavailable) leaves both keys out, so the page says nothing about macro."""
+    out = {"btc": None}
+    if btc is not None and len(btc):
+        last = btc.iloc[-1]
+        out["btc"] = {"state": btc_state(last["rsi"], last["close"], last["ema200"]),
+                      "rsi": round(float(last["rsi"]), 1),
+                      "close": px(float(last["close"])), "ema200": px(float(last["ema200"]))}
+    if window is not None:
+        for key, e in zip(("blocker", "macro"), window):
+            out[key] = e and {"ts_ms": int((now.timestamp() + e[0] * 3600) * 1000), "title": e[1]}
+    return out
+
+
 # ── Exchange helpers ───────────────────────────────────────────────────────────
 def make_exchange(exid, rate_limit=True):
     """Build a ccxt exchange from an allowlisted id — never getattr on raw user
@@ -2024,46 +2044,70 @@ def signals_for_tf(df, tf, rules, live_price, sym, wk_vol, forming_df=None):
 
 
 # ── Chart preview ──────────────────────────────────────────────────────────────
+def _plain(v):
+    """A price as plain digits for a chart label (no exponent on sub-cent coins)."""
+    return np.format_float_positional(v, trim="-")
+
+
 def render_chart(df, d, sig):
-    """PNG of the A-to-B leg: candles with the stop and R lines over the MACD
-    panel with its trough and crossover dots. `d` is the raw detection (bar
-    indexes into `df`), `sig` the finished signal (levels)."""
+    """PNG of the A-to-B leg: candles with the entry, stop and R lines (each
+    labelled with its price) over the MACD panel with its trough and crossover
+    dots; A and B carry their price and MACD value. `d` is the raw detection
+    (bar indexes into `df`), `sig` the finished signal (levels)."""
     lo = max(0, d["a_start"] - 10)
     v = df.iloc[lo:min(len(df), d["signal_bar"] + 30)]
     x = np.arange(len(v))
-    fig = Figure(figsize=(9, 5.5), tight_layout=True)
+    bg, fg, mut, line = "#0C111B", "#DCE3EE", "#9AA8BD", "#222D40"      # the page's tokens
+    green, red, amber, acc = "#6FCF9F", "#E58C98", "#E2B866", "#8FB4E8"
+    fig = Figure(figsize=(6.4, 4.6), tight_layout=True, facecolor=bg)   # shown about 460px wide
     ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
+    for a in (ax, am):
+        a.set_facecolor(bg)
+        a.tick_params(colors=mut, labelsize=9)
+        for sp in a.spines.values():
+            sp.set_color(line)
+
+    def ab(a, ia, ib, ya, yb, fmt):
+        """The A-to-B line with each end labelled with its value, on the side
+        away from the line (below the troughs of a bullish one, above peaks)."""
+        a.plot([ia - lo, ib - lo], [ya, yb], color=amber, lw=1.5, marker="o")
+        dy, va = (-12, "top") if d["side"] == "bullish" else (8, "bottom")
+        for name, i, y in (("A", ia, ya), ("B", ib, yb)):
+            a.annotate(f"{name} {fmt(y)}", (i - lo, y), xytext=(0, dy), textcoords="offset points",
+                       color=fg, fontsize=10, ha="center", va=va)
 
     up = (v["close"] >= v["open"]).values
-    for mask, col in ((up, "#26a69a"), (~up, "#ef5350")):
+    for mask, col in ((up, green), (~up, red)):
         ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=1)
         ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=3)
-    ax.plot([d["a_p"] - lo, d["b_p"] - lo], [d["a_price"], d["b_price"]],
-            color="#f5a623", lw=1.5, marker="o")
+    ab(ax, d["a_p"], d["b_p"], d["a_price"], d["b_price"], lambda y: _plain(px(y)))
+    ax.margins(y=0.15)      # room for the A / B labels
+    am.margins(y=0.2)
     t = sig["targets"]
-    for lvl, col, lbl in ((sig["stop_price"], "#ef5350", "stop"), (t["1r"], "#26a69a", "1R"),
-                          (t["2r"], "#26a69a", "2R"), (t["3r"], "#26a69a", "3R")):
-        ax.axhline(lvl, color=col, lw=0.8, ls="--")
-        ax.text(len(v) - 1, lvl, lbl, color=col, fontsize=8, va="bottom", ha="right")
+    for lvl, col, ls, lbl in ((sig["entry_ref_price"], acc, "-", "Entry"),
+                              (sig["stop_price"], red, "--", "Stop"), (t["1r"], mut, ":", "1R"),
+                              (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R")):
+        ax.axhline(lvl, color=col, lw=0.8, ls=ls)
+        ax.text(1.01, lvl, f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
+                transform=ax.get_yaxis_transform())      # right of the panel, clear of the candles
     ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']} divergence, "
-                 f"grade {sig['grade']} ({sig['score']})", fontsize=10)
+                 f"grade {sig['grade']} ({sig['score']})", fontsize=11, color=fg)
 
-    am.plot(x, v["macd"].values, color="#2962ff", lw=1.2, label="MACD")
-    am.plot(x, v["signal"].values, color="#ff6d00", lw=1, label="signal")
-    am.axhline(0, color="#888888", lw=0.5)
-    am.plot([d["a_m"] - lo, d["b_m"] - lo], [d["a_macd"], d["b_macd"]],
-            color="#f5a623", lw=1.5, marker="o")
+    am.plot(x, v["macd"].values, color=acc, lw=1.2, label="MACD")
+    am.plot(x, v["signal"].values, color=mut, lw=1, label="signal")
+    am.axhline(0, color=line, lw=0.8)
+    ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], lambda y: f"{y:.3g}")
     for bar, direction in d["crosses"]:
         am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
-                color="#26a69a" if direction > 0 else "#ef5350")
-    am.legend(loc="upper left", fontsize=7)
-    step = max(1, len(v) // 6)
+                color=green if direction > 0 else red)
+    am.legend(loc="upper left", fontsize=9, facecolor=bg, edgecolor=line, labelcolor=mut)
+    step = max(1, len(v) // 4)
     shown = v.index[::step] + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
     am.set_xticks(x[::step])
-    am.set_xticklabels([ts.strftime("%b %d %H:%M") for ts in shown], fontsize=7)
+    am.set_xticklabels([ts.strftime("%b %d %H:%M") for ts in shown])
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110)
+    fig.savefig(buf, format="png", dpi=150)
     return buf.getvalue()
 
 
@@ -2313,7 +2357,8 @@ def index():
     # Thresholds are templated in so the dashboard's highlights and tooltips
     # cannot drift from the constants the scans actually use.
     tmpl = {
-        "__TF_CFG_JSON__": json.dumps({k: {"label": v["label"], "minutes": v["minutes"]}
+        "__TF_CFG_JSON__": json.dumps({k: {"label": v["label"], "minutes": v["minutes"],
+                                           "fresh_h": v["fresh_h"], "macro_h": MACRO_WAIT_H[k]}
                                        for k, v in TF_CFG.items()}),
         "__DEFAULT_VOL_M__": str(int(DEFAULT_MIN_WEEKLY_VOL / 1e6)),
         "__DEFAULT_MAX_PAIRS__": str(DEFAULT_MAX_PAIRS),
@@ -2438,12 +2483,13 @@ def scan_route():
         # Nearest USD blocker (for the entry verdict) and nearest other mover
         # (a row tag). A calendar failure must not stop a scan; the verdict
         # then simply ignores the calendar.
-        blocker = macro = None
+        blocker = macro = window = None
+        cal_now = datetime.datetime.now(datetime.timezone.utc)
         try:
             refresh_calendar()
             with _lock:
                 events = list(_cal_state["events"])
-            blocker, macro = macro_window(events, datetime.datetime.now(datetime.timezone.utc))
+            window = blocker, macro = macro_window(events, cal_now)
         except Exception as e:
             yield sse("log", {"msg": f"Calendar unavailable for the entry verdict: {e}"})
 
@@ -2683,7 +2729,8 @@ def scan_route():
                     "venues": list(V), "spread_rejected": spread_reject,
                     "atr_rejected": c["atr_reject"], "short_history": c["short_history"],
                     "oi_rejected": c["oi_reject"],
-                    "complete": done.is_set() and q.empty()}
+                    "complete": done.is_set() and q.empty(),
+                    **brief_meta(btc, window, cal_now)}
             with _lock:
                 _state["results"] = results
                 _state["ts"] = datetime.datetime.now(datetime.timezone.utc)
@@ -2939,278 +2986,259 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MACD Divergence Screener</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* One calm column: brief first, short table second, everything else on click. Inter for words, mono only for numbers. */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#090D18;--sf:#0F1623;--sf2:#141D2E;--sf3:#1A2438;
-  --bd:#1E2D42;--bd2:#253449;
-  --tx:#CDD6E8;--tx2:#8A9BB5;--tx3:#4F6380;
-  --bull:#34D399;--bull-bg:#0D2E1F;
-  --bear:#FB7185;--bear-bg:#2D0F18;
-  --acc:#F0608A;--fresh:#FBBF24;--fresh-bg:#2D1F06;
-  --mono:'JetBrains Mono',monospace;--sans:'Inter',system-ui,sans-serif;
-  --ease:cubic-bezier(.22,.68,0,1.2);--eout:cubic-bezier(0,.55,.45,1);
+  color-scheme:dark;
+  --bg:#0C111B;--sf:#121926;--sf2:#182132;--line:#222D40;
+  --tx:#DCE3EE;--tx2:#9AA8BD;--tx3:#6E7D94;
+  --acc:#8FB4E8;--acc-ink:#0C111B;
+  --yes:#6FCF9F;--yes-bg:#12291F;
+  --wait:#E2B866;--wait-bg:#2A2212;
+  --no:#8E9BB0;--no-bg:#1A2231;
+  --short:#E58C98;
+  --sans:'Inter',system-ui,sans-serif;--mono:'JetBrains Mono',ui-monospace,monospace;
 }
-html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:14px;line-height:1.5}
-.shell{display:grid;grid-template-rows:48px 1fr;grid-template-columns:minmax(0,1fr);height:100vh;overflow:hidden}
-.topbar{display:flex;align-items:center;background:var(--sf);border-bottom:1px solid var(--bd);z-index:20}
-.t-logo{font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.12em;color:var(--acc);padding:0 18px;flex-shrink:0}
-.t-div{width:1px;height:16px;background:var(--bd2)}
-.nav{display:flex;height:48px;padding:0 8px;min-width:0;overflow-x:auto;scrollbar-width:none}
-.nav-btn{height:100%;padding:0 18px;font-size:12px;font-weight:500;color:var(--tx3);cursor:pointer;border:none;border-bottom:2px solid transparent;background:none;transition:color .15s,border-color .15s;letter-spacing:.04em;flex-shrink:0;white-space:nowrap}
-.nav-btn:hover{color:var(--tx2)}
-.nav-btn.active{color:var(--tx);border-bottom-color:var(--acc)}
-.t-right{margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:18px;flex-shrink:0}
-.sdot{width:6px;height:6px;border-radius:50%;background:var(--tx3);transition:background .4s,box-shadow .4s}
-.sdot.live{background:var(--bull);box-shadow:0 0 8px var(--acc);animation:blink 2s ease-in-out infinite}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.55;padding:0 16px 64px}
+.shell{max-width:1020px;margin:0 auto}
+button,select,input{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:4px}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.lbl,.fl,.dash-sec-ttl,.lp-lbl,.cal-next-lbl,.cal-dow{font-size:12px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--tx3)}
+.calm,.note,.audit,.hint,.wprog,.sig-sub,.learn-sub{font-size:13px;color:var(--tx3)}
+.calm,.note,.prose{max-width:68ch}
+.prose{color:var(--tx2)}
+.prose b,.rule-b b{color:var(--tx);font-weight:500}
+
+.topbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding-block:18px;border-bottom:1px solid var(--line);margin-bottom:28px}
+.t-logo{font-weight:600;letter-spacing:.02em}
+.nav{display:flex;flex-wrap:wrap;gap:4px}
+.nav-btn{background:none;border:0;padding:6px 12px;border-radius:6px;color:var(--tx2)}
+.nav-btn:hover{color:var(--tx)}
+.nav-btn.active{background:var(--sf2);color:var(--tx)}
+.t-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.sdot{width:7px;height:7px;border-radius:50%;background:var(--tx3)}
+.sdot.live{background:var(--acc);animation:blink 2s ease-in-out infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
-.slbl{font-family:var(--mono);font-size:11px;color:var(--tx3);transition:opacity .2s}
+.slbl{font-size:13px;color:var(--tx3);transition:opacity .2s}
 .slbl.fd{opacity:.3}
 .page{display:none}
-.page.active{display:flex;flex-direction:column}
-#pg-scan.active{display:grid;grid-template-columns:286px 1fr;overflow:hidden}
-.wq{display:inline-flex;align-items:center;padding:3px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:700;white-space:nowrap}
-.wq-sc{background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
-.wq-cap{background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2)}
-.wflag{display:inline-block;padding:2px 6px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;margin-right:4px;white-space:nowrap}
-.wf-spot{background:var(--bull-bg);color:var(--bull);border:1px solid #1a4020}
-.wf-crowd{background:#2D1500;color:#FB923C;border:1px solid #4a2800}
-.wf-squeeze{background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500}
-.wf-hioi{background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
-.wbar{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
-.wbar select{width:130px}
-.wbar .rbtn{width:auto;padding:8px 22px}
-.wprog{font-family:var(--mono);font-size:11px;color:var(--tx3)}
-.sb{background:var(--sf);border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
-.ss{padding:13px 15px;border-bottom:1px solid var(--bd)}
-.fl{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3);margin-bottom:7px}
-.hint{font-family:var(--mono);font-size:9px;color:var(--tx3);line-height:1.6;margin-top:7px}
-select,input[type=text]{width:100%;background:var(--sf2);border:1px solid var(--bd2);color:var(--tx);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:5px;outline:none;appearance:none;transition:border-color .2s}
+.page.active{display:flex;flex-direction:column;gap:28px}
+
+/* ── Brief ── */
+.brief{display:flex;flex-direction:column;gap:18px}
+.brief h1{font-size:26px;font-weight:600;line-height:1.25;text-wrap:balance}
+.brief p{max-width:68ch;color:var(--tx2)}
+.brief p b{color:var(--tx);font-weight:500}
+.state{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+.picks{display:flex;flex-direction:column;gap:10px}
+.pick{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 16px;align-items:center;width:100%;text-align:left;
+  background:var(--sf);border:1px solid var(--line);border-radius:10px;padding:14px 16px;transition:border-color .15s}
+.pick:hover{border-color:var(--acc)}
+.pick .head{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px}
+.pick .coin{font-size:17px;font-weight:600}
+.pick .gr{color:var(--tx2)}
+.pick .old{color:var(--tx3);font-size:13px}
+.pick .why{grid-column:1/-1;color:var(--tx2);font-size:14px}
+.pick .lv{grid-column:1/-1;font-size:13px;color:var(--tx2)}
+.pick .lv span{color:var(--tx)}
+.side-long{color:var(--yes)}.side-short{color:var(--short)}
+.ans{display:inline-block;padding:3px 10px;border-radius:20px;font-size:13px;font-weight:500;white-space:nowrap}
+.ans.enter{background:var(--yes-bg);color:var(--yes)}.ans.wait{background:var(--wait-bg);color:var(--wait)}.ans.skip{background:var(--no-bg);color:var(--no)}
+table.stale .ans{opacity:.45}
+
+/* ── Scan bar, settings, progress ── */
+.scan-sec{display:flex;flex-direction:column;gap:14px}
+.bar,.wbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px}
+.rbtn{background:var(--acc);color:var(--acc-ink);border:0;border-radius:8px;padding:9px 22px;font-weight:600;transition:opacity .15s}
+.rbtn:hover:not(:disabled){opacity:.88}
+.rbtn:disabled,.gbtn:disabled{opacity:.4;cursor:not-allowed}
+.gbtn{background:none;color:var(--tx2);border:1px solid var(--line);border-radius:8px;padding:7px 14px;font-size:14px}
+.gbtn:hover:not(:disabled){border-color:var(--acc);color:var(--tx)}
+.audit.warn{color:var(--wait);background:var(--wait-bg);border-radius:8px;padding:9px 12px}
+details.set{margin-left:auto}
+details.set[open]{flex-basis:100%;margin-left:0}
+details.set summary{cursor:pointer;color:var(--tx2);font-size:14px;padding:6px 4px}
+.setbody{margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:20px 28px;background:var(--sf);border:1px solid var(--line);border-radius:10px;padding:18px}
+.fl{margin-bottom:7px}
+.hint{margin-top:7px}
+select,input[type=text]{width:100%;background:var(--sf2);border:1px solid var(--line);font-size:14px;padding:8px 10px;border-radius:6px;appearance:none;transition:border-color .2s}
 select:focus,input[type=text]:focus{border-color:var(--acc)}
 input[type=number]{-moz-appearance:textfield}
 input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none}
-.nw{display:flex;align-items:center;background:var(--sf2);border:1px solid var(--bd2);border-radius:5px;overflow:hidden;transition:border-color .15s}
+.nw{display:flex;align-items:center;background:var(--sf2);border:1px solid var(--line);border-radius:6px;overflow:hidden}
 .nw:focus-within{border-color:var(--acc)}
-.nw input[type=number]{flex:1;background:transparent;border:none;border-left:1px solid var(--bd2);border-right:1px solid var(--bd2);border-radius:0;text-align:center;padding:7px 4px;color:var(--tx);font-family:var(--mono);font-size:12px}
-.nw input[type=number]:focus{outline:none}
-.nb{width:34px;height:34px;background:transparent;border:none;color:var(--tx3);font-size:17px;cursor:pointer;transition:background .12s,color .12s;display:flex;align-items:center;justify-content:center}
-.nb:hover{background:var(--sf3);color:var(--tx)}
-.trow{display:flex;gap:3px}
-.tbtn{flex:1;padding:6px 0;background:var(--sf2);border:1px solid var(--bd2);color:var(--tx3);font-family:var(--mono);font-size:11px;cursor:pointer;border-radius:4px;transition:color .15s,background .15s,border-color .15s}
+.nw input[type=number]{flex:1;min-width:0;background:transparent;border:none;border-left:1px solid var(--line);border-right:1px solid var(--line);text-align:center;padding:8px 4px;font-family:var(--mono);font-size:14px}
+.nb{width:38px;height:38px;background:transparent;border:none;color:var(--tx2);font-size:17px}
+.nb:hover{background:var(--line);color:var(--tx)}
+.trow{display:flex;gap:4px}
+.tbtn{flex:1;padding:7px 0;background:var(--sf2);border:1px solid var(--line);color:var(--tx2);font-size:14px;border-radius:6px;transition:color .15s,background .15s}
 .tbtn:hover{color:var(--tx)}
-.tbtn.active{background:var(--acc);border-color:var(--acc);color:#000;font-weight:600}
-.rbtn{width:100%;padding:10px;background:var(--acc);color:#000;border:none;border-radius:6px;font-family:var(--mono);font-size:12px;font-weight:700;cursor:pointer;letter-spacing:.06em;transition:opacity .2s,transform .15s,box-shadow .2s}
-.rbtn:hover:not(:disabled){opacity:.88;box-shadow:0 0 16px rgba(240,96,138,.3)}
-.rbtn:active:not(:disabled){transform:scale(.97)}
-.rbtn:disabled{opacity:.3;cursor:not-allowed}
-.gbtn{width:100%;padding:8px;background:transparent;color:var(--tx2);border:1px solid var(--bd2);border-radius:6px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:border-color .15s,color .15s}
-.gbtn:hover:not(:disabled){border-color:var(--acc);color:var(--tx)}
-.gbtn:disabled{opacity:.4;cursor:not-allowed}
-.pb-bg{height:3px;background:var(--sf3);border-radius:2px;overflow:hidden;margin-bottom:6px}
-.pb-fill{height:100%;background:linear-gradient(90deg,var(--acc),#F4A0BE);border-radius:2px;width:0%;transition:width 1.4s cubic-bezier(0,.55,.45,1)}
-.pb-lbl{font-family:var(--mono);font-size:10px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.lc{display:flex;flex-direction:column;gap:5px;min-height:80px;overflow:hidden}
-.lcard{display:flex;align-items:flex-start;gap:8px;background:var(--sf2);border:1px solid var(--bd);border-left:2px solid var(--bd2);border-radius:5px;padding:7px 9px;will-change:transform,opacity;transform:translateY(0);opacity:1;transition:opacity .35s var(--eout),transform .35s var(--eout),border-left-color .3s,max-height .4s var(--eout),padding .4s var(--eout),margin-bottom .4s var(--eout);max-height:60px;overflow:hidden}
-.lcard.ce{opacity:0;transform:translateY(-10px)}
-.lcard.cx{opacity:0;transform:translateY(4px);max-height:0;padding-top:0;padding-bottom:0;margin-bottom:-5px}
-.lcard.in{border-left-color:var(--acc)}.lcard.dn{border-left-color:var(--bull)}.lcard.er{border-left-color:var(--bear)}.lcard.ol{opacity:.35}
-.lcard-m{font-family:var(--mono);font-size:11px;color:var(--tx2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.lcard.in .lcard-m{color:var(--tx)}.lcard.dn .lcard-m{color:var(--bull)}
-.lcard-t{font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:1px}
-.main{display:flex;flex-direction:column;overflow:hidden;background:var(--bg);position:relative}
-.rbar{display:flex;align-items:center;gap:8px;padding:9px 16px;background:var(--sf);border-bottom:1px solid var(--bd);flex-shrink:0;flex-wrap:wrap}
-.rtitle{font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--tx3)}
-.spill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-family:var(--mono);font-size:11px;font-weight:600;border:1px solid transparent;opacity:0;transform:scale(.85);pointer-events:none;transition:opacity .35s var(--eout),transform .35s var(--eout)}
-.spill.vis{opacity:1;transform:scale(1);pointer-events:auto}
-.spill .num{display:inline-block}
-@keyframes nb2{0%,100%{transform:scale(1)}50%{transform:scale(1.4)}}
-.num.bmp{animation:nb2 .28s var(--ease)}
-.sbull{background:var(--bull-bg);color:var(--bull);border-color:#1a4020}
-.sbear{background:var(--bear-bg);color:var(--bear);border-color:#4a1a22}
-.sfresh{background:var(--fresh-bg);color:var(--fresh);border-color:#4a3500}
-.fbar{margin-left:auto;display:flex;gap:4px;flex-wrap:wrap}
-.ftab{padding:4px 10px;background:transparent;border:1px solid var(--bd2);color:var(--tx3);font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.06em;border-radius:4px;cursor:pointer;transition:color .15s,border-color .15s,background .15s}
-.ftab:hover{color:var(--tx2);border-color:var(--tx3)}
-.ftab.active{background:var(--sf3);color:var(--tx);border-color:var(--acc)}
-.tw{flex:1;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
-.tw::-webkit-scrollbar{width:4px}.tw::-webkit-scrollbar-track{background:transparent}.tw::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px}
-table{width:100%;border-collapse:collapse}
-thead{position:sticky;top:0;z-index:2}
-th{background:var(--sf);border-bottom:1px solid var(--bd);padding:9px 12px;text-align:left;font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3);white-space:nowrap}
+.tbtn.active{background:var(--acc);border-color:var(--acc);color:var(--acc-ink);font-weight:600}
+.prog{display:flex;flex-direction:column;gap:8px}
+.pb-bg{height:3px;background:var(--sf2);border-radius:2px;overflow:hidden}
+.pb-fill{height:100%;background:var(--acc);border-radius:2px;width:0%;transition:width 1.4s cubic-bezier(0,.55,.45,1)}
+.pb-lbl{font-size:13px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lc{display:flex;flex-direction:column;gap:5px}
+.lcard{display:flex;justify-content:space-between;gap:12px;border-left:2px solid var(--line);padding:3px 10px;font-size:13px;transition:opacity .35s,max-height .4s;max-height:60px;overflow:hidden}
+.lcard.ce,.lcard.cx{opacity:0}
+.lcard.cx{max-height:0;padding-block:0}
+.lcard.in{border-left-color:var(--acc)}.lcard.er{border-left-color:var(--short)}.lcard.ol{opacity:.5}
+.lcard-m{color:var(--tx2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lcard.in .lcard-m,.lcard.dn .lcard-m{color:var(--tx)}
+.lcard-t{font-family:var(--mono);font-size:12px;color:var(--tx3);flex-shrink:0}
+.sl{display:none;position:relative;height:240px;flex-direction:column;align-items:center;justify-content:center;gap:12px;border:1px solid var(--line);border-radius:10px;overflow:hidden;transition:opacity .35s ease}
+.sl.vis{display:flex}.sl.diss{opacity:0}
+.sbg{position:absolute;inset:0;overflow:hidden;pointer-events:none}
+.sbg-feed{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end;padding:16px 20px;overflow:hidden}
+.bgl{font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;opacity:0;transition:opacity .4s ease}
+.bgl.sh{opacity:.25}.bgl.sh.hit{opacity:.8;color:var(--tx2)}
+.lring{position:relative;width:72px;height:72px}
+.lring svg{width:72px;height:72px;transform:rotate(-90deg)}
+.rtrack{fill:none;stroke:var(--line);stroke-width:2.5}
+.rfill{fill:none;stroke:var(--acc);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:201;stroke-dashoffset:201;transition:stroke-dashoffset 1.4s cubic-bezier(0,.55,.45,1)}
+.rpct{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:14px;font-weight:600}
+.lpair{position:relative;font-size:14px;color:var(--tx2);max-width:220px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.llbl{position:relative;font-size:12px;color:var(--tx3);letter-spacing:.08em;text-transform:uppercase}
+.rbar{display:flex;align-items:center;gap:8px 14px;flex-wrap:wrap}
+.spill{font-size:13px;color:var(--tx2);display:none}
+.spill.vis{display:inline}
+.fbar,.sig-filters{display:flex;gap:6px;flex-wrap:wrap}
+.fbar{margin-left:auto}
+.ftab,.sig-ftab{padding:5px 12px;background:none;border:1px solid var(--line);color:var(--tx2);font-size:13px;border-radius:6px;transition:color .15s,border-color .15s,background .15s}
+.ftab:hover,.sig-ftab:hover{color:var(--tx)}
+.ftab.active,.sig-ftab.active{background:var(--sf2);color:var(--tx);border-color:var(--tx3)}
+
+/* ── Tables ── */
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+table{width:100%;border-collapse:collapse;min-width:700px}
+th{text-align:left;font-size:12px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3);padding:12px 16px;border-bottom:1px solid var(--line);white-space:nowrap}
 th.sortable{cursor:pointer;user-select:none}
 th.sortable:hover{color:var(--tx2)}
 th.sorted{color:var(--acc)}
-td{padding:10px 12px;border-bottom:1px solid var(--bd);vertical-align:middle;transition:background .2s}
-tr.rb{background:#0D201018}tr.rr{background:#2D0F1818}
-tr.dim td{opacity:.6}
-tr.dim td:nth-child(-n+3){opacity:1}
-tr:hover td{background:var(--sf2)}
-@keyframes ri{from{opacity:0;transform:translateX(-5px)}to{opacity:1;transform:translateX(0)}}
-tbody tr{animation:ri .3s var(--eout) both}
-.pb{display:flex;flex-direction:column;gap:2px}
-.pb-pair{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--tx)}
-.pb-q{font-family:var(--mono);font-size:9px;color:var(--tx3)}
-.bdg{display:inline-flex;align-items:center;padding:3px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.04em;white-space:nowrap}
-.bb{background:var(--bull-bg);color:var(--bull);border:1px solid #1a4020}
-.br{background:var(--bear-bg);color:var(--bear);border:1px solid #4a1a22}
-.ptm{font-family:var(--mono);font-size:10px;color:var(--tx3)}
-.sl{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);z-index:10;opacity:0;pointer-events:none;transition:opacity .35s ease}
-.sl.vis{opacity:1;pointer-events:auto}.sl.diss{opacity:0;pointer-events:none}
-.sbg{position:absolute;inset:0;overflow:hidden;pointer-events:none;-webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 88%,transparent 100%);mask-image:linear-gradient(to bottom,#000 0%,#000 88%,transparent 100%)}
-.sbg-feed{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end;padding:20px 24px;overflow:hidden}
-.bgl{font-family:var(--mono);font-size:10px;line-height:1.8;color:#00C853;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;opacity:0;transform:translateY(120%);transition:opacity .4s ease,transform .4s cubic-bezier(0,.55,.45,1)}
-.bgl.sh{opacity:.22;transform:translateY(0)}.bgl.sh.hit{opacity:.75;color:#A8FFD0}
-.lring{position:relative;width:72px;height:72px}
-.lring svg{width:72px;height:72px;transform:rotate(-90deg)}
-.rtrack{fill:none;stroke:var(--bd);stroke-width:2.5}
-.rfill{fill:none;stroke:var(--acc);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:201;stroke-dashoffset:201;transition:stroke-dashoffset 1.4s cubic-bezier(0,.55,.45,1),stroke .4s;filter:drop-shadow(0 0 4px rgba(240,96,138,.6))}
-.rfill.done{stroke:var(--bull)}
-.rpct{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:13px;font-weight:600;color:var(--tx)}
-.lpair{font-family:var(--mono);font-size:11px;color:var(--tx2);max-width:220px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.llbl{font-family:var(--mono);font-size:10px;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase}
-.qc{display:flex;flex-direction:column;gap:2px;min-width:56px}
-.qnum{font-family:var(--mono);font-size:12px;font-weight:600}
-.qbar{height:3px;background:var(--bd2);border-radius:2px;overflow:hidden}
-.qfill{height:100%;border-radius:2px;transition:width .4s}
-.tlbl{font-size:11px;font-weight:700;white-space:nowrap}
-.tsub{font-size:9px;font-weight:400;opacity:.8;margin-top:1px;white-space:normal;line-height:1.3}
-.ev{display:inline-flex;flex-direction:column;gap:2px;padding:6px 10px;border-radius:5px;font-family:var(--mono);min-width:220px;max-width:340px}
-.ev .tsub{white-space:normal;line-height:1.45;font-size:10.5px;font-family:var(--sans);opacity:.95}
-.ev-enter{background:#0D2E1F;color:#34D399;border:1px solid #1a4020}
-.ev-wait{background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500}
-.ev-skip{background:var(--sf3);color:var(--tx3);border:1px solid var(--bd2)}
-table.stale .ev{opacity:.4}
-tbody tr.main-row{cursor:pointer}
-tr.det td{background:var(--sf);font-family:var(--mono);font-size:10px;color:var(--tx2);line-height:1.8;padding:10px 16px}
-tr.det b{color:var(--tx)}
-tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1px solid var(--bd2);border-radius:4px}
-.tfb-on{color:var(--tx);border-color:var(--tx3)}
-.tfb{display:inline-block;margin-left:4px;padding:2px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;background:var(--sf3);color:var(--tx2);border:1px solid var(--bd2)}
-.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;color:var(--tx3);font-family:var(--mono);font-size:12px}
-.empty-icon{font-size:28px;opacity:.3}
-.greet{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;padding:48px 40px}
-.g-hl{font-family:var(--sans);font-size:42px;font-weight:600;color:var(--tx);letter-spacing:-.02em;line-height:1.15}
-.g-sub{font-family:var(--sans);font-size:16px;color:var(--tx3);max-width:380px;line-height:1.7}
-.g-cta{margin-top:16px;padding:14px 52px;background:var(--acc);color:#000;border:none;border-radius:7px;font-family:var(--sans);font-size:14px;font-weight:600;cursor:pointer;transition:opacity .2s,transform .15s,box-shadow .2s}
-.g-cta:hover{opacity:.88;box-shadow:0 0 28px rgba(240,96,138,.4)}
-.g-cta:active{transform:scale(.97)}
-.dash-sec{margin-bottom:28px}
-.dash-sec-ttl{font-size:10px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3);margin-bottom:12px}
-.no-sig{color:var(--tx3);font-family:var(--mono);font-size:12px;padding:20px;background:var(--sf);border:1px solid var(--bd);border-radius:8px;text-align:center}
-.audit{font-family:var(--mono);font-size:10px;color:var(--tx3);margin:-14px 0 24px;line-height:1.7}
-.audit.warn{color:var(--fresh);background:var(--fresh-bg);border:1px solid #4a3500;border-radius:6px;padding:9px 12px;margin-top:-10px}
-.uni-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px}
-.uni-row{display:flex;align-items:center;justify-content:space-between;padding:6px 9px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;font-family:var(--mono);font-size:11px}
-.uni-base{font-weight:600;color:var(--tx)}
-.uni-vol{color:var(--tx3);font-size:9px}
-.learn-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.learn-card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:16px}
-.learn-card.lc-bull{border-left:3px solid var(--bull)}
-.learn-card.lc-bear{border-left:3px solid var(--bear)}
-.learn-card-hdr{display:flex;align-items:center;gap:8px;margin-bottom:12px}
-.learn-sub{font-size:11px;color:var(--tx3);font-family:var(--mono)}
-.learn-panels{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.lp-lbl{font-size:9px;color:var(--tx3);text-align:center;margin-bottom:4px;letter-spacing:.08em;text-transform:uppercase}
-.lp-svg{width:100%;display:block;background:var(--sf2);border-radius:5px}
-.lp-line{fill:none;stroke:var(--tx3);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
-.lp-zero{stroke:var(--bd2);stroke-width:0.5;stroke-dasharray:2 2}
-.lp-dot-A{fill:var(--sf3);stroke:var(--tx2);stroke-width:1.5}
-.lp-dot-B{fill:var(--sf3);stroke:var(--acc);stroke-width:1.5}
-.lp-txt{font-family:var(--mono);font-size:8px;fill:var(--tx2);text-anchor:middle}
-.lp-connect-bull{stroke:var(--bull);stroke-width:1.2;stroke-dasharray:3 2}
-.lp-connect-bear{stroke:var(--bear);stroke-width:1.2;stroke-dasharray:3 2}
-.lp-cap{font-family:var(--mono);font-size:8px;text-anchor:middle}
-.lp-cap-bull{fill:var(--bull)}
-.lp-cap-bear{fill:var(--bear)}
-.rules{max-width:760px}
+td{padding:14px 16px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tr.row{cursor:pointer}
+tr.row:hover td{background:var(--sf)}
+td .sub{display:block;font-size:13px;color:var(--tx3)}
+td.none{color:var(--tx3);cursor:default}
+td.coin{white-space:nowrap}
+td.why{min-width:250px}
+.tf{font-size:12px;color:var(--tx3);margin-left:6px}
+.tf.on{color:var(--tx2)}
+.tag,.bdg,.thin-badge,.cal-imp{display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin:4px 4px 0 0;white-space:nowrap}
+tr.det td{background:var(--sf);padding:18px 16px}
+.dgrid{display:grid;grid-template-columns:minmax(0,1.9fr) minmax(0,1fr) minmax(0,1fr);gap:20px}
+.dgrid + .dgrid{margin-top:20px;padding-top:20px;border-top:1px solid var(--line)}
+@media (max-width:820px){.dgrid{grid-template-columns:minmax(0,1fr)}}
+.dgrid > div{min-width:0;display:flex;flex-direction:column;gap:8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:14px}
+.kv dt{color:var(--tx3)}
+.chk{list-style:none;font-size:14px;display:flex;flex-direction:column;gap:3px}
+.chk li::before{content:"\2713";color:var(--yes);margin-right:8px}
+.chk li.w::before{content:"\2026";color:var(--wait)}
+.chk li.x::before{content:"\00D7";color:var(--short)}
+.full{font-size:13px;color:var(--tx2)}
+img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8px}
+.fold{background:none;border:0;border-top:1px solid var(--line);color:var(--tx2);padding:12px 16px;width:100%;text-align:left;font-size:14px}
+.fold:hover{color:var(--tx)}
+.no-sig{color:var(--tx3);padding:20px;text-align:center}
 
-  opacity:0;transform:translateY(8px);animation:rtIn .45s ease forwards;animation-delay:var(--d);transition:border-color .3s,background .3s,box-shadow .3s}
-.rule{display:flex;gap:12px;padding:11px 0;border-bottom:1px solid var(--bd)}
-.rule:last-child{border-bottom:none}
-.rule-n{font-family:var(--mono);font-size:10px;color:var(--acc);flex-shrink:0;width:22px;padding-top:2px}
-.rule-b{font-size:12px;color:var(--tx2);line-height:1.65}
-.rule-b b{color:var(--tx);font-weight:600}
-.sig-hdr{display:flex;align-items:center;gap:12px;margin-bottom:18px}
-.sig-ttl{font-size:18px;font-weight:600;color:var(--tx)}
-.sig-sub{font-size:12px;color:var(--tx3)}
-.sig-filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
-.sig-ftab{padding:5px 12px;background:var(--sf);border:1px solid var(--bd2);color:var(--tx3);font-family:var(--mono);font-size:10px;font-weight:600;border-radius:4px;cursor:pointer;transition:all .15s}
-.sig-ftab:hover{color:var(--tx2);border-color:var(--tx3)}
-.sig-ftab.active{background:var(--sf3);color:var(--tx);border-color:var(--acc)}
-::-webkit-scrollbar{width:4px;height:4px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px}
-::-webkit-scrollbar-thumb:hover{background:var(--tx3)}
-
-
-#pg-movers.active{display:block;overflow-y:auto;padding:24px}
-#pg-movers{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
-.mv-thin{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--tx2);cursor:pointer;user-select:none}
-.mv-thin input{accent-color:var(--fresh)}
-.mv-sep td{background:var(--fresh-bg);color:var(--fresh);font-family:var(--mono);font-size:10px;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid #4a3500}
-.thin-badge{display:inline-block;margin-top:3px;padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:600;background:var(--fresh-bg);color:var(--fresh);border:1px solid #4a3500;white-space:nowrap}
-.mrank{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;border-radius:5px;background:var(--sf3);border:1px solid var(--bd2);font-family:var(--mono);font-size:10px;font-weight:700;color:var(--tx3)}
-.mrank.top{background:var(--acc);border-color:var(--acc);color:#000}
-.mpos{position:relative;width:88px;height:5px;background:var(--sf3);border-radius:3px}
+/* ── Movers ── */
+.sig-ttl{font-size:20px;font-weight:600}
+.wbar select{width:150px}
+.mv-thin{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--tx2);cursor:pointer;user-select:none}
+.mv-thin input{accent-color:var(--acc)}
+.mv-sep td{background:var(--wait-bg);color:var(--wait);font-size:13px;padding:8px 16px}
+.thin-badge{color:var(--wait);border-color:var(--wait-bg)}
+.mrank{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:5px;background:var(--sf2);font-family:var(--mono);font-size:12px;color:var(--tx2)}
+.mrank.top{background:var(--acc);color:var(--acc-ink);font-weight:600}
+.mpos{position:relative;width:88px;height:5px;background:var(--sf2);border-radius:3px;margin-top:8px}
 .mpos i{position:absolute;top:-3px;width:3px;height:11px;border-radius:2px;background:var(--tx);transform:translateX(-1px)}
-.mlv{font-family:var(--mono);font-size:10px;color:var(--tx2);white-space:nowrap;line-height:1.6}
-.mlv small{color:var(--tx3);font-size:9px}
+.mlv{font-family:var(--mono);font-size:13px;color:var(--tx2);white-space:nowrap}
+/* nine columns in the same 1020px column: tighter cells, wrapping headers */
+#mvT th,#mvT td{padding:12px 9px}
+#mvT th{white-space:normal}
+#mvT .sub,td.num .sub{white-space:nowrap}
+.mlv small{font-family:var(--sans);color:var(--tx3);font-size:12px}
+.qc{display:flex;flex-direction:column;gap:4px;min-width:56px}
+.qbar{height:3px;background:var(--sf2);border-radius:2px;overflow:hidden}
+.qfill{height:100%;border-radius:2px;background:var(--tx3)}
+.hl{color:var(--tx);font-weight:600}
+.lo{color:var(--tx2)}
+
 /* ── Calendar ── */
-#pg-calendar.active{display:block;overflow-y:auto;padding:24px}
-#pg-calendar{scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
-.cal-next{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:14px 18px;margin-bottom:16px}
-.cal-next.soon{border-color:#4a3500;background:var(--fresh-bg)}
-.cal-next-lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3);width:100%}
-.cal-next-ttl{font-size:16px;font-weight:600;color:var(--tx)}
-.cal-next-in{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--acc)}
-.cal-next.soon .cal-next-in{color:var(--fresh)}
-.cal-next-meta{font-family:var(--mono);font-size:11px;color:var(--tx2)}
-.cal-next-meta b{color:var(--tx);font-weight:600}
-.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:24px}
-.cal-day{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:10px 10px 8px;min-height:104px;cursor:pointer;display:flex;flex-direction:column;gap:6px;transition:border-color .15s,background .15s}
-.cal-day:hover{border-color:var(--bd2)}
+.cal-next,.cal-strip{display:flex;align-items:center;gap:8px 18px;flex-wrap:wrap;background:var(--sf);border:1px solid var(--line);border-radius:10px;padding:14px 18px}
+.cal-next.soon,.cal-strip.soon,.cal-day.soon{background:var(--wait-bg)}
+.cal-next-lbl{width:100%}
+.cal-next-ttl{font-size:17px;font-weight:600}
+.cal-next-in,.cal-strip .in{font-family:var(--mono);font-weight:600;color:var(--tx)}
+.cal-next.soon .cal-next-in,.cal-strip.soon .in{color:var(--wait)}
+.cal-next-meta{font-size:13px;color:var(--tx2)}
+.cal-next-meta b,.cal-strip b{color:var(--tx);font-weight:600}
+.cal-strip{font-size:14px;color:var(--tx2);padding:10px 16px}
+.cal-strip a,.cal-out{color:var(--tx2);font-size:13px;text-decoration:none;cursor:pointer;white-space:nowrap}
+.cal-strip a{margin-left:auto}
+.cal-strip a:hover,.cal-out:hover{color:var(--acc)}
+.cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}
+.cal-day{background:var(--sf);border:1px solid var(--line);border-radius:8px;padding:10px;min-height:110px;cursor:pointer;display:flex;flex-direction:column;gap:6px;transition:border-color .15s}
+.cal-day:hover{border-color:var(--tx3)}
 .cal-day.past{opacity:.4}
 .cal-day.today{border-color:var(--acc)}
-.cal-day.soon{background:var(--fresh-bg);border-color:#4a3500}
-.cal-day.sel{background:var(--sf2);box-shadow:inset 0 0 0 1px var(--tx3)}
+.cal-day.sel{background:var(--sf2);border-color:var(--tx3)}
 .cal-dh{display:flex;justify-content:space-between;align-items:baseline}
-.cal-dow{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3)}
-.cal-dn{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--tx)}
+.cal-dn{font-family:var(--mono);font-size:14px;font-weight:600}
 .cal-day.today .cal-dn{color:var(--acc)}
-.cal-ev{font-size:11px;line-height:1.35;color:var(--tx);background:var(--sf3);border-left:2px solid var(--bd2);border-radius:4px;padding:5px 7px}
-.cal-ev.mv{border-left-color:var(--bear)}
+.cal-ev{font-size:12px;line-height:1.35;background:var(--sf2);border-left:2px solid var(--line);border-radius:4px;padding:5px 7px;overflow-wrap:anywhere}
+.cal-ev.mv{border-left-color:var(--acc)}
 .cal-ev.done{opacity:.5}
-.cal-ev-t{font-family:var(--mono);font-size:10px;color:var(--tx2);margin-right:5px}
-.cal-ev-c{font-family:var(--mono);font-size:9px;color:var(--tx3);margin-left:4px}
-.cal-quiet{font-size:11px;color:var(--tx3);font-style:italic;margin-top:auto}
-.cal-imp{font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:.08em;padding:2px 6px;border-radius:3px;background:var(--sf3);color:var(--tx2);white-space:nowrap}
-.cal-imp.hi{background:var(--bear-bg);color:var(--bear)}
-.cal-imp.md{background:var(--fresh-bg);color:var(--fresh)}
-.cal-strip{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:10px 16px;margin:0 0 24px;font-size:12px;color:var(--tx2)}
-.cal-strip.soon{border-color:#4a3500;background:var(--fresh-bg)}
-.cal-strip .lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3)}
-.cal-strip b{color:var(--tx);font-weight:600}
-.cal-strip .in{font-family:var(--mono);font-weight:600;color:var(--acc)}
-.cal-strip.soon .in{color:var(--fresh)}
-.cal-strip a{color:var(--tx3);cursor:pointer;margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase}
-.cal-strip a:hover{color:var(--tx)}
-.cal-out{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3);text-decoration:none;border-bottom:1px solid transparent;transition:color .15s,border-color .15s;white-space:nowrap}
-.cal-out:hover{color:var(--acc);border-bottom-color:var(--acc)}
+.cal-ev-t{font-family:var(--mono);color:var(--tx2);margin-right:5px}
+.cal-ev-c{color:var(--tx3);margin-left:4px}
+.cal-quiet{font-size:12px;color:var(--tx3);margin-top:auto}
+.cal-imp{margin:0}
+.cal-imp.hi{color:var(--tx);border-color:var(--tx3)}
 .cal-day-hdr{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:12px}
-.cal-day-hdr .dash-sec-ttl{margin:0}
-.mf-vol{background:#2D1F06;color:#FBBF24;border:1px solid #4a3500}
-.mf-rng{background:#1B1030;color:#C4A0FF;border:1px solid #3A2A5A}
-.mf-hi{background:var(--bull-bg);color:var(--bull);border:1px solid #1a4020}
-.mf-lo{background:var(--bear-bg);color:var(--bear);border:1px solid #4a1a22}
-.mf-move{background:#0F2A3A;color:#7DD3FC;border:1px solid #1F4A66}
+
+/* ── Tags and Method ── */
+.dash-sec{display:flex;flex-direction:column;gap:12px}
+#tagsBody{display:flex;flex-direction:column;gap:28px}
+.learn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.learn-card{background:var(--sf);border:1px solid var(--line);border-radius:10px;padding:16px}
+.learn-card.lc-bull{border-left:3px solid var(--yes)}
+.learn-card.lc-bear{border-left:3px solid var(--short)}
+.learn-card-hdr{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.learn-card-hdr .bdg{margin:0}
+.bb{color:var(--yes)}.br{color:var(--short)}
+.learn-panels{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.lp-lbl{text-align:center;margin-bottom:4px}
+.lp-svg{width:100%;display:block;background:var(--sf2);border-radius:5px}
+.lp-line{fill:none;stroke:var(--tx3);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.lp-zero{stroke:var(--line);stroke-width:0.5;stroke-dasharray:2 2}
+.lp-dot-A{fill:var(--sf2);stroke:var(--tx2);stroke-width:1.5}
+.lp-dot-B{fill:var(--sf2);stroke:var(--acc);stroke-width:1.5}
+/* SVG user units: the 150-wide drawings render at 1.5x or more, so 8 is 12px on screen */
+.lp-txt{font-family:var(--mono);font-size:8px;fill:var(--tx2);text-anchor:middle}
+.lp-connect-bull{stroke:var(--yes);stroke-width:1.2;stroke-dasharray:3 2}
+.lp-connect-bear{stroke:var(--short);stroke-width:1.2;stroke-dasharray:3 2}
+.lp-cap{font-family:var(--sans);font-size:8px;text-anchor:middle}
+.lp-cap-bull{fill:var(--yes)}
+.lp-cap-bear{fill:var(--short)}
+.rules{max-width:780px}
+.rule{display:flex;gap:14px;padding:12px 0;border-bottom:1px solid var(--line)}
+.rule:last-child{border-bottom:none}
+.rule-n{font-family:var(--mono);font-size:12px;color:var(--tx3);flex-shrink:0;width:22px;padding-top:3px}
+.rule-k{flex-shrink:0;width:170px}
+.rule-b{font-size:14px;color:var(--tx2)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
 <div class="shell">
 
 <header class="topbar">
-  <span class="t-logo">MACD&middot;DIV</span>
-  <div class="t-div"></div>
+  <span class="t-logo">Divergence Screener</span>
   <nav class="nav">
     <button class="nav-btn active" data-pg="scan">Scan</button>
     <button class="nav-btn" data-pg="movers">Movers</button>
@@ -3225,103 +3253,112 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
 </header>
 
 <div id="pg-scan" class="page active">
-  <aside class="sb">
-    <div class="ss"><div class="fl">Exchange</div>
-      <select id="exchange"><option value="all" selected>All (Binance first)</option><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
-      <div class="hint">All: Binance data, OKX / Bybit for coins Binance does not list, and each setup checked on the other venues (ALSO ON).</div></div>
+  <section class="brief">
+    <h1 id="briefH"></h1>
+    <div class="state" id="briefState"></div>
+    <div class="picks" id="briefPicks" style="display:none">
+      <span class="lbl" id="briefLbl"></span>
+      <div class="picks" id="picks"></div>
+      <span class="calm">Passing the checklist is not a prediction: the backtest has not shown an edge yet, so size accordingly.</span>
+    </div>
+  </section>
+  <section class="scan-sec">
+    <div class="bar">
+      <button class="rbtn" id="runBtn" onclick="startScan()">Run Scan</button>
+      <span id="scan-age" class="audit"></span>
+      <details class="set" id="scanSet"><summary>Scan settings</summary>
+        <div class="setbody">
+          <div class="ss"><div class="fl">Exchange</div>
+            <select id="exchange"><option value="all" selected>All (Binance first)</option><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
+            <div class="hint">All: Binance data, OKX / Bybit for coins Binance does not list, and each setup checked on the other venues (ALSO ON).</div></div>
 
-    <div class="ss"><div class="fl">Minimum weekly volume ($M)</div>
-      <div class="nw"><button class="nb" onclick="stepVol(-10)">-</button><input type="number" id="minVol" value="__DEFAULT_VOL_M__" min="5" max="2000" step="10"><button class="nb" onclick="stepVol(10)">+</button></div>
-      <div class="hint">Rolling 7-day traded value. $70M/week is about $10M/day.</div>
-      <button class="gbtn" id="uniBtn" style="margin-top:8px" onclick="checkUniverse()">How many coins pass?</button>
-      <div id="uniOut" class="hint"></div></div>
+          <div class="ss"><div class="fl">Minimum weekly volume ($M)</div>
+            <div class="nw"><button class="nb" onclick="stepVol(-10)" aria-label="Lower the volume floor">-</button><input type="number" id="minVol" value="__DEFAULT_VOL_M__" min="5" max="2000" step="10"><button class="nb" onclick="stepVol(10)" aria-label="Raise the volume floor">+</button></div>
+            <div class="hint">Rolling 7-day traded value. $70M/week is about $10M/day.</div>
+            <button class="gbtn" id="uniBtn" style="margin-top:8px" onclick="checkUniverse()">How many coins pass?</button>
+            <div id="uniOut" class="hint"></div></div>
 
-    <div class="ss"><div class="fl">Detection strictness</div>
-      <div class="trow" id="strG">
-        <button class="tbtn active" data-val="balanced">Balanced</button>
-        <button class="tbtn" data-val="strict">Strict</button>
+          <div class="ss"><div class="fl">Detection strictness</div>
+            <div class="trow" id="strG">
+              <button class="tbtn active" data-val="balanced">Balanced</button>
+              <button class="tbtn" data-val="strict">Strict</button>
+            </div>
+            <div class="hint" id="strHint">Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.</div></div>
+
+          <div class="ss"><div class="fl">Max pairs to scan</div>
+            <div class="nw"><button class="nb" onclick="stepPairs(-25)" aria-label="Fewer pairs">-</button><input type="number" id="maxPairs" value="__DEFAULT_MAX_PAIRS__" min="10" max="600" step="25"><button class="nb" onclick="stepPairs(25)" aria-label="More pairs">+</button></div>
+            <div class="hint">Most liquid first. Raise it to reach deeper into the tail.</div></div>
+
+          <div class="ss"><div class="fl">Scan speed</div>
+            <div class="trow" id="spdG">
+              <button class="tbtn" data-val="safe">Safe</button>
+              <button class="tbtn active" data-val="normal">Normal</button>
+              <button class="tbtn" data-val="fast">Fast</button>
+            </div>
+            <div class="hint">Fast uses more parallel requests. Drop to Safe if the exchange starts rate-limiting.</div></div>
+
+          <div class="ss"><div class="fl">Specific coins (optional)</div>
+            <input type="text" id="symOverride" placeholder="ENS, SOL, TAO">
+            <div class="hint">Comma-separated. Overrides the volume and thin-coin filters entirely &mdash; scans exactly these.</div></div>
+        </div>
+      </details>
+    </div>
+
+    <div class="prog" id="pgSec" style="display:none">
+      <div class="sl" id="sl">
+        <div class="sbg"><div class="sbg-feed" id="sbgFeed"></div></div>
+        <div class="lring">
+          <svg viewBox="0 0 72 72"><circle class="rtrack" cx="36" cy="36" r="32"/><circle class="rfill" id="rfill" cx="36" cy="36" r="32"/></svg>
+          <div class="rpct" id="rpct">0%</div>
+        </div>
+        <div class="lpair" id="lpair">Loading markets...</div>
+        <div class="llbl">Scanning for divergences</div>
       </div>
-      <div class="hint" id="strHint">Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.</div></div>
-
-    <div class="ss"><div class="fl">Max pairs to scan</div>
-      <div class="nw"><button class="nb" onclick="stepPairs(-25)">-</button><input type="number" id="maxPairs" value="__DEFAULT_MAX_PAIRS__" min="10" max="600" step="25"><button class="nb" onclick="stepPairs(25)">+</button></div>
-      <div class="hint">Most liquid first. Raise it to reach deeper into the tail.</div></div>
-
-    <div class="ss"><div class="fl">Scan speed</div>
-      <div class="trow" id="spdG">
-        <button class="tbtn" data-val="safe">Safe</button>
-        <button class="tbtn active" data-val="normal">Normal</button>
-        <button class="tbtn" data-val="fast">Fast</button>
-      </div>
-      <div class="hint">Fast uses more parallel requests. Drop to Safe if the exchange starts rate-limiting.</div></div>
-
-    <div class="ss"><div class="fl">Specific coins (optional)</div>
-      <input type="text" id="symOverride" placeholder="ENS, SOL, TAO">
-      <div class="hint">Comma-separated. Overrides the volume and thin-coin filters entirely &mdash; scans exactly these.</div></div>
-
-    <div class="ss"><button class="rbtn" id="runBtn" onclick="startScan()">Run Scan</button></div>
-    <div class="ss" id="pgSec" style="display:none">
-      <div class="fl">Progress</div>
       <div class="pb-bg"><div class="pb-fill" id="pbFill"></div></div>
-      <div class="pb-lbl" id="pbLbl">-</div></div>
-    <div class="ss" style="flex:1"><div class="fl">Activity</div><div class="lc" id="lc"></div></div>
-  </aside>
+      <div class="pb-lbl" id="pbLbl">-</div>
+      <div class="lc" id="lc"></div>
+    </div>
 
-  <main class="main">
-    <div class="sl" id="sl">
-      <div class="sbg"><div class="sbg-feed" id="sbgFeed"></div></div>
-      <div class="lring">
-        <svg viewBox="0 0 72 72"><circle class="rtrack" cx="36" cy="36" r="32"/><circle class="rfill" id="rfill" cx="36" cy="36" r="32"/></svg>
-        <div class="rpct" id="rpct">0%</div>
+    <div id="resWrap" style="display:none" class="scan-sec">
+      <div class="rbar">
+        <span class="spill" id="stBull"><span class="num" id="cBull">0</span> long</span>
+        <span class="spill" id="stBear"><span class="num" id="cBear">0</span> short</span>
+        <span class="spill" id="stEnter"><span class="num" id="cEnter">0</span> Yes</span>
+        <div class="fbar">
+          <button class="ftab" data-f="live" onclick="setF(this)" title="Everything still worth watching: answer Yes or Not yet.">Live</button>
+          <button class="ftab" data-f="enter" onclick="setF(this)" title="Only rows whose answer is Yes.">Enter now</button>
+          <button class="ftab" data-f="bull" onclick="setF(this)" title="Bullish divergences (long side) answering Yes or Not yet.">Bullish</button>
+          <button class="ftab" data-f="bear" onclick="setF(this)" title="Bearish divergences (short side) answering Yes or Not yet.">Bearish</button>
+          <button class="ftab" data-f="both" onclick="setF(this)" title="The same side diverging on 4H and 1H at once.">4H+1H</button>
+          <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence found, including the No rows: ones that already played out, were stopped, or are too old. Until you pick this, those are folded under the table.">All</button>
+        </div>
       </div>
-      <div class="lpair" id="lpair">Loading markets...</div>
-      <div class="llbl">Scanning for divergences</div>
-    </div>
-    <div class="cal-strip" id="dash-cal" style="display:none;margin:10px 16px 0"></div>
-    <div class="rbar">
-      <span class="rtitle">Divergences</span>
-      <span class="spill sbull" id="stBull">&#9650; <span class="num" id="cBull">0</span> bullish</span>
-      <span class="spill sbear" id="stBear">&#9660; <span class="num" id="cBear">0</span> bearish</span>
-      <span class="spill sfresh" id="stEnter">&#9889; <span class="num" id="cEnter">0</span> enter now</span>
-      <div class="fbar">
-        <button class="ftab" data-f="live" onclick="setF(this)" title="Everything still worth watching: verdict Enter or Wait.">Live</button>
-        <button class="ftab" data-f="enter" onclick="setF(this)" title="Only rows whose verdict is Enter.">Enter now</button>
-        <button class="ftab" data-f="bull" onclick="setF(this)">Bullish</button>
-        <button class="ftab" data-f="bear" onclick="setF(this)">Bearish</button>
-        <button class="ftab" data-f="both" onclick="setF(this)" title="The same side diverging on 4H and 1H at once.">4H+1H</button>
-        <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence found, including ones that already played out, were stopped, or are too old.">All</button>
+      <div class="tw">
+        <table id="resT">
+          <thead><tr>
+            <th title="The coin, then at most two of its tags and +N for the rest. Open the row for every tag; hover a tag for its definition, or open the Tags page for the full list.">Coin</th>
+            <th title="long: a regular bullish divergence. Across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. short: a regular bearish divergence, the mirror on two peaks. Then the timeframes that diverge; the brighter one supplies the answer and the levels.">Side and TF</th>
+            <th title="Grade and quality score 0-100: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
+            <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Under the answer: the first sentence of the reason; open the row for all of it. Default order: Yes, then Not yet, then No; highest score first, No rows newest first. Click to return to it.">Answer</th>
+            <th title="The entry reference: the signal price (the close of the MACD cross that ends the second wave), or the lower-timeframe trigger price when that fired first. 1R / 2R / 3R are measured from it; open the row to see them.">Entry</th>
+            <th title="Beyond price extreme B by 0.25 ATR, and the distance to it from the entry as a percentage. Price trading through it means the divergence has failed.">Stop</th>
+            <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. On OKX it covers all of the coin's contracts, not just this one. Click to sort, biggest build-up first.">7d OI</th>
+          </tr></thead>
+          <tbody id="resB"></tbody>
+        </table>
+        <button class="fold" id="fold" aria-expanded="false" style="display:none"></button>
       </div>
+      <p class="note">Click a row for its chart, targets, tags and the full checklist. Each row shows two tags at most; the rest are inside.</p>
+      <div id="scan-audit" class="audit"></div>
     </div>
-    <div id="scan-age" class="audit" style="margin:8px 16px 0"></div>
-    <div id="scan-audit" class="audit" style="margin:4px 16px 8px"></div>
-    <div class="tw">
-      <div class="empty" id="emS">
-        <span class="empty-icon">&#9672;</span><span>Run a scan to find divergences</span>
-      </div>
-      <table id="resT" style="display:none">
-        <thead><tr>
-          <th>Pair</th>
-          <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Default order: Yes, then Not yet, then No; highest score first, No rows newest first.">Good to enter? &#8595;</th>
-          <th title="Regular bullish: across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. Regular bearish is the mirror on two peaks. The tags show which timeframes diverge; the highlighted one supplies the answer and the levels.">Side &middot; TF</th>
-          <th title="Quality score 0-100 and its grade: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
-          <th title="WITH TREND: the BTC 4H state (BULL or BEAR) and this coin's 200 EMA both agree with the side. CHOP: BTC is neither BULL nor BEAR; a reversal keeps the normal cutoff. COUNTER TREND (also when BTC data is missing) needs grade A to answer Yes. Below it: what price has done since the signal bar.">Regime &middot; Status</th>
-          <th class="sortable" data-sort="age" title="The signal bar is the MACD cross that ends the second wave. Shown: its closing price, and the bar's time as a chart labels it (the bar's open).">Signal</th>
-          <th title="Beyond price extreme B by 0.25 ATR. Price trading through it means the divergence has failed.">Stop</th>
-          <th title="Multiples of the distance from the entry reference to the stop. The entry reference is the signal price, or the lower-timeframe trigger price when that fired first. The structure target is the price at the top of the bump between A and B.">Targets (1R / 2R / 3R)</th>
-          <th title="Times of the price extremes inside wave A and wave B.">A &rarr; B</th>
-          <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. On OKX it covers all of the coin's contracts, not just this one. Click to sort, biggest build-up first.">7d OI</th>
-          <th title="Pattern tags first (TRIPLE, W-PATTERN, LTF TRIGGER, 15M TRIGGER, ZERO-LINE CROSS): TRIPLE is worth 8 score points and a trigger (LTF, or 15M on a 4H signal) is what allows Yes (early). PARTIAL DATA means some score context could not be checked. Then MACRO (a calendar print within 24h that the answer does not name), the daily-movers and open-interest tags, which are context only and never change the answer. Hover a tag for its definition, or open the Tags page for the full list.">Tags</th>
-        </tr></thead>
-        <tbody id="resB"></tbody>
-      </table>
-    </div>
-  </main>
+  </section>
+  <div class="cal-strip" id="dash-cal" style="display:none"></div>
 </div>
 
 <div id="pg-movers" class="page">
   <div class="sig-hdr">
     <div><div class="sig-ttl">Movers &mdash; daily watchlist</div>
-    <div class="sig-sub" id="mv-sub">Unusual volume, unusual range, or a big day &mdash; measured on completed daily bars. Crypto perps only. Uses the Scan tab's volume floor, speed and max-pairs.</div></div>
+    <div class="sig-sub" id="mv-sub">Unusual volume, unusual range, or a big day &mdash; measured on completed daily bars. Crypto perps only. Uses the volume floor, speed and max pairs from Scan settings on the Scan page.</div></div>
   </div>
   <div class="wbar">
     <select id="mvExchange"><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
@@ -3337,8 +3374,8 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     <button class="sig-ftab" data-mf="hi" onclick="setMF(this)">At range high</button>
     <button class="sig-ftab" data-mf="lo" onclick="setMF(this)">At range low</button>
   </div>
-  <div id="mv-audit" class="audit" style="margin:0 0 12px"></div>
-  <div class="tw" style="overflow:visible">
+  <div id="mv-audit" class="audit"></div>
+  <div class="tw">
     <table id="mvT" style="display:none">
       <thead><tr>
         <th>#</th><th>Coin</th>
@@ -3363,7 +3400,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   </div>
   <div class="cal-next" id="cal-next"><span class="cal-next-meta">Loading calendar...</span></div>
   <div class="wbar">
-    <div class="sig-filters" style="margin:0">
+    <div class="sig-filters">
       <button class="sig-ftab active" data-cf="movers" onclick="setCF(this)" title="Only the curated list: CPI, PCE, PPI, the jobs report, FOMC, Powell, GDP, retail sales, ISM, and the BoJ / ECB / BoE rate decisions.">Market movers</button>
       <button class="sig-ftab" data-cf="high" onclick="setCF(this)" title="Everything ForexFactory rates High impact, all currencies.">All high-impact</button>
     </div>
@@ -3372,7 +3409,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     <a class="cal-out" style="margin-left:auto" href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener"
        title="Open ForexFactory's calendar in a new tab. The feed carries no actual values, so this is where you check what a print came in at.">ForexFactory &#8599;</a>
   </div>
-  <div id="cal-audit" class="audit" style="margin:0 0 12px"></div>
+  <div id="cal-audit" class="audit"></div>
   <div class="cal-grid" id="cal-grid"></div>
   <div class="dash-sec">
     <div class="cal-day-hdr">
@@ -3380,7 +3417,7 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <a class="cal-out" id="cal-ff-day" href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener"
          title="Open this day on ForexFactory, where the actual values appear once a print lands.">Open this day on ForexFactory &#8599;</a>
     </div>
-    <div class="tw" style="overflow:visible">
+    <div class="tw">
       <table id="calT" style="display:none">
         <thead><tr>
           <th>Time</th><th>Cur</th><th>Event</th><th>Impact</th><th>Forecast</th><th>Previous</th><th>Actual</th>
@@ -3392,12 +3429,13 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   </div>
 </div>
 
-<div id="pg-tags" class="page" style="overflow-y:auto;padding:24px">
+<div id="pg-tags" class="page">
   <div class="dash-sec">
     <div class="dash-sec-ttl">What every tag means</div>
-    <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
-      Each tag as it appears in the table, with the same wording as its hover text. The regime tags
-      set the grade the answer needs (COUNTER TREND needs A), TRIPLE and PARTIAL DATA change the
+    <div class="prose">
+      Each tag as it appears on the Scan page, with the same wording as its hover text. A row shows
+      two of its tags and +N; open the row for all of them, and for the regime, which sits in its
+      Setup list. The regime tags set the grade the answer needs (COUNTER TREND needs A), TRIPLE and PARTIAL DATA change the
       score, and LTF / 15M TRIGGER allow Yes (early); every other tag, MACRO included, is context
       for you to weigh.
     </div>
@@ -3405,12 +3443,12 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
   <div id="tagsBody"></div>
 </div>
 
-<div id="pg-learn" class="page" style="overflow-y:auto;padding:24px">
+<div id="pg-learn" class="page">
   <div class="dash-sec">
     <div class="dash-sec-ttl">What this screener looks for</div>
-    <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75;margin-bottom:18px">
+    <div class="prose">
       Regular divergence only &mdash; price and momentum disagreeing at a trend extreme, which is the
-      classic <b style="color:var(--tx)">reversal</b> signature. Hidden (continuation) divergences are
+      classic <b>reversal</b> signature. Hidden (continuation) divergences are
       not scanned. It is read the way you would on a chart: the MACD/signal crossovers split the MACD line into waves, each wave below the signal line is one trough, and two neighbouring troughs A and B are compared with the price lows inside those same waves. Price lower, MACD trough higher: that mismatch is the whole signal.
     </div>
   </div>
@@ -3463,10 +3501,10 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     </div>
   </div>
 
-  <div class="dash-sec" style="margin-top:28px">
+  <div class="dash-sec">
     <div class="dash-sec-ttl">The rules a signal has to pass (Balanced)</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so two scans inside the same bar agree. The one exception is a row marked &ldquo;bar still forming&rdquo;: it is provisional and can disappear.</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so two scans inside the same bar agree. The one exception is a row whose signal bar is still forming (its answer and its opened row say so): it is provisional and can disappear.</div></div>
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Waves come from the crossovers.</b> A bear wave runs from a bearish MACD/signal cross to the next bullish cross, a bull wave the other way. A cross only counts if the two lines separate by 5% of the recent MACD range within 3 bars, and a wave shorter than 3 bars is merged into its neighbours, so a tiny double dot cannot split one trough into two.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One trough per wave.</b> The MACD trough is the lowest MACD-line value in the wave. The price low is the lowest wick from the start of the wave to 2 bars after it ends, because price often bottoms just after momentum turns.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>A then B, with a real bump between.</b> Two neighbouring troughs, 8 to 80 bars apart. The MACD peak between them must rise at least 25% of the leg's MACD range above the higher trough: that is the middle of the W.</div></div>
@@ -3477,19 +3515,19 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
     </div>
   </div>
 
-  <div class="dash-sec" style="margin-top:28px">
-    <div class="dash-sec-ttl">Good to enter? &mdash; a checklist, not a prediction</div>
+  <div class="dash-sec">
+    <div class="dash-sec-ttl">The answer &mdash; a checklist, not a prediction</div>
     <div class="rules">
       <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar (counted to the last completed bar, not the clock), or the grade is C.</div></div>
       <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment rate, FOMC rate / statement / press conference, Fed Chair speech or testimony) due within 12 hours for a 4H signal or 4 hours for a 1H signal, or printed in the last hour, or a signal bar that has not closed and has no lower-timeframe trigger. BoJ / ECB / BoE rate decisions and the rest of the market movers never block; one due within 24 hours shows as a MACRO tag, and so does a USD print above that the answer does not name (e.g. CPI in 6 hours on a 1H row).</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
-      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both tags and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the highlighted tag shows which. Click a row for each timeframe's levels and its chart.</div></div>
+      <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run. The brief on top of the Scan page is built from the same rows: BTC's state and the nearest USD print come from the scan, and only the print's countdown keeps running.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open a row for each timeframe's levels and its chart.</div></div>
     </div>
   </div>
 
-  <div class="dash-sec" style="margin-top:28px">
+  <div class="dash-sec">
     <div class="dash-sec-ttl">Context tags &mdash; what else is true about this coin</div>
     <div class="rules">
       <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Movers and OI-flow tags never change the answer.</b> They are fetched only for coins that already have a divergence, and they are yours to weigh. The grade does use some of the same data: the higher timeframe's MACD and the change in open interest into B are score components.</div></div>
@@ -3514,9 +3552,9 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
 
   <div class="dash-sec">
     <div class="dash-sec-ttl">Quality score and grade</div>
-    <div style="font-size:12px;color:var(--tx2);max-width:700px;line-height:1.75">
-      0 to 100, graded <b style="color:var(--tx)">A</b> (70+), <b style="color:var(--tx)">B</b> (55-69) or
-      <b style="color:var(--tx)">C</b> (below 55). Pattern points, up to 70: the price difference A to B in ATR
+    <div class="prose">
+      0 to 100, graded <b>A</b> (70+), <b>B</b> (55-69) or
+      <b>C</b> (below 55). Pattern points, up to 70: the price difference A to B in ATR
       (12), the MACD trough improvement (12), the height of the bump (8), both troughs on the classic side of
       zero (10), volume drying up in wave B (10), a rejection wick at B (10), a triple divergence (8). Context
       points, 10 each: the higher timeframe's MACD agreeing, open interest falling into B with funding not
@@ -3525,10 +3563,10 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
       <br><br>
       A context item the data cannot check (no higher-timeframe candles, no OI history or funding, no BTC
       candles) is left out rather than scored as a miss: the score is what was earned out of what could be
-      checked, scaled to 100, and the signal is tagged <b style="color:var(--tx)">PARTIAL DATA</b>.
+      checked, scaled to 100, and the signal is tagged <b>PARTIAL DATA</b>.
       <br><br>
       The grade describes the setup. It is not a win rate. To see how each grade and regime has actually done on
-      the stored candles, run <b style="color:var(--tx)">python macd_divergence_screener_v5.py --backtest</b>.
+      the stored candles, run <b>python macd_divergence_screener_v5.py --backtest</b>.
     </div>
   </div>
 </div>
@@ -3538,26 +3576,13 @@ tr.det img.chart{display:block;width:100%;max-width:900px;margin:8px 0;border:1p
 <script>
 var TFM = __TF_CFG_JSON__;
 
-var SC = {
-  active:      {lbl:'At the signal'},
-  extended:    {lbl:'Extended'},
-  ran:         {lbl:'Ran'},
-  invalidated: {lbl:'Invalidated'}
-};
+var SC = {active:'at the signal', extended:'extended', ran:'ran', invalidated:'invalidated'};
 
-function qcolor(q){ return q >= 70 ? 'var(--bull)' : q >= 50 ? 'var(--fresh)' : 'var(--tx3)'; }
 function qcell(q){
-  var c = qcolor(q), lbl = q >= 70 ? 'HIGH' : q >= 50 ? 'MED' : 'LOW';
-  return '<div class="qc"><span class="qnum" style="color:' + c + '">' + q +
-    '<span style="font-size:9px;opacity:.7;margin-left:3px">' + lbl + '</span></span>' +
-    '<div class="qbar"><div class="qfill" style="width:' + q + '%;background:' + c + '"></div></div></div>';
+  return '<div class="qc"><span class="num">' + q + ' <span class="lo">' + (q >= 70 ? 'HIGH' : q >= 50 ? 'MED' : 'LOW') +
+    '</span></span><div class="qbar"><div class="qfill" style="width:' + q + '%"></div></div></div>';
 }
-function gradeCell(p){
-  var c = p.grade === 'A' ? 'var(--bull)' : p.grade === 'B' ? 'var(--fresh)' : 'var(--tx3)';
-  return '<div class="qc"><span class="qnum" style="color:' + c + '">' + p.grade +
-    '<span style="font-size:9px;opacity:.7;margin-left:3px">' + p.score + '</span></span>' +
-    '<div class="qbar"><div class="qfill" style="width:' + p.score + '%;background:' + c + '"></div></div></div>';
-}
+function gradeCell(p){ return '<span class="num">' + p.grade + ' ' + p.score + '</span>'; }
 // Sub-cent tokens round to values like 9.8e-06, and JS stringifies anything
 // below 1e-6 with an exponent — an unusable price level. Force plain digits.
 function fmtPx(v){
@@ -3579,14 +3604,12 @@ function b2t(bars, tf){
   return d + (d === 1 ? ' day' : ' days') + ' ago';
 }
 
-var EV = {
-  enter: {lbl:'&#10003; YES',     cls:'ev-enter'},
-  wait:  {lbl:'&#9203; NOT YET', cls:'ev-wait'},
-  skip:  {lbl:'&#10005; NO',     cls:'ev-skip'}
-};
+var ANS = {enter:'Yes', wait:'Not yet', skip:'No'};
 var EV_RANK = {enter:0, wait:1, skip:2};
 function verdict(r){ return (r.entry && r.entry.verdict) || 'skip'; }
-function primary(r){ return r.signals[r.primary_tf || r.tfs[0]]; }
+function primaryTf(r){ return r.primary_tf || r.tfs[0]; }
+function primary(r){ return r.signals[primaryTf(r)]; }
+function rowKey(r){ return r.pair + '|' + r.side; }
 
 function matches(r, f){
   var v = verdict(r);
@@ -3598,35 +3621,32 @@ function matches(r, f){
   if(f === 'both')  return r.tfs.length > 1 && v !== 'skip';
   return true;
 }
-function evCell(r){
-  var e = r.entry || {verdict:'skip', reason:''}, c = EV[e.verdict] || EV.skip;
-  /* the reason can carry a calendar event title from an outside feed */
-  var txt = calEsc(e.reason) + (e.level != null ? ' ' + fmtPx(e.level) : '');
-  return '<div class="ev ' + c.cls + '"><span class="tlbl">' + c.lbl + '</span>' +
-         '<span class="tsub">' + txt + '</span></div>';
+/* The full reason. It can carry a calendar event title from an outside feed. */
+function reason(r){
+  var e = r.entry || {};
+  return calEsc(e.reason) + (e.level != null ? ' ' + fmtPx(e.level) : '');
 }
-function ctxCell(r){
-  var h = [];
-  (primary(r).tags || []).forEach(function(f){
-    h.push('<span class="wflag wf-hioi"' + tip(f) + '>' + f + '</span>');
-  });
-  (r.venue_tags || []).forEach(function(f){
-    h.push('<span class="wflag wf-hioi"' + tip(f.indexOf('ALSO ON') === 0 ? 'ALSO ON' : f) + '>' + f + '</span>');
-  });
-  /* the title comes from an outside calendar feed */
-  if(r.macro) h.push('<span class="wflag wf-hioi"' + tip('MACRO') + '>' + calEsc(r.macro) + '</span>');
-  if(r.context_error) h.push('<span class="ptm" title="' + calEsc(r.context_error) + '">context unavailable</span>');
-  ((r.mover || {}).flags || []).forEach(function(f){
-    h.push('<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
-  });
+/* Its first sentence, without the leading Yes / Not yet / No the pill already says. */
+function shortWhy(r){ return reason(r).replace(/^(No|Not yet|Yes[^.]*)\.\s*/, '').split('. ')[0].replace(/\.$/, ''); }
+function ansPill(r){ var v = verdict(r); return '<span class="ans ' + v + '">' + ANS[v] + '</span>'; }
+function evCell(r){ return ansPill(r) + '<span class="sub">' + shortWhy(r) + '</span>'; }
+function sideHtml(r){
+  var s = r.side === 'bullish' ? 'long' : 'short';
+  return '<span class="side-' + s + '">' + s + '</span>' + r.tfs.map(function(t){
+    return '<span class="tf' + (t === primaryTf(r) ? ' on' : '') + '">' + tfLabel(t) + '</span>'; }).join('');
+}
+function tag(k, txt){ return '<span class="tag"' + tip(k) + '>' + (txt || k) + '</span>'; }
+/* Every tag of a row, pattern tags first. The Coin cell shows two; the opened row shows all. */
+function tagChips(r){
+  var h = (primary(r).tags || []).map(function(f){ return tag(f); });
+  (r.venue_tags || []).forEach(function(f){ h.push(tag(f.indexOf('ALSO ON') === 0 ? 'ALSO ON' : f, f)); });
+  if(r.macro) h.push(tag('MACRO', calEsc(r.macro)));
+  ((r.mover || {}).flags || []).forEach(function(f){ h.push(tag(f)); });
   if(r.flow && r.flow.quadrant){
-    h.push('<span class="' + (WQ[r.flow.quadrant] || {cls:'wq'}).cls + '"' + tip(r.flow.quadrant) + '>' + r.flow.quadrant + '</span>');
-    (r.flow.flags || []).forEach(function(f){
-      h.push('<span class="wflag ' + (WFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>');
-    });
+    h.push(tag(r.flow.quadrant));
+    (r.flow.flags || []).forEach(function(f){ h.push(tag(f)); });
   }
-  return h.length ? '<div style="display:flex;flex-wrap:wrap;gap:4px;max-width:260px">' + h.join('') + '</div>'
-                  : '<span class="ptm">&mdash;</span>';
+  return h;
 }
 function tfLabel(tf){ return (TFM[tf] && TFM[tf].label) || tf.toUpperCase(); }
 
@@ -3665,15 +3685,6 @@ document.querySelectorAll('.nav-btn').forEach(function(b){
   b.addEventListener('click', function(){ showPg(b.dataset.pg); });
 });
 
-/* ── OI flow tags ─────────────────────────────────────────────────────────── */
-var WQ = {
-  'NEW LONGS':      {cls:'bdg bb'},
-  'NEW SHORTS':     {cls:'bdg br'},
-  'SHORT COVERING': {cls:'wq wq-sc'},
-  'CAPITULATION':   {cls:'wq wq-cap'}
-};
-var WFLAG = {'SPOT-LED':'wf-spot','CROWDED LONGS':'wf-crowd','SQUEEZE FUEL':'wf-squeeze','HIGH OI/VOL':'wf-hioi'};
-
 var TH = {chg:__MOVER_CHG__, vol:__MOVER_VOL__, rng:__MOVER_RNG__, edge:__MOVER_EDGE__, thinM:__MOVER_THIN_M__,
           oiVol:__OI_VOL__, fundSpot:__FUND_SPOT__, fundCrowd:__FUND_CROWD__, fundSqueeze:__FUND_SQUEEZE__};
 var TIP = {
@@ -3697,21 +3708,16 @@ var TIP = {
   'LTF TRIGGER':     'The lower timeframe (1H for a 4H signal, 15m for a 1H signal) has crossed its MACD and closed beyond its last swing since B.',
   '15M TRIGGER':     '4H signals only: the 15m chart has crossed its MACD and closed beyond its last swing since B, within 8 hours of the 4H close. Your actual entry moment; the trigger price is whichever trigger (1H or 15m) closed first.',
   'MACRO':           'A calendar print due within 24 hours that this row\'s answer does not name: a curated market mover that never blocks (BoJ / ECB / BoE rates, GDP, retail sales, ISM, FOMC minutes, ...), or a USD print that can block (CPI, PCE, PPI, jobs, FOMC rate, Fed Chair) but is outside this timeframe\'s wait window (12h on 4H, 4h on 1H) or the answer is already No / Not yet for another reason. The sooner one is shown. Context only.',
-  '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags above are exactly that combination. n/a = too little OI history. On OKX it covers all of the coin\'s contracts, not just this one.',
+  '7d OI':           'Change in the coin\'s open interest over the last 7 days. Rising = positions being opened, falling = positions being closed. Read it with price: the four positioning tags below are exactly that combination. n/a = too little OI history. On OKX it covers all of the coin\'s contracts, not just this one.',
   'ZERO-LINE CROSS': 'The MACD line has already crossed zero since the signal bar.',
   'WITH TREND':      'The BTC 4H state agrees with the signal (BULL: RSI above 55 and close above its 200 EMA; BEAR: RSI below 45 and close below it) and so does the coin\'s own 200 EMA. Grade B is enough for Yes.',
   'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
   'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
   'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100.',
-  'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is shown under the pair name).',
+  'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is Data from in the opened row).',
   'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
-
-/* ── Movers tags ──────────────────────────────────────────────────────────── */
-var MFLAG = {'VOLUME SPIKE':'mf-vol','RANGE EXPANSION':'mf-rng','BIG MOVE':'mf-move',
-             'AT RANGE HIGH':'mf-hi','ABOVE 7D HIGH':'mf-hi',
-             'AT RANGE LOW':'mf-lo','BELOW 7D LOW':'mf-lo'};
 
 /* ── Tags page: built from TIP so it cannot drift from the hover text ─────── */
 var TAG_GROUPS = [
@@ -3724,22 +3730,16 @@ var TAG_GROUPS = [
   ['Open interest: funding and crowding', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
   ['Daily movers (the last completed day)', ['VOLUME SPIKE','RANGE EXPANSION','BIG MOVE','AT RANGE HIGH','ABOVE 7D HIGH','AT RANGE LOW','BELOW 7D LOW']]
 ];
-function tagChip(k){
-  var cls = WQ[k] ? WQ[k].cls : 'wflag ' + (MFLAG[k] || WFLAG[k] || 'wf-hioi');
-  return '<span class="' + cls + '">' + k + '</span>';
-}
 document.getElementById('tagsBody').innerHTML = TAG_GROUPS.map(function(g){
-  return '<div class="dash-sec" style="margin-top:28px"><div class="dash-sec-ttl">' + g[0] + '</div><div class="rules">' +
+  return '<div class="dash-sec"><div class="dash-sec-ttl">' + g[0] + '</div><div class="rules">' +
     g[1].map(function(k){
-      return '<div class="rule"><div style="flex-shrink:0;width:150px">' + tagChip(k) + '</div><div class="rule-b">' + TIP[k] + '</div></div>';
+      return '<div class="rule"><div class="rule-k">' + tag(k) + '</div><div class="rule-b">' + TIP[k] + '</div></div>';
     }).join('') + '</div></div>';
 }).join('');
 function oiVal(r){ return r.flow && r.flow.oi_chg_pct != null ? r.flow.oi_chg_pct : null; }
 function oiCell(r){
   var v = oiVal(r);
-  if(v == null) return '<span class="ptm">n/a</span>';
-  return '<span style="font-family:var(--mono);font-size:11px;color:' +
-    (v >= 5 ? 'var(--bull)' : v <= -5 ? 'var(--bear)' : 'var(--tx3)') + '">' + (v > 0 ? '+' : '') + v + '%</span>';
+  return v == null ? 'n/a' : (v > 0 ? '+' : '') + v + '%';
 }
 
 function fmtPct(v){
@@ -3783,26 +3783,22 @@ function moversAudit(m){
   return txt;
 }
 function mvRow(r, i, thin){
-  var flags = (r.flags || []).map(function(f){
-    return '<span class="wflag ' + (MFLAG[f] || 'wf-hioi') + '"' + tip(f) + '>' + f + '</span>';
-  }).join('') || '<span style="color:var(--tx3)">&mdash;</span>';
-  var up  = r.chg_1d_pct >= 0;
-  var big = Math.abs(r.chg_1d_pct || 0) >= TH.chg;
-  var badge = thin ? '<div><span class="thin-badge" title="Below the volume floor. Thin book: expect worse fills and slippage through stops. Size down.">THIN &middot; ' +
-                     fmtVol(r.daily_volume) + '/day</span></div>' : '';
+  var flags = (r.flags || []).map(function(f){ return tag(f); }).join('') || '&mdash;';
+  var hl = function(on){ return on ? 'hl' : 'lo'; };
+  var badge = thin ? '<span class="thin-badge" title="Below the volume floor. Thin book: expect worse fills and slippage through stops. Size down.">THIN &middot; ' +
+                     fmtVol(r.daily_volume) + '/day</span>' : '';
   var tr = document.createElement('tr');
-  tr.className = up ? 'rb' : 'rr';
   tr.innerHTML =
     '<td><span class="mrank' + (!thin && i < 4 ? ' top' : '') + '">' + (i + 1) + '</span></td>' +
-    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">' + fmtPx(r.current_price) + '</span></div>' + badge + '</td>' +
+    '<td><b>' + r.base + '</b><span class="sub num">' + fmtPx(r.current_price) + '</span>' + badge + '</td>' +
     '<td>' + qcell(r.score) + '</td>' +
-    '<td><span style="font-family:var(--mono);font-weight:600;color:' + (big ? 'var(--fresh)' : up ? 'var(--bull)' : 'var(--bear)') + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
-      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">today ' + fmtPct(r.chg_live_pct) + '</div></td>' +
-    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.vol_mult || 0) >= TH.vol ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.vol_mult) + '</span></td>' +
-    '<td><span style="font-family:var(--mono);font-size:12px;color:' + ((r.range_mult || 0) >= TH.rng ? 'var(--fresh)' : 'var(--tx2)') + '">' + fmtX(r.range_mult) + '</span></td>' +
+    '<td class="num"><span class="' + hl(Math.abs(r.chg_1d_pct || 0) >= TH.chg) + '">' + fmtPct(r.chg_1d_pct) + '</span>' +
+      '<span class="sub">today ' + fmtPct(r.chg_live_pct) + '</span></td>' +
+    '<td class="num ' + hl((r.vol_mult || 0) >= TH.vol) + '">' + fmtX(r.vol_mult) + '</td>' +
+    '<td class="num ' + hl((r.range_mult || 0) >= TH.rng) + '">' + fmtX(r.range_mult) + '</td>' +
     '<td><div class="mpos"><i style="left:' + r.pos_in_range + '%"></i></div>' +
-      '<div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:3px">' + r.pos_in_range + '% of range</div></td>' +
-    '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + ' &nbsp;<small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
+      '<span class="sub num">' + r.pos_in_range + '% of range</span></td>' +
+    '<td><div class="mlv"><small>PDH</small> ' + fmtPx(r.pdh) + '</div><div class="mlv"><small>PDL</small> ' + fmtPx(r.pdl) + '</div>' +
       '<div class="mlv"><small>7D</small> ' + fmtPx(r.r_lo) + ' &ndash; ' + fmtPx(r.r_hi) + '</div></td>' +
     '<td>' + flags + '</td>';
   return tr;
@@ -3910,7 +3906,7 @@ function startMovers(){
   };
 }
 
-/* ── Sidebar controls ─────────────────────────────────────────────────────── */
+/* ── Scan settings ─────────────────────────────────────────────────────── */
 var STR_HINTS = {
   balanced: 'Two MACD waves with a real bump between them; the price and MACD differences must clear a minimum size.',
   strict:   'Larger minimum size, and both troughs must sit below the zero line (both peaks above it for bearish).'
@@ -3943,7 +3939,7 @@ function checkUniverse(){
     .then(function(d){
       btn.disabled = false; btn.textContent = 'How many coins pass?';
       if(d.error){ out.textContent = 'Error: ' + d.error; return; }
-      out.innerHTML = '<span style="color:var(--bull)">' + d.passing + '</span> of ' + d.total_perps +
+      out.innerHTML = '<b>' + d.passing + '</b> of ' + d.total_perps +
         ' perps clear this floor on ' + (d.venues || [d.exchange]).join(' / ').toUpperCase() + '.';
     })
     .catch(function(){ btn.disabled = false; btn.textContent = 'How many coins pass?'; out.textContent = 'Failed.'; });
@@ -3951,7 +3947,7 @@ function checkUniverse(){
 
 /* ── Scanner ──────────────────────────────────────────────────────────────── */
 var cb = 0, cr = 0, cf = 0;
-function bump(el, v){ el.textContent = v; el.classList.remove('bmp'); void el.offsetWidth; el.classList.add('bmp'); }
+function bump(el, v){ el.textContent = v; }
 function updStats(side, isEnter){
   if(side === 'bullish'){ cb++; bump(document.getElementById('cBull'), cb); document.getElementById('stBull').classList.add('vis'); }
   else { cr++; bump(document.getElementById('cBear'), cr); document.getElementById('stBear').classList.add('vis'); }
@@ -3964,10 +3960,14 @@ function resetStats(){
 }
 
 var af = 'all', sortKey = 'score', pendR = [], hasScanned = false, seenSig = {};
+function setTab(f){
+  af = f;
+  document.querySelectorAll('.ftab').forEach(function(b){ b.classList.toggle('active', b.dataset.f === f); });
+}
 function setF(btn){
-  document.querySelectorAll('.ftab').forEach(function(b){ b.classList.remove('active'); });
-  btn.classList.add('active'); af = btn.dataset.f;
-  if(hasScanned) renderAll(pendR);   // before a scan, leave the welcome panel alone
+  setTab(btn.dataset.f);
+  showNo = af === 'all';             // picking All asks for the No rows too
+  if(hasScanned) renderAll(pendR);   // before a scan, leave the welcome alone
 }
 document.querySelectorAll('th.sortable').forEach(function(th){
   th.addEventListener('click', function(){
@@ -4014,7 +4014,7 @@ function pushLog(msg, cls){
   c.querySelectorAll('.lcard').forEach(function(x){ x.classList.remove('in','dn','er'); x.classList.add('ol'); });
   var d = document.createElement('div');
   d.className = 'lcard ' + cls + ' ce';
-  d.innerHTML = '<div style="flex:1;min-width:0"><div class="lcard-m">' + msg + '</div><div class="lcard-t">' + t + '</div></div>';
+  d.innerHTML = '<span class="lcard-m">' + msg + '</span><span class="lcard-t">' + t + '</span>';
   c.insertBefore(d, c.firstChild);
   requestAnimationFrame(function(){ requestAnimationFrame(function(){ d.classList.remove('ce'); }); });
   var all = c.querySelectorAll('.lcard');
@@ -4028,7 +4028,6 @@ function pushLog(msg, cls){
 function showLoader(){
   setRing(0, '');
   document.getElementById('lpair').textContent = 'Loading markets...';
-  document.getElementById('rfill').classList.remove('done');
   document.getElementById('sl').classList.add('vis');
   document.getElementById('sl').classList.remove('diss');
 }
@@ -4056,96 +4055,194 @@ function pushBg(pair, isHit){
 }
 function resetBg(){ var f = document.getElementById('sbgFeed'); if(f) f.innerHTML = ''; }
 
-function tgtHtml(d){
-  var tgt = d.targets || {}, trig = d.targets_from === 'trigger';
-  return '<div style="font-family:var(--mono);font-size:8px;color:' + (trig ? 'var(--fresh)' : 'var(--tx3)') + ';margin-bottom:2px">' +
-    (trig ? 'FROM TRIGGER PRICE ' + fmtPx(d.entry_ref_price) : 'FROM SIGNAL PRICE') + '</div>' +
-    '<span style="color:var(--tx3)">' + fmtPx(tgt['1r']) + '</span>' +
-    ' <span style="color:var(--tx3)">/</span> <span style="color:var(--tx2)">' + fmtPx(tgt['2r']) + '</span>' +
-    ' <span style="color:var(--tx3)">/</span> <span style="color:var(--bull);font-weight:600">' + fmtPx(tgt['3r']) + '</span>' +
-    '<div style="font-size:8px;color:var(--tx3);margin-top:2px">structure ' + fmtPx(tgt.structure) + '</div>';
+function kv(k, v){ return '<dt>' + k + '</dt><dd>' + v + '</dd>'; }
+/* One line per rule of the answer, for the primary timeframe: [class, text] with
+   '' = passed, 'w' = waiting on it, 'x' = failed. The answer itself comes from the scan. */
+function checks(r){
+  var p = primary(r), tf = primaryTf(r), cfg = TFM[tf] || {}, a = [];
+  var bars = p.bars_ago + ' completed ' + tfLabel(tf) + ' bar' + (p.bars_ago === 1 ? '' : 's') +
+             ' since the signal (limit ' + cfg.fresh_h * 60 / cfg.minutes + ')';
+  a.push(p.forming ? (p.trigger_first ? ['', 'Signal bar still forming, lower timeframe already triggered']
+                                      : ['w', 'Signal bar still forming, no lower-timeframe trigger yet'])
+                   : [p.fresh ? '' : 'x', bars]);
+  a.push(p.grade === 'C' ? ['x', 'Grade C (' + p.score + ') is too weak'] : ['', 'Grade ' + p.grade + ' (' + p.score + ')']);
+  a.push(p.regime === 'COUNTER TREND' && p.grade !== 'A' ? ['w', 'Counter trend needs grade A']
+       : ['', p.regime.charAt(0) + p.regime.slice(1).toLowerCase()]);
+  a.push(p.status === 'invalidated' ? ['x', 'Price traded through the stop']
+       : p.status === 'ran' ? ['x', 'Already ran ' + p.r_reached + 'R']
+       : p.status === 'extended' ? ['w', 'Price has moved ' + p.pct_chg + '% away from the signal']
+       : ['', 'Price still near the signal']);
+  var b = scanMeta.blocker;          /* undefined: a scan saved before the brief existed */
+  if(b === null) a.push(['', 'No major US release on the calendar']);
+  else if(b && scanTs){
+    var h = (b.ts_ms - scanTs) / 3600000;
+    a.push(h >= -1 && h <= cfg.macro_h
+      ? ['w', calEsc(b.title) + (h > 0 ? ' was ' + calUntil(h * 3600000) + ' away at the scan' : ' had just printed at the scan')]
+      : ['', 'No US release inside the ' + cfg.macro_h + 'h wait window at the scan']);
+  }
+  return a;
+}
+/* One block per diverging timeframe: chart, levels and setup, then the answer's
+   checklist and the tags on the timeframe that supplies the answer. */
+function tfBlock(r, tf){
+  var s = r.signals[tf], t = s.targets || {}, main = tf === primaryTf(r), trig = s.targets_from === 'trigger';
+  var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf;
+  return '<div class="dgrid">' +
+    '<div><a href="' + src + '" target="_blank" rel="noopener" title="Open the chart full size"><img class="chart" loading="lazy" alt="' +
+      r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + '"></a></div>' +
+    '<div><span class="lbl">' + tfLabel(tf) + ' levels</span><dl class="kv num">' +
+      kv('Now', fmtPx(r.current_price)) +
+      kv('Entry', fmtPx(s.entry_ref_price) + (trig ? ' (trigger price)' : ' (signal price)')) +
+      (s.trigger_price != null && !trig ? kv('Trigger', fmtPx(s.trigger_price)) : '') +
+      kv('Stop', fmtPx(s.stop_price) + ' (' + s.risk_pct + '%)') +
+      kv('1R', fmtPx(t['1r'])) + kv('2R', fmtPx(t['2r'])) + kv('3R', fmtPx(t['3r'])) +
+      kv('Structure', fmtPx(t.structure)) + '</dl>' +
+      '<span class="lbl">Setup</span><dl class="kv">' +
+      kv('A', s.pivot1_time + ' @ ' + fmtPx(s.pivot1_price)) +
+      kv('B', s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price)) +
+      kv('Signal', (s.forming ? 'bar still forming' : s.signal_time + ' (' + b2t(s.bars_ago, tf) + ')') + ' @ ' + fmtPx(s.signal_price)) +
+      kv('Regime', '<span' + tip(s.regime) + '>' + s.regime + '</span> &middot; ' + (SC[s.status] || SC.active) +
+        ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)') +
+      kv('Data from', (r.exchange || '').toUpperCase() + ' &middot; ' + fmtVol(r.weekly_volume) + ' / week') +
+      kv('Timeframes', r.tfs.map(tfLabel).join(' + ')) + '</dl></div>' +
+    '<div>' + (main
+      ? '<span class="lbl">Why this answer</span><ul class="chk">' +
+        checks(r).map(function(c){ return '<li class="' + c[0] + '">' + c[1] + '</li>'; }).join('') + '</ul>' +
+        '<p class="full">' + reason(r) + '</p>'
+      : '<span class="lbl">' + tfLabel(tf) + ' also diverges</span><p class="full">Grade ' + s.grade + ' (' + s.score +
+        '). The answer comes from ' + tfLabel(primaryTf(r)) + '.</p>') +
+      '<span class="lbl">Score inputs</span><dl class="kv">' +
+      kv('MACD A to B', s.pivot1_macd + ' &rarr; ' + s.pivot2_macd) +
+      kv('Higher TF', s.htf_ok == null ? 'n/a' : s.htf_ok ? 'agrees' : 'no') +
+      kv('OI into B', s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
+      kv('BTC', s.btc_state || 'n/a') +
+      kv('Volume', s.vol_dry ? 'drying' : 'not drying') +
+      kv('Wick', s.wick ? 'yes' : 'no') + (s.triple ? kv('Triple', 'yes') : '') +
+      (s.partial ? kv('Score', 'partial data') : '') + '</dl>' +
+      (main ? '<span class="lbl">All tags</span><div>' + (tagChips(r).join('') || '<span class="calm">None</span>') +
+              (r.context_error ? '<span class="calm" title="' + calEsc(r.context_error) + '"> Movers and OI context unavailable.</span>' : '') + '</div>' : '') +
+    '</div></div>';
 }
 function detailRow(r){
-  var tr = document.createElement('tr');
-  tr.className = 'det';
-  var h = r.tfs.map(function(tf){
-    var s = r.signals[tf], c = SC[s.status] || SC.active;
-    return '<div><b>' + tfLabel(tf) + '</b> &nbsp;A ' + s.pivot1_time + ' @ ' + fmtPx(s.pivot1_price) +
-      ' &rarr; B ' + s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price) +
-      ' &nbsp;&middot;&nbsp; MACD ' + s.pivot1_macd + ' &rarr; ' + s.pivot2_macd +
-      ' &nbsp;&middot;&nbsp; grade ' + s.grade + ' (' + s.score + ') &middot; ' + s.regime +
-      (s.partial ? ' (partial data)' : '') +
-      ' &nbsp;&middot;&nbsp; HTF ' + (s.htf_ok == null ? 'n/a' : s.htf_ok ? 'agrees' : 'no') + ', OI ' + (s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
-      ', BTC ' + (s.btc_state || 'n/a') +
-      ', volume ' + (s.vol_dry ? 'drying' : 'not drying') + ', wick ' + (s.wick ? 'yes' : 'no') + (s.triple ? ', triple' : '') +
-      ' &nbsp;&middot;&nbsp; ' + c.lbl + ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)' +
-      (s.trigger_price != null ? ' &nbsp;&middot;&nbsp; lower-timeframe trigger at ' + fmtPx(s.trigger_price) : '') +
-      ' &nbsp;&middot;&nbsp; stop ' + fmtPx(s.stop_price) + ' (risk ' + s.risk_pct + '%)' +
-      ' &nbsp;&middot;&nbsp; 1R ' + fmtPx((s.targets || {})['1r']) + ' / 2R ' + fmtPx((s.targets || {})['2r']) +
-      ' / 3R ' + fmtPx((s.targets || {})['3r']) + '</div>' +
-      '<img class="chart" loading="lazy" alt="Chart needs a fresh scan" src="/chart?pair=' +
-      encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '">';
-  }).join('');
-  tr.innerHTML = '<td colspan="11"><div>Weekly volume ' + fmtVol(r.weekly_volume) + ' (7 days)</div>' + h + '</td>';
-  return tr;
+  var tfs = [primaryTf(r)].concat(r.tfs.filter(function(t){ return t !== primaryTf(r); }));
+  return '<tr class="det"><td colspan="7">' + tfs.map(function(tf){ return tfBlock(r, tf); }).join('') + '</td></tr>';
 }
+var openKey = null, showNo = false;
 function buildRow(r){
-  var bull = r.side === 'bullish', p = primary(r), tf = r.primary_tf || r.tfs[0];
-  var tr = document.createElement('tr');
-  tr.className = 'main-row ' + (bull ? 'rb' : 'rr') + (verdict(r) === 'skip' ? ' dim' : '');
-  var tfs = r.tfs.map(function(t){ return '<span class="tfb' + (t === tf ? ' tfb-on' : '') + '">' + tfLabel(t) + '</span>'; }).join('');
-  tr.innerHTML =
-    '<td><div class="pb"><span class="pb-pair">' + r.base + '</span><span class="pb-q">USDT PERP' +
-      (r.exchange ? ' &middot; ' + r.exchange.toUpperCase() : '') + '</span></div></td>' +
-    '<td>' + evCell(r) + '</td>' +
-    '<td><span class="bdg ' + (bull ? 'bb' : 'br') + '">' + (bull ? 'BULLISH' : 'BEARISH') + '</span>' + tfs + '</td>' +
-    '<td>' + gradeCell(p) + '</td>' +
-    '<td><div class="ptm" style="color:var(--tx);font-size:11px">' + p.regime + '</div><div class="ptm">' + (SC[p.status] || SC.active).lbl + '</div></td>' +
-    '<td><span style="font-family:var(--mono);font-size:11px">' + fmtPx(p.signal_price) + '</span><div class="ptm">' +
-      (p.forming ? tfLabel(tf) + ' &middot; bar still forming' : p.signal_time + ' &middot; ' + b2t(p.bars_ago, tf)) + '</div></td>' +
-    '<td><span style="font-family:var(--mono);font-size:11px;color:var(--bear)">' + fmtPx(p.stop_price) + '</span><div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">risk ' + p.risk_pct + '%</div></td>' +
-    '<td style="font-family:var(--mono);font-size:10px">' + tgtHtml(p) + '</td>' +
-    '<td><div class="ptm">A ' + p.pivot1_time + '</div><div class="ptm">B ' + p.pivot2_time + '</div></td>' +
-    '<td>' + oiCell(r) + '</td>' +
-    '<td>' + ctxCell(r) + '</td>';
-  tr.addEventListener('click', function(){
-    var n = tr.nextSibling;
-    if(n && n.className === 'det'){ n.parentNode.removeChild(n); return; }
-    tr.parentNode.insertBefore(detailRow(r), tr.nextSibling);
-  });
-  return tr;
+  var p = primary(r), k = rowKey(r), tags = tagChips(r), more = tags.length - 2;
+  return '<tr class="row" data-k="' + k + '" tabindex="0" aria-expanded="' + (openKey === k) + '">' +
+    '<td class="coin"><b>' + r.base + '</b><span class="sub">' + tags.slice(0, 2).join('') + (more > 0 ? '<span class="tag">+' + more + '</span>' : '') + '</span></td>' +
+    '<td>' + sideHtml(r) + '</td><td>' + gradeCell(p) + '</td><td class="why">' + evCell(r) + '</td>' +
+    '<td class="num">' + fmtPx(p.entry_ref_price) + '</td>' +
+    '<td class="num">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
+    '<td class="num">' + oiCell(r) + '</td></tr>';
 }
-function ageMin(r){ var tf = r.primary_tf || r.tfs[0]; return primary(r).bars_ago * ((TFM[tf] && TFM[tf].minutes) || 240); }
+function ageMin(r){ return primary(r).bars_ago * ((TFM[primaryTf(r)] && TFM[primaryTf(r)].minutes) || 240); }
 
+/* No rows stay folded under the table until asked for: the fold button, or picking All. */
 function renderAll(results){
-  var rows = (results || []).filter(function(d){ return matches(d, af); });
+  results = results || [];
+  var rows = results.filter(function(d){ return matches(d, af); });
   rows.sort(function(a, b){
-    if(sortKey === 'age') return ageMin(a) - ageMin(b);
     if(sortKey === 'oi'){ var x = oiVal(a), y = oiVal(b); return (y == null ? -1e9 : y) - (x == null ? -1e9 : x); }
     return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
            (verdict(a) === 'skip' ? ageMin(a) - ageMin(b) : 0) ||   /* played-out rows: newest first */
            (b.score - a.score);
   });
-  var tb = document.getElementById('resB'); tb.innerHTML = '';
-  var st = rows.length > 1 ? Math.min(60, 800 / rows.length) : 0;
-  rows.forEach(function(d, i){
-    var tr = buildRow(d);
-    tr.style.animationDelay = (i * st).toFixed(0) + 'ms';
-    tb.appendChild(tr);
+  var h = '', no = 0;
+  rows.forEach(function(r){
+    if(verdict(r) === 'skip'){ no++; if(!showNo) return; }
+    h += buildRow(r);
+    if(openKey === rowKey(r)) h += detailRow(r);
   });
-  if(rows.length === 0){
-    document.getElementById('resT').style.display = 'none';
-    var em = document.getElementById('emS');
-    em.style.display = 'flex';
-    var N = (results || []).length;
-    em.innerHTML = '<span class="empty-icon">&#9676;</span><span>' + (N > 0 && af !== 'all'
-      ? 'No live setups right now. ' + N + ' divergence' + (N !== 1 ? 's' : '') + ' found, all played out, stopped or too old: see All.'
-      : 'No divergences match this filter') + '</span>';
-  } else {
-    document.getElementById('emS').style.display = 'none';
-    document.getElementById('resT').style.display = 'table';
-  }
+  if(!h) h = '<tr><td class="none" colspan="7">' + (!results.length ? 'No divergences found.'
+    : af === 'all' ? 'No setup passes or is waiting right now.' : 'No setup matches this filter.') + '</td></tr>';
+  document.getElementById('resB').innerHTML = h;
+  document.getElementById('resWrap').style.display = '';
+  var f = document.getElementById('fold');
+  f.style.display = no ? '' : 'none';
+  f.textContent = showNo ? 'Hide the ' + no + ' that did not pass' : 'Show ' + no + ' that did not pass, newest first';
+  f.setAttribute('aria-expanded', showNo);
 }
+function rowEl(k){
+  return Array.prototype.filter.call(document.querySelectorAll('#resB tr.row'), function(t){ return t.dataset.k === k; })[0];
+}
+function toggleRow(t){
+  var k = t.dataset.k;
+  openKey = openKey === k ? null : k;
+  renderAll(pendR);
+  if(rowEl(k)) rowEl(k).focus({preventScroll:true});
+}
+document.getElementById('resB').addEventListener('click', function(e){
+  var t = e.target.closest('tr.row'); if(t) toggleRow(t);
+});
+document.getElementById('resB').addEventListener('keydown', function(e){
+  if(e.target.matches('tr.row') && (e.key === 'Enter' || e.key === ' ')){ e.preventDefault(); toggleRow(e.target); }
+});
+document.getElementById('fold').addEventListener('click', function(){ showNo = !showNo; renderAll(pendR); });
+
+/* ── The brief: what matters now, in sentences ────────────────────────────── */
+var scanMeta = {};
+/* Market and macro lines. Scans saved before the brief existed have no btc /
+   blocker / macro in their meta: those lines are then left out, not guessed. */
+function briefState(){
+  var m = scanMeta, b = m.btc, now = Date.now(), s = '';
+  if(b){
+    var means = b.state === 'BULL' ? 'Longs are with the trend when the coin is also above its 200 EMA. Shorts are counter trend and need grade A.'
+      : b.state === 'BEAR' ? 'Shorts are with the trend when the coin is also below its 200 EMA. Longs are counter trend and need grade A.'
+      : 'BTC is neither trending up nor down, so reversals keep the normal bar: grade B or better.';
+    s += '<p><b>Market is ' + (b.state === 'CHOP' ? 'in chop' : b.state.toLowerCase()) + '.</b> BTC 4H closed at <span class="num">' + fmtPx(b.close) +
+      '</span>, ' + (b.close > b.ema200 ? 'above' : 'below') + ' its 200 EMA at <span class="num">' + fmtPx(b.ema200) +
+      '</span>, with RSI <span class="num">' + Math.round(b.rsi) + '</span>. ' + means + '</p>';
+  } else if(b === null) s += '<p><b>BTC data is unavailable.</b> Every setup is treated as counter trend.</p>';
+  if(m.blocker){
+    var h = (m.blocker.ts_ms - now) / 3600000, t = calEsc(m.blocker.title);
+    s += h < -1 ? '<p><b>' + t + ' printed ' + calUntil(-h * 3600000) + ' ago.</b> Scan again to pick up the next release.</p>'
+      : '<p><b>' + t + (h > 0 ? ' in ' + calUntil(h * 3600000) : ' printed ' + calUntil(-h * 3600000) + ' ago') + '.</b> ' +
+        (h <= TFM['1h'].macro_h ? 'All entries wait until an hour after it prints.'
+         : h <= TFM['4h'].macro_h ? '4H setups wait until it is out. 1H setups are clear for now.'
+         : 'Far enough away that nothing waits on it yet.') + '</p>';
+  } else if(m.blocker === null) s += '<p><b>No major US release on the calendar.</b> Nothing waits on macro.</p>';
+  if(m.macro && m.macro.ts_ms > now) s += '<p>Also due: ' + calEsc(m.macro.title) + ' in ' + calUntil(m.macro.ts_ms - now) +
+    '. Context only, it never blocks an entry.</p>';
+  document.getElementById('briefState').innerHTML = s;
+}
+function renderBrief(){
+  var R = pendR, byScore = function(a, b){ return b.score - a.score; };
+  var yes = R.filter(function(r){ return verdict(r) === 'enter'; }).sort(byScore);
+  var wait = R.filter(function(r){ return verdict(r) === 'wait'; }).sort(byScore);
+  var hr = new Date().getHours(), hi = hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+  document.getElementById('briefH').textContent = hi + '. ' + (
+    yes.length ? yes.length + (yes.length === 1 ? ' setup passes' : ' setups pass') + ' the checklist; the rest can wait.'
+    : wait.length ? 'Nothing passes yet. ' + wait.length + (wait.length === 1 ? ' setup is' : ' setups are') + ' close.'
+    : 'Nothing passes the checklist right now. No trade is a fine answer.');
+  briefState();
+  var list = yes.length ? yes.slice(0, 3) : wait.length ? wait.slice(0, 2)
+           : R.slice().sort(function(a, b){ return ageMin(a) - ageMin(b); }).slice(0, 3);
+  document.getElementById('briefLbl').textContent = yes.length ? 'Worth a look' : wait.length ? 'Closest to qualifying'
+    : 'Nothing to act on. The three newest signals, and why each is a No';
+  document.getElementById('picks').innerHTML = list.map(function(r){
+    var p = primary(r);
+    return '<button class="pick" data-k="' + rowKey(r) + '"><span class="head"><span class="coin">' + r.base + '</span><span>' + sideHtml(r) +
+      '</span><span class="num gr">' + p.grade + ' ' + p.score + '</span><span class="old">' +
+      (p.forming ? 'signal bar still forming' : 'signal ' + b2t(p.bars_ago, primaryTf(r))) + '</span></span>' +
+      ansPill(r) + '<span class="why">' + reason(r) + '</span>' +
+      '<span class="lv num">Entry <span>' + fmtPx(p.entry_ref_price) + '</span> &middot; Stop <span>' + fmtPx(p.stop_price) + '</span> (' + p.risk_pct +
+      '%) &middot; 2R <span>' + fmtPx((p.targets || {})['2r']) + '</span> &middot; Now <span>' + fmtPx(r.current_price) + '</span></span></button>';
+  }).join('');
+  document.getElementById('briefPicks').style.display = list.length ? '' : 'none';
+  document.getElementById('runBtn').textContent = 'Scan again';
+}
+/* A card opens its row in the table, unfolding or unfiltering whatever hides it. */
+document.getElementById('picks').addEventListener('click', function(e){
+  var b = e.target.closest('.pick'); if(!b) return;
+  var r = pendR.filter(function(x){ return rowKey(x) === b.dataset.k; })[0]; if(!r) return;
+  openKey = b.dataset.k;
+  if(!matches(r, af)) setTab('all');
+  if(verdict(r) === 'skip') showNo = true;
+  renderAll(pendR);
+  rowEl(openKey).scrollIntoView({block:'start'});
+});
 
 /* The verdict is only as fresh as the scan. Past one closed 1H bar it is dimmed. */
 var scanTs = null;
@@ -4158,7 +4255,7 @@ function updAge(){
     (stale ? ' &mdash; more than one 1H bar has closed since. Re-run the scan before acting on them.' : '');
   document.getElementById('resT').classList.toggle('stale', stale);
 }
-setInterval(updAge, 60000);
+setInterval(function(){ updAge(); if(scanTs) briefState(); }, 60000);   /* the macro countdown runs live */
 
 function loadLast(){
   fetch('/signals').then(function(r){ return r.json(); }).then(function(d){
@@ -4168,9 +4265,20 @@ function loadLast(){
     scanTs = new Date(d.ts).getTime();
     resetStats();
     rows.forEach(function(r){ if(verdict(r) !== 'skip') updStats(r.side, verdict(r) === 'enter'); });
+    scanMeta = d.meta || {};
     document.getElementById('scan-audit').innerHTML = auditLine(d.meta);
-    renderAll(pendR); updAge();
+    showResults(); updAge();
   }).catch(function(){});
+}
+
+function showResults(){ renderAll(pendR); renderBrief(); }
+/* A scan that ended early: show what it found, or say that it stopped. The log above the table has the detail. */
+function scanStopped(msg){
+  document.getElementById('runBtn').disabled = false;
+  dissolve();
+  if(pendR.length){ scanTs = Date.now(); updAge(); setTimeout(showResults, 350); return; }
+  document.getElementById('briefH').textContent = 'The scan stopped.';
+  document.getElementById('briefState').innerHTML = '<p>' + calEsc(msg) + '</p>';
 }
 
 var es = null;
@@ -4182,15 +4290,15 @@ function startScan(){
     c.classList.add('cx');
     setTimeout(function(){ if(c.parentNode) c.parentNode.removeChild(c); }, 420);
   });
-  document.getElementById('resB').innerHTML = '';
-  document.getElementById('resT').style.display = 'none';
-  document.getElementById('emS').style.display = 'flex';
-  document.getElementById('emS').innerHTML = '<span class="empty-icon">&#9672;</span><span>Scanning...</span>';
+  document.getElementById('resWrap').style.display = 'none';
+  document.getElementById('briefH').textContent = 'Scanning the market...';
+  document.getElementById('briefState').innerHTML = '';
+  document.getElementById('briefPicks').style.display = 'none';
   document.getElementById('pgSec').style.display = '';
   document.getElementById('runBtn').disabled = true;
   tot = 0; setProgress(0, 0, ''); setStatus('Scanning...', true);
   showLoader(); resetBg(); pendR = []; seenSig = {}; hasScanned = true;
-  scanTs = null; updAge();
+  scanTs = null; updAge(); scanMeta = {}; openKey = null;
   document.getElementById('scan-audit').innerHTML = '';
 
   var exch = document.getElementById('exchange').value;
@@ -4230,30 +4338,24 @@ function startScan(){
     setStatus('Done - ' + d.hits + ' row' + (d.hits !== 1 ? 's' : ''), false);
     var m = d.meta || {};
     pushLog('Scan complete - ' + d.hits + ' divergence row(s) from ' + (m.scanned || 0) + ' pairs analysed', 'dn');
-    scanTs = Date.now(); updAge();
+    scanTs = Date.now(); updAge(); scanMeta = m;
     document.getElementById('scan-audit').innerHTML = auditLine(m);
     if(m.vol_rejected) pushLog(m.vol_rejected + ' pair(s) fell short on 7-day volume', 'in');
     if(m.no_data || m.errors) pushLog(((m.no_data||0) + (m.errors||0)) + ' pair(s) could not be analysed (no candles / error)', 'er');
     setRing(100, '');
-    document.getElementById('rfill').classList.add('done');
-    if(d.hits === 0){
-      setTimeout(function(){ dissolve(); }, 600);
-      document.getElementById('emS').style.display = 'flex';
-      document.getElementById('emS').innerHTML = '<span class="empty-icon">&#9676;</span><span>No divergences found</span>';
-    } else {
-      setTimeout(function(){
-        dissolve();
-        setTimeout(function(){ renderAll(pendR); }, 350);
-      }, 500);
-    }
+    setTimeout(function(){
+      dissolve();
+      /* the progress and log give way to the brief; the audit line under the table keeps the counts */
+      setTimeout(function(){ document.getElementById('pgSec').style.display = 'none'; showResults(); }, 350);
+    }, 500);
   });
   es.addEventListener('error', function(e){
     if(!e.data) return;  // native connection errors handled by es.onerror
     var m = 'Scan error';
     try { m = JSON.parse(e.data).msg; } catch(x){}
     pushLog(m, 'er'); es.close();
-    document.getElementById('runBtn').disabled = false;
     setStatus('Error', false);
+    scanStopped(m);
   });
   es.onerror = function(){
     if(es.readyState === EventSource.CLOSED) return;
@@ -4262,27 +4364,21 @@ function startScan(){
     // quota with the first and appending duplicate rows to pendR. Close it and
     // let the user decide to re-run.
     es.close();
-    pushLog('Connection lost - scan stopped. Press Run Scan to restart.', 'er');
-    document.getElementById('runBtn').disabled = false;
+    pushLog('Connection lost - scan stopped. Run the scan again to restart.', 'er');
     setStatus('Disconnected', false);
-    if(pendR.length){ scanTs = Date.now(); updAge(); dissolve(); setTimeout(function(){ renderAll(pendR); }, 350); }
+    scanStopped('Connection lost. Run the scan again to restart.');
   };
 }
 
+/* Before any scan the brief is the welcome: headline, one sentence, and the Run Scan button under it. */
 function renderWelcome(){
-  try {
-    var el = document.getElementById('emS');
-    if(!el) return;
-    var h = new Date().getHours();
-    var gr = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
-    var subs = ['Ready to find divergences.',
-                '4H and 1H, regular divergences only.',
-                'Every liquid perp, one scan, one table.',
-                'Set the volume floor and hit Run.'];
-    el.style.display = 'flex';
-    el.innerHTML = '<div class="greet"><div class="g-hl">' + gr + ', Kevin</div><div class="g-sub">' +
-      subs[Math.floor(Math.random()*subs.length)] + '</div><button class="g-cta" onclick="startScan()">Run Scan</button></div>';
-  } catch(e){}
+  var h = new Date().getHours();
+  var subs = ['Ready to find divergences.',
+              '4H and 1H, regular divergences only.',
+              'Every liquid perp, one scan, one table.',
+              'Set the volume floor and hit Run.'];
+  document.getElementById('briefH').textContent = (h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening') + ', Kevin';
+  document.getElementById('briefState').innerHTML = '<p>' + subs[Math.floor(Math.random()*subs.length)] + '</p>';
 }
 
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
@@ -4433,16 +4529,16 @@ function calDetail(now){
   rows.forEach(function(e){
     var t = new Date(e.ts), done = t.getTime() < now;
     var tr = document.createElement('tr'); if(done) tr.style.opacity = '.5';
-    var impCls = e.impact === 'High' ? ' hi' : (e.impact === 'Medium' ? ' md' : '');
+    var impCls = e.impact === 'High' ? ' hi' : '';
     tr.innerHTML =
-      '<td><span style="font-family:var(--mono)" title="' + calUTC(t) + '">' + calHM(t) + '</span></td>' +
-      '<td><span style="font-family:var(--mono);color:var(--tx2)">' + calEsc(e.currency) + '</span></td>' +
-      '<td><span style="font-weight:600;color:var(--tx)">' + calEsc(e.title) + '</span>' +
+      '<td class="num"><span title="' + calUTC(t) + '">' + calHM(t) + '</span></td>' +
+      '<td class="lo">' + calEsc(e.currency) + '</td>' +
+      '<td><b>' + calEsc(e.title) + '</b>' +
         (e.mover ? ' &nbsp;<span class="cal-imp hi" title="On the curated market-mover list">MOVER</span>' : '') + '</td>' +
       '<td><span class="cal-imp' + impCls + '">' + calEsc(e.impact) + '</span></td>' +
-      '<td style="font-family:var(--mono)">' + (calEsc(e.forecast) || '&mdash;') + '</td>' +
-      '<td style="font-family:var(--mono)">' + (calEsc(e.previous) || '&mdash;') + '</td>' +
-      '<td style="font-family:var(--mono);color:var(--tx)">' + (calEsc(e.actual) || '&mdash;') + '</td>';
+      '<td class="num">' + (calEsc(e.forecast) || '&mdash;') + '</td>' +
+      '<td class="num">' + (calEsc(e.previous) || '&mdash;') + '</td>' +
+      '<td class="num">' + (calEsc(e.actual) || '&mdash;') + '</td>';
     tb.appendChild(tr);
   });
 }
@@ -4460,7 +4556,6 @@ function calMetaLine(){
   if(m.time_check_h) info.push('JBlanked clock was ' + (m.time_check_h > 0 ? '+' : '') + m.time_check_h + 'h vs ForexFactory; its events were corrected.');
   var a = document.getElementById('cal-audit');
   a.className = 'audit' + (warn.length ? ' warn' : '');
-  a.style.margin = '0 0 12px';
   a.innerHTML = (warn.length ? '&#9888; ' : '') + warn.concat(info).map(calEsc).join('<br>');
 }
 function renderCalendar(){

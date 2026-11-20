@@ -3149,9 +3149,9 @@ table.stale .ans{opacity:.45}
 .gbtn:hover:not(:disabled){border-color:var(--acc);color:var(--tx)}
 .audit.warn{color:var(--wait);background:var(--wait-bg);border-radius:8px;padding:9px 12px}
 details.set{margin-left:auto}
-details.set[open]{flex-basis:100%;margin-left:0}
 details.set summary{cursor:pointer;color:var(--tx2);font-size:14px;padding:6px 4px}
-.setbody{margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:20px 28px;background:var(--sf);border:1px solid var(--line);border-radius:10px;padding:18px}
+.setbody[hidden]{display:none}
+.setbody{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:20px 28px;background:var(--sf);border:1px solid var(--line);border-radius:10px;padding:18px}
 .fl{margin-bottom:7px}
 .hint{margin-top:7px}
 select,input[type=text]{width:100%;background:var(--sf2);border:1px solid var(--line);font-size:14px;padding:8px 10px;border-radius:6px;appearance:none;transition:border-color .2s}
@@ -3392,8 +3392,8 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
     <div class="bar">
       <button class="rbtn" id="runBtn" onclick="startScan()">Run Scan</button>
       <span id="scan-age" class="audit"></span>
-      <details class="set" id="scanSet"><summary>Scan settings</summary>
-        <div class="setbody">
+      <details class="set" id="scanSet" ontoggle="document.getElementById('scanSetBody').hidden = !this.open"><summary>Scan settings</summary></details>
+        <div class="setbody" id="scanSetBody" hidden>
           <div class="ss"><div class="fl">Exchange</div>
             <select id="exchange"><option value="all" selected>All (Binance first)</option><option value="okx">OKX</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select>
             <div class="hint">All: Binance data, OKX / Bybit for coins Binance does not list, and each setup checked on the other venues (ALSO ON).</div></div>
@@ -3427,7 +3427,6 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
             <input type="text" id="symOverride" placeholder="ENS, SOL, TAO">
             <div class="hint">Comma-separated. Overrides the volume and thin-coin filters entirely &mdash; scans exactly these.</div></div>
         </div>
-      </details>
     </div>
 
     <div class="prog" id="pgSec" style="display:none">

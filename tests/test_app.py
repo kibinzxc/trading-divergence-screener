@@ -290,8 +290,9 @@ class Page(unittest.TestCase):
 
     def test_settings_live_in_a_closed_panel_on_the_scan_page(self):
         scan = re.search(r'<div id="pg-scan".*?<div id="pg-movers"', self.html, re.S).group(0)
-        panel = re.search(r'<details class="set" id="scanSet"><summary>Scan settings</summary>(.*?)</details>',
-                          scan, re.S).group(1)
+        # the panel sits beside <details>, not inside it, so opening it cannot move the summary
+        self.assertIn("""ontoggle="document.getElementById('scanSetBody').hidden = !this.open"><summary>Scan settings</summary></details>""", scan)
+        panel = re.search(r'<div class="setbody" id="scanSetBody" hidden>(.*?)\n    </div>\n', scan, re.S).group(1)
         for cid in ("exchange", "minVol", "uniBtn", "uniOut", "strG", "strHint", "maxPairs", "spdG",
                     "symOverride"):
             self.assertIn('id="%s"' % cid, panel, cid)

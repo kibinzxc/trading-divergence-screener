@@ -156,6 +156,8 @@ feed; that feed is the authoritative source for the current week anyway.
 python macd_divergence_screener_v5.py
 ```
 
+On Windows you can double-click `Start Screener.bat` instead: it starts the app and opens it in the browser. Close its window to stop the app.
+
 Serves on `http://localhost:5099`. Open `/` in a browser for the dashboard,
 which drives the scan below via Server-Sent Events and shows live progress,
 results, and any partial/incomplete-scan warnings.

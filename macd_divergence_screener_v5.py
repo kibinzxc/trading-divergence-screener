@@ -2060,69 +2060,100 @@ def spread_labels(ys, gap):
     return out
 
 
-def render_chart(df, d, sig):
-    """PNG of the A-to-B leg: candles with the entry, stop and R lines (each
-    labelled with its price) over the MACD panel with its trough and crossover
-    dots; A and B carry their price and MACD value. `d` is the raw detection
-    (bar indexes into `df`), `sig` the finished signal (levels)."""
-    lo = max(0, d["a_start"] - 10)
-    v = df.iloc[lo:min(len(df), d["signal_bar"] + 30)]
+CHART_DPI = 180
+
+
+def chart_figure(df, d, sig):
+    """The A-to-B leg as a figure: candles with the entry, stop and R lines
+    (each labelled with its price) over the MACD panel with its trough and
+    crossover dots; A and B carry their price and MACD value. `d` is the raw
+    detection (bar indexes into `df`), `sig` the finished signal (levels).
+
+    Sized for the opened row: 5.2in wide and drawn about 460px wide there, so
+    10pt text reads at 12px without opening the chart full size."""
+    end = min(len(df), d["signal_bar"] + 30)
+    price_lbl = [_plain(px(d["a_price"])), _plain(px(d["b_price"]))]
+    macd_lbl = [f"{d['a_macd']:.3g}", f"{d['b_macd']:.3g}"]
+    # A's label sits left of A and B's right of B, so each needs its own width of view on that side:
+    # about 6.5pt a character of a panel some 220pt wide. Past the last bar that is empty space.
+    need = min(0.32, (max(map(len, price_lbl + macd_lbl)) + 2) * 6.5 / 220 + 0.05)
+    left, right = d["a_start"] - 10, end
+    for _ in range(8):      # widening the view widens the share each label needs; this converges
+        w = need * (right - left)
+        left = min(left, min(d["a_p"], d["a_m"]) - w)
+        right = max(right, max(d["b_p"], d["b_m"]) + w)
+    lo = max(0, int(left))
+    v = df.iloc[lo:end]
     x = np.arange(len(v))
+    bull = d["side"] == "bullish"
     bg, fg, mut, line = "#0C111B", "#DCE3EE", "#9AA8BD", "#222D40"      # the page's tokens
     green, red, amber, acc = "#8FBF9F", "#D99AA0", "#D8BE8A", "#8FB4E8"
-    fig = Figure(figsize=(6.4, 4.6), tight_layout=True, facecolor=bg)   # shown about 460px wide
+    fig = Figure(figsize=(5.2, 4.2), dpi=CHART_DPI, tight_layout=True, facecolor=bg)
     ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
     for a in (ax, am):
         a.set_facecolor(bg)
-        a.tick_params(colors=mut, labelsize=9)
+        a.tick_params(colors=mut, labelsize=10)
         for sp in a.spines.values():
             sp.set_color(line)
 
-    def ab(a, ia, ib, ya, yb, fmt):
-        """The A-to-B line with each end labelled with its value, on the side
-        away from the line (below the troughs of a bullish one, above peaks)."""
+    def ab(a, ia, ib, ya, yb, lbl):
+        """The A-to-B line with each end labelled with its value: A's label ends
+        left of A and B's starts right of B, both on the side away from the line
+        (below the troughs of a bullish one, above peaks), so they can touch
+        neither each other nor the line however close A and B are."""
         a.plot([ia - lo, ib - lo], [ya, yb], color=amber, lw=1.5, marker="o")
-        dy, va = (-12, "top") if d["side"] == "bullish" else (8, "bottom")
-        for name, i, y in (("A", ia, ya), ("B", ib, yb)):
-            a.annotate(f"{name} {fmt(y)}", (i - lo, y), xytext=(0, dy), textcoords="offset points",
-                       color=fg, fontsize=10, ha="center", va=va)
+        k, va = (-1, "top") if bull else (1, "bottom")
+        for txt, i, y, dx, ha in (("A " + lbl[0], ia, ya, -6, "right"), ("B " + lbl[1], ib, yb, 6, "left")):
+            a.annotate(txt, (i - lo, y), xytext=(dx, 8 * k), textcoords="offset points",
+                       color=fg, fontsize=10, ha=ha, va=va)
+
+    def room(a, frac):
+        """Grow the panel on the side the A / B labels sit, once all its data is in."""
+        y0, y1 = a.get_ylim()
+        a.set_ylim(y0 - frac * (y1 - y0) if bull else y0, y1 if bull else y1 + frac * (y1 - y0))
 
     up = (v["close"] >= v["open"]).values
+    body = float(np.clip(150 / (right - left), 0.7, 3))       # points: the view shares about 220pt of width
     for mask, col in ((up, green), (~up, red)):
-        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=1)
-        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=3)
-    ab(ax, d["a_p"], d["b_p"], d["a_price"], d["b_price"], lambda y: _plain(px(y)))
-    ax.margins(y=0.15)      # room for the A / B labels
-    am.margins(y=0.2)
+        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=max(0.5, body / 3))
+        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=body)
+    ab(ax, d["a_p"], d["b_p"], d["a_price"], d["b_price"], price_lbl)
     t = sig["targets"]
     levels = ((sig["entry_ref_price"], acc, "-", "Entry"), (sig["stop_price"], red, "--", "Stop"),
               (t["1r"], mut, ":", "1R"), (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R"))
     for lvl, col, ls, _ in levels:
         ax.axhline(lvl, color=col, lw=0.8, ls=ls)
+    room(ax, 0.2)
     y0, y1 = ax.get_ylim()
-    # a 10pt label is about 6% of the price panel's height; the line stays where it is
-    for (lvl, col, _, lbl), y in zip(levels, spread_labels([l[0] for l in levels], (y1 - y0) * 0.065)):
+    # a 10pt label is about a tenth of the price panel's height; the line stays where it is
+    for (lvl, col, _, lbl), y in zip(levels, spread_labels([l[0] for l in levels], (y1 - y0) * 0.11)):
         ax.text(1.01, y, f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
                 transform=ax.get_yaxis_transform())      # right of the panel, clear of the candles
-    ax.set_ylim(y0, y1)
-    ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']} divergence, "
+    ax.set_title(f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']}, "
                  f"grade {sig['grade']} ({sig['score']})", fontsize=11, color=fg)
 
     am.plot(x, v["macd"].values, color=acc, lw=1.2, label="MACD")
     am.plot(x, v["signal"].values, color=mut, lw=1, label="signal")
     am.axhline(0, color=line, lw=0.8)
-    ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], lambda y: f"{y:.3g}")
+    ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], macd_lbl)
     for bar, direction in d["crosses"]:
         am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
                 color=green if direction > 0 else red)
-    am.legend(loc="upper left", fontsize=9, facecolor=bg, edgecolor=line, labelcolor=mut)
+    room(am, 0.32)
+    am.legend(loc="upper left" if bull else "lower left", fontsize=10, facecolor=bg, edgecolor=line,
+              labelcolor=mut)      # the corner the A / B labels are not in
     step = max(1, len(v) // 4)
     shown = v.index[::step] + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
     am.set_xticks(x[::step])
-    am.set_xticklabels([ts.strftime("%b %d %H:%M") for ts in shown])
+    am.set_xticklabels([ts.strftime("%b %d\n%H:%M") for ts in shown])
+    ax.set_xlim(left - lo, right - lo)
+    return fig
 
+
+def render_chart(df, d, sig):
+    """chart_figure() as PNG bytes."""
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
+    chart_figure(df, d, sig).savefig(buf, format="png")
     return buf.getvalue()
 
 
@@ -3273,6 +3304,30 @@ img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8p
 .rule-n{font-family:var(--mono);font-size:12px;color:var(--tx3);flex-shrink:0;width:22px;padding-top:3px}
 .rule-k{flex-shrink:0;width:170px}
 .rule-b{font-size:14px;color:var(--tx2)}
+/* Phone: each scan row stacks (coin and tags, then side / grade / answer, then entry / stop / 7d OI with
+   their labels) and the two sortable headers stay as a sort bar. Nothing on any page scrolls the body sideways. */
+@media (max-width:640px){
+  #resT{display:block;min-width:0}
+  #resT thead,#resT tbody,#resT tr.det,#resT tr.det td,#resT td.none{display:block}
+  #resT thead tr{display:flex;align-items:center;gap:4px;padding:4px 12px;border-bottom:1px solid var(--line)}
+  #resT thead tr::before{content:"Sort by";font-size:12px;color:var(--tx3);margin-right:8px}
+  #resT th{display:none;border:0;padding:8px}
+  #resT th.sortable{display:block}
+  #resT tr.row{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px 12px;padding:14px 12px;border-bottom:1px solid var(--line)}
+  #resT tr.row td{display:block;padding:0;border:0}
+  #resT tr.row td.coin{flex:0 0 100%;white-space:normal}
+  #resT tr.row td.why{flex:1 1 50%;min-width:0}      /* wide enough to push entry / stop / OI to their own line */
+  #resT tr.row td[data-l]{flex:1 1 28%}
+  #resT td[data-l]::before{content:attr(data-l);display:block;font-family:var(--sans);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3)}
+  #resT tr.row:hover td{background:none}
+  #resT tr.det td{padding:16px 12px}
+  .detw{position:static;max-width:none}
+  .cal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .rule{flex-wrap:wrap}
+  .rule-b{flex:1 1 240px}
+  .learn-panels{grid-template-columns:1fr}
+  .cal-out{margin-left:0!important}
+}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -3670,7 +3725,11 @@ function reason(r){
 }
 /* Its first sentence, without the leading Yes / Not yet / No the pill already says. */
 function shortWhy(r){ return reason(r).replace(/^(No|Not yet|Yes[^.]*)\.\s*/, '').split('. ')[0].replace(/\.$/, ''); }
-function ansPill(r){ var v = verdict(r); return '<span class="ans ' + v + '">' + ANS[v] + '</span>'; }
+/* A Yes on a signal bar that is still forming is the early one (the lower timeframe triggered first). */
+function ansPill(r){
+  var v = verdict(r);
+  return '<span class="ans ' + v + '">' + (v === 'enter' && primary(r).forming ? 'Yes (early)' : ANS[v]) + '</span>';
+}
 function evCell(r){ return ansPill(r) + '<span class="sub">' + shortWhy(r) + '</span>'; }
 function sideHtml(r){
   var s = r.side === 'bullish' ? 'long' : 'short';
@@ -4180,9 +4239,9 @@ function buildRow(r){
   return '<tr class="row" data-k="' + k + '" tabindex="0" aria-expanded="' + (openKey === k) + '">' +
     '<td class="coin"><b>' + r.base + '</b><span class="sub">' + tags.slice(0, 2).join('') + (more > 0 ? '<span class="tag">+' + more + '</span>' : '') + '</span></td>' +
     '<td>' + sideHtml(r) + '</td><td>' + gradeCell(p) + '</td><td class="why">' + evCell(r) + '</td>' +
-    '<td class="num">' + fmtPx(p.entry_ref_price) + '</td>' +
-    '<td class="num">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
-    '<td class="num ' + (oiVal(r) > 0 ? 'oi-up' : oiVal(r) < 0 ? 'oi-dn' : '') + '">' + oiCell(r) + '</td></tr>';
+    '<td class="num" data-l="Entry">' + fmtPx(p.entry_ref_price) + '</td>' +
+    '<td class="num" data-l="Stop">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
+    '<td class="num ' + (oiVal(r) > 0 ? 'oi-up' : oiVal(r) < 0 ? 'oi-dn' : '') + '" data-l="7d OI">' + oiCell(r) + '</td></tr>';
 }
 function ageMin(r){ return primary(r).bars_ago * ((TFM[primaryTf(r)] && TFM[primaryTf(r)].minutes) || 240); }
 

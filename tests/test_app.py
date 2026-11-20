@@ -136,6 +136,62 @@ class Chart(unittest.TestCase):
         self.assertTrue(all(b - a >= 0.5 for a, b in zip(ys, ys[1:])), ys)
         self.assertEqual(m.spread_labels([5.0, 1.0, 9.0], 2.0), [5.0, 1.0, 9.0])   # nothing collides
 
+    def boxes(self, hit):
+        """Per panel: the A / B value labels, the right-hand level labels, and the
+        A-to-B line, all in pixels as the PNG is drawn."""
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = m.chart_figure(*hit)
+        FigureCanvasAgg(fig)
+        fig.canvas.draw()
+        r = fig.canvas.get_renderer()
+        out = []
+        for ax in fig.axes:
+            ab = [t.get_window_extent(r) for t in ax.texts if t.get_text()[:2] in ("A ", "B ")]
+            lv = [t.get_window_extent(r) for t in ax.texts if t.get_text()[:2] not in ("A ", "B ")]
+            seg = next(l for l in ax.lines if l.get_marker() == "o" and len(l.get_xdata()) == 2)
+            out.append((ab, lv, ax.transData.transform(seg.get_xydata()), ax.get_window_extent(r)))
+        return fig, out
+
+    def variants(self):
+        """The fixture as found, its bearish mirror, and each with B squeezed up against A,
+        with B on the last bar, and at a sub-cent price (long labels)."""
+        s = m.signals_for_tf(wave_df(LONG, side="bearish"), "1h", m.STRICTNESS["balanced"],
+                             99.5, "ENS/USDT:USDT", 9e7)[0]
+        for df, d, sig in (self.hit, (s.pop("_df"), s.pop("_d"), s)):
+            yield df, d, sig
+            yield df, dict(d, b_p=d["a_p"] + 2, b_m=d["a_m"] + 2), sig
+            yield df, dict(d, b_p=len(df) - 1, b_m=len(df) - 1), sig
+            yield df, dict(d, a_price=d["a_price"] * 1e-7, b_price=d["b_price"] * 1e-7), sig
+
+    def test_a_and_b_labels_touch_neither_each_other_nor_their_line(self):
+        for hit in self.variants():
+            for ab, _, ((x0, y0), (x1, y1)), panel in self.boxes(hit)[1]:
+                self.assertEqual(len(ab), 2)
+                for b in ab:      # inside the panel: not over the axis ticks, not over the level labels
+                    self.assertTrue(panel.x0 <= b.x0 and b.x1 <= panel.x1 and panel.y0 <= b.y0 and b.y1 <= panel.y1,
+                                    (hit[1]["side"], b, panel))
+                self.assertFalse(ab[0].overlaps(ab[1]), (hit[1]["side"], ab))
+                for k in range(101):
+                    pt = (x0 + (x1 - x0) * k / 100, y0 + (y1 - y0) * k / 100)
+                    self.assertFalse(any(b.contains(*pt) for b in ab), (hit[1]["side"], pt))
+
+    def test_level_labels_do_not_overlap_on_the_drawn_chart(self):
+        for hit in self.variants():
+            lv = self.boxes(hit)[1][0][1]
+            self.assertEqual(len(lv), 5)
+            if hit[1]["a_price"] < 1:      # the sub-cent variant only stretches the A / B labels
+                continue
+            for i, a in enumerate(lv):
+                for b in lv[i + 1:]:
+                    self.assertFalse(a.overlaps(b), (a, b))
+
+    def test_chart_text_reads_at_12px_in_the_opened_row(self):
+        # the chart column of the opened row is 462px wide on a 1280px window
+        from matplotlib.text import Text
+        fig = self.boxes(self.hit)[0]
+        sizes = [t.get_fontsize() for t in fig.findobj(Text) if t.get_text().strip() and t.get_visible()]
+        self.assertGreaterEqual(min(sizes) / 72 * 462 / fig.get_figwidth(), 12, sorted(set(sizes)))
+
     def test_route_serves_the_chart_of_a_scanned_row(self):
         r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"})
         self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"))
@@ -247,6 +303,11 @@ class Page(unittest.TestCase):
             hi, lo = sorted((lum(tok[fg]), lum(tok[bg])), reverse=True)
             self.assertGreaterEqual((hi + 0.05) / (lo + 0.05), 4.5, (fg, bg))
 
+    def test_rows_stack_on_a_phone(self):
+        for want in ("@media (max-width:640px)", 'data-l="Entry"', 'data-l="Stop"', 'data-l="7d OI"',
+                     "content:attr(data-l)"):
+            self.assertIn(want, self.html, want)
+
     def test_pivot_era_ui_is_gone(self):
         for gone in ("macd_cross", "volCell", "FROM CURRENT PRICE", "MACD pivot must align"):
             self.assertNotIn(gone, self.html, gone)
@@ -312,12 +373,19 @@ class PageLogic(unittest.TestCase):
                           "Weak setup: grade C, score 40 of 100"])
         self.assertTrue(self.js_value("reason(WAIT)").endswith("pull back to 9.5"))
 
+    def test_the_pill_says_which_yes(self):
+        got = self.js_value("[ansPill(YES), ansPill(BEST), ansPill(WAIT), ansPill(NO), evCell(BEST)]")
+        self.assertEqual([re.sub(r"<[^>]+>", "", h) for h in got[:4]], ["Yes", "Yes (early)", "Not yet", "No"])
+        self.assertEqual(re.findall(r'class="ans (\w+)"', "".join(got)), ["enter", "enter", "wait", "skip", "enter"])
+        self.assertIn(">Yes (early)</span>", got[4])
+
     def test_brief_with_yes_rows(self):
         b = self.js_value("brief([NO, WAIT, YES, BEST], {btc: {state: 'BEAR', rsi: 32.4, close: 61959.3, ema200: 73736.56},"
                           " blocker: {ts_ms: Date.now() + 3 * 3600000 + 10000, title: 'CPI m/m'}, macro: null})")
         self.assertIn("2 setups pass the checklist; the rest can wait.", b["h"])
         self.assertEqual(b["lbl"], "Worth a look")
         self.assertEqual(re.findall(r'class="coin">(\w+)<', b["picks"]), ["BBB", "AAA"])   # highest score first
+        self.assertEqual(re.findall(r'class="ans enter">([^<]+)<', b["picks"]), ["Yes (early)", "Yes"])
         self.assertIn('class="mkt mkt-bear"', b["state"])
         self.assertIn("61959.30</span>, below its 200 EMA at <span class=\"num\">73736.56<", b["state"])
         self.assertIn("<b>CPI m/m in 3h 0m.</b> All entries wait until an hour after it prints.", b["state"])

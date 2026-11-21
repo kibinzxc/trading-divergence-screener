@@ -389,7 +389,7 @@ class Page(unittest.TestCase):
     def test_matte_pills_chips_and_tag_families(self):
         for want in (".side-long{", ".side-short{", ".gr-A{", ".gr-B{", ".gr-C{", ".oi-up{", ".oi-dn{",
                      ".tag.t-pattern{", ".tag.t-flow{", ".tag.t-mover{", ".tag.t-caution{", ".tag.t-venue{",
-                     ".mkt-bear b{", ".mkt-bull b{", ".mkt-chop b{"):
+                     ".brief p.mkt-bear b{", ".brief p.mkt-bull b{", ".brief p.mkt-chop b{"):
             self.assertIn(want, self.html, want)
         self.assertNotIn("Kevin", self.html)
 

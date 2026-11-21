@@ -3241,9 +3241,20 @@ tr.det td{background:var(--sf);padding:18px 16px}
 .chk li.x::before{content:"\00D7";color:var(--short)}
 .full{font-size:13px;color:var(--tx2)}
 img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8px;cursor:zoom-in}
-dialog.zoom{border:0;padding:0;background:transparent;max-width:96vw;max-height:96vh}
-dialog.zoom::backdrop{background:rgba(5,8,14,.82)}
-dialog.zoom img{display:block;max-width:96vw;max-height:94vh;border-radius:8px;cursor:zoom-out}
+/* margin:auto is restated because the page reset zeroes it, which pinned the dialog to the top-left corner */
+dialog.zoom{margin:auto;padding:0;border:1px solid var(--line);border-radius:12px;background:var(--sf);color:var(--tx);
+  max-width:min(94vw,1000px);max-height:92vh;overflow:hidden;outline:none;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+dialog.zoom[open]{display:flex;flex-direction:column;animation:zoomIn .16s ease-out}
+dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
+@keyframes zoomIn{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+.zhead{display:flex;align-items:center;gap:12px;padding:12px 14px 12px 18px;border-bottom:1px solid var(--line)}
+.zhead b{font-weight:600} .zhead span{color:var(--tx3);font-size:13px;margin-right:auto}
+.zhead button{background:var(--sf2);border:1px solid var(--line);border-radius:8px;color:var(--tx2);padding:5px 14px;cursor:pointer}
+.zhead button:hover{color:var(--tx)}
+.zbody{overflow:auto;padding:14px;background:var(--bg)}
+.zbody img{display:block;max-width:100%;height:auto;max-height:calc(92vh - 90px);margin:0 auto;border-radius:8px;cursor:zoom-out}
+@media (max-width:640px){.zbody img{max-width:none;max-height:none;width:680px}}
+@media (prefers-reduced-motion:reduce){dialog.zoom[open]{animation:none}}
 .fold{background:none;border:0;border-top:1px solid var(--line);color:var(--tx2);padding:12px 16px;width:100%;text-align:left;font-size:14px}
 .fold:hover{color:var(--tx)}
 .no-sig{color:var(--tx3);padding:20px;text-align:center}
@@ -4224,9 +4235,11 @@ function checks(r){
 /* One block per diverging timeframe: chart, levels and setup, then the answer's
    checklist and the tags on the timeframe that supplies the answer. */
 /* The chart enlarges over the page (click or Esc closes it) instead of leaving for a new tab. */
-function zoomChart(src){
-  var d = document.getElementById('zoom');
-  d.firstElementChild.src = src;
+function zoomChart(src, cap){
+  var d = document.getElementById('zoom'), img = document.getElementById('zoomImg');
+  document.getElementById('zoomCap').textContent = cap || 'Chart';
+  img.alt = (cap || 'Chart') + ', enlarged';
+  img.src = src;
   d.showModal();
   return false;
 }
@@ -4236,7 +4249,7 @@ function tfBlock(r, tf){
   return '<div class="dgrid">' +
     /* A phone gets the narrow render, readable at its width. Chosen when the row opens: a <picture> would
        refetch the uncached image every time the window is resized. */
-    '<div><a href="' + src + '" onclick="return zoomChart(this.href)" title="Enlarge the chart"><img class="chart" alt="' +
+    '<div><a href="' + src + '" data-cap="' + r.base + ' ' + tfLabel(tf) + ' ' + r.side + ' divergence" onclick="return zoomChart(this.href, this.dataset.cap)" title="Enlarge the chart"><img class="chart" alt="' +
       r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + (matchMedia('(max-width:640px)').matches ? '&w=narrow' : '') +
       '" onerror="var p=document.createElement(\'p\');p.className=\'calm\';p.textContent=this.alt;this.parentNode.replaceWith(p)"></a></div>' +
     '<div><span class="lbl">' + tfLabel(tf) + ' levels</span><dl class="kv num">' +
@@ -4737,7 +4750,10 @@ document.addEventListener('DOMContentLoaded', function(){
   if(pg && document.getElementById('pg-' + pg)) showPg(pg);   /* deep link, e.g. /#calendar */
 });
 </script>
-<dialog id="zoom" class="zoom" aria-label="Chart, enlarged" onclick="this.close()"><img alt="Enlarged chart"></dialog>
+<dialog id="zoom" class="zoom" aria-labelledby="zoomCap" onclick="if(!event.target.closest('.zhead') || event.target.tagName === 'BUTTON') this.close()">
+  <div class="zhead"><b id="zoomCap"></b><span>Esc or a click closes this</span><button type="button">Close</button></div>
+  <div class="zbody"><img id="zoomImg" alt=""></div>
+</dialog>
 </body>
 </html>"""
 

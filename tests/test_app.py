@@ -257,7 +257,7 @@ class Page(unittest.TestCase):
                 self.assertIn("'" + k + "':", tip, k)
 
     def test_chart_enlarges_in_the_page_not_a_new_tab(self):
-        for want in ('<dialog id="zoom"', "function zoomChart", 'onclick="return zoomChart(this.href)"'):
+        for want in ('<dialog id="zoom"', "function zoomChart", 'onclick="return zoomChart(this.href, this.dataset.cap)"', 'id="zoomCap"', "dialog.zoom{margin:auto"):
             self.assertIn(want, self.html, want)
         self.assertNotIn('target="_blank" rel="noopener" title="Open the chart', self.html)
 

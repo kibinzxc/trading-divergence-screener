@@ -256,6 +256,11 @@ class Page(unittest.TestCase):
             for k in re.findall(r"'([^']+)'", line.split(", [", 1)[-1]):
                 self.assertIn("'" + k + "':", tip, k)
 
+    def test_chart_enlarges_in_the_page_not_a_new_tab(self):
+        for want in ('<dialog id="zoom"', "function zoomChart", 'onclick="return zoomChart(this.href)"'):
+            self.assertIn(want, self.html, want)
+        self.assertNotIn('target="_blank" rel="noopener" title="Open the chart', self.html)
+
     def test_no_unfilled_template_placeholders(self):
         self.assertEqual(re.findall(r"__[A-Z][A-Z_]+__", self.html), [])
 

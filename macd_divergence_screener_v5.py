@@ -3160,13 +3160,12 @@ button{cursor:pointer}
 .gr-A{color:var(--yes);background:var(--yes-bg)}
 .gr-B{color:var(--blue);background:var(--blue-bg)}
 .gr-C{color:var(--tx2);background:var(--sf2)}
-.brief p.mkt{max-width:none;padding:14px 16px;border-radius:10px;color:var(--tx);align-self:stretch}
-.mkt-bear{background:var(--short-bg)}
-.mkt-bear b{color:var(--short)}
-.mkt-bull{background:var(--yes-bg)}
-.mkt-bull b{color:var(--yes)}
-.mkt-chop{background:var(--wait-bg)}
-.mkt-chop b{color:var(--wait)}
+/* neutral card; only the state words carry colour, as a pill */
+.brief p.mkt{max-width:none;padding:14px 16px;border-radius:10px;color:var(--tx);align-self:stretch;background:var(--sf);border:1px solid var(--line)}
+.brief p.mkt b{display:inline-block;padding:1px 11px;border-radius:20px;margin-right:6px}
+.mkt-bear b{color:var(--short);background:var(--short-bg)}
+.mkt-bull b{color:var(--yes);background:var(--yes-bg)}
+.mkt-chop b{color:var(--wait);background:var(--wait-bg)}
 .oi-up{color:var(--yes)}
 .oi-dn{color:var(--short)}
 .ans{display:inline-block;padding:3px 10px;border-radius:20px;font-size:13px;font-weight:500;white-space:nowrap}

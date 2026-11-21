@@ -261,6 +261,11 @@ class Page(unittest.TestCase):
             self.assertIn(want, self.html, want)
         self.assertNotIn('target="_blank" rel="noopener" title="Open the chart', self.html)
 
+    def test_tab_title_and_icon(self):
+        for want in ("<title>Divergence Screener</title>", '<link rel="icon" href="data:image/svg+xml,',
+                     "' Yes \u00b7 '", "+ 'Divergence Screener';"):
+            self.assertIn(want, self.html, want)
+
     def test_no_unfilled_template_placeholders(self):
         self.assertEqual(re.findall(r"__[A-Z][A-Z_]+__", self.html), [])
 

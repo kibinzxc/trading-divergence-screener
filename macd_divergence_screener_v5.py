@@ -118,8 +118,9 @@ complete one is how you end up trusting an empty table.
 from flask import Flask, Response, jsonify, request
 from concurrent.futures import ThreadPoolExecutor
 import ccxt, pandas as pd, numpy as np, json, time, threading, queue, datetime, os, io
-import re, statistics, urllib.request, urllib.error
+import re, statistics, urllib.request, urllib.error, math
 from matplotlib.figure import Figure   # no pyplot: Figure alone is safe across Flask threads
+from matplotlib.ticker import FuncFormatter
 
 app = Flask(__name__)
 
@@ -308,7 +309,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # divergence scan's saved state, and vice versa.
 MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
-STATE_VERSION = 3    # scan_state.json written by an older row shape is ignored
+STATE_VERSION = 4    # scan_state.json written by an older row shape is ignored (4: score parts, a verdict per timeframe)
 HTF_BARS_1D   = 200   # daily history, for the 4H signal's higher-timeframe check
 LTF_BARS_15M  = 300   # 15m history (75h), for the 1H and 4H signals' early-entry triggers
 
@@ -679,35 +680,45 @@ def build_targets(sig):
 
 
 # ── Quality score, regime, tags ────────────────────────────────────────────────
+def score_parts(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None):
+    """The score's ten components, in order: seven pattern parts (70 points)
+    and three context parts (10 each). Each is {key, group, pts, max, checked}.
+
+    A context input that is None (htf_ok, oi_chg or fund, btc_state) is
+    unavailable: its part has checked False and earns nothing. The OI part is
+    +10 when OI fell into B with funding not against it, -10 when OI rose more
+    than OI_AGAINST_PCT with funding on the crowded side, else 0. score_signal()
+    is computed from these, so the page's breakdown cannot drift from the score.
+    """
+    bull = sig["side"] == "bullish"
+
+    def part(key, group, pts, top, checked=True):
+        return {"key": key, "group": group, "pts": pts if checked else 0, "max": top, "checked": checked}
+
+    oi_ok = oi_chg is not None and fund is not None
+    f = (fund if bull else -fund) if oi_ok else 0
+    oi_pts = (10 if oi_chg < 0 and f <= 0 else -10 if oi_chg > OI_AGAINST_PCT and f > 0 else 0) if oi_ok else 0
+    return [part("price_move", "pattern", min(sig["price_atr"], 1.0) * 12, 12),
+            part("macd", "pattern", min(sig["macd_frac"] / 0.5, 1.0) * 12, 12),
+            part("bump", "pattern", float(np.clip((sig["bump_frac"] - BUMP_MIN) / 0.5, 0, 1)) * 8, 8),
+            part("zero", "pattern", 10 * bool(sig["zero_ok"]), 10),
+            part("vol_dry", "pattern", 10 * bool(sig["vol_dry"]), 10),
+            part("wick", "pattern", 10 * bool(sig["wick"]), 10),
+            part("triple", "pattern", 8 * bool(sig["triple"]), 8),
+            part("htf", "context", 10 * bool(htf_ok), 10, htf_ok is not None),
+            part("oi", "context", oi_pts, 10, oi_ok),
+            part("btc", "context", 10 * (btc_state == ("BULL" if bull else "BEAR")), 10, btc_state is not None)]
+
+
 def score_signal(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None):
     """(0-100 score, grade, partial). A description of the setup, not a win rate.
 
-    Pattern points 0-70, context 10 each: higher timeframe agrees, OI falling
-    into B with funding against the crowd, BTC state on the signal's side.
-    OI rising more than OI_AGAINST_PCT into B with funding on the crowded side
-    costs 10. A context input that is None (htf_ok, oi_chg or fund, btc_state)
-    is unavailable: that component leaves the denominator and `partial` is True.
+    What was earned out of what could be checked (see score_parts), scaled to
+    100. `partial` is True when a context part left the denominator.
     """
-    bull = sig["side"] == "bullish"
-    s = min(sig["price_atr"], 1.0) * 12                                   # 0-12
-    s += min(sig["macd_frac"] / 0.5, 1.0) * 12                            # 0-12
-    s += float(np.clip((sig["bump_frac"] - BUMP_MIN) / 0.5, 0, 1)) * 8    # 0-8
-    s += 10 * sig["zero_ok"] + 10 * sig["vol_dry"] + 10 * sig["wick"] + 8 * sig["triple"]
-    avail = 70
-    if htf_ok is not None:
-        avail += 10
-        s += 10 * bool(htf_ok)
-    if oi_chg is not None and fund is not None:
-        avail += 10
-        f = fund if bull else -fund
-        if oi_chg < 0 and f <= 0:
-            s += 10
-        elif oi_chg > OI_AGAINST_PCT and f > 0:
-            s -= 10
-    if btc_state is not None:
-        avail += 10
-        s += 10 * (btc_state == ("BULL" if bull else "BEAR"))
-    score = int(max(0, min(100, round(s / avail * 100))))
+    parts = [p for p in score_parts(sig, htf_ok, oi_chg, fund, btc_state) if p["checked"]]
+    avail = sum(p["max"] for p in parts)
+    score = int(max(0, min(100, round(math.fsum(p["pts"] for p in parts) / avail * 100))))
     return score, ("A" if score >= GRADE_A else "B" if score >= GRADE_B else "C"), avail < 100
 
 
@@ -744,6 +755,7 @@ def finish_signal(sig, htf_ok=None, oi_chg=None, fund=None, btc_state=None, trig
     whichever closed first.
     """
     sig["score"], sig["grade"], sig["partial"] = score_signal(sig, htf_ok, oi_chg, fund, btc_state)
+    sig["score_parts"] = score_parts(sig, htf_ok, oi_chg, fund, btc_state)
     sig["htf_ok"] = htf_ok
     sig["oi_chg_pct"] = None if oi_chg is None else round(oi_chg, 1)
     sig["btc_state"] = btc_state
@@ -1991,6 +2003,7 @@ def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, ma
         r["fresh"]  = any(s["fresh"] for s in r["signals"].values())
         r["status"] = p["status"]
         r["entry"]  = verdicts[best]
+        r["verdicts"] = verdicts        # each timeframe's own answer, for the opened row's tabs
         due = [macro] if macro else []
         if blocker and 0 < blocker[0] <= 24 and verdicts[best] == entry_verdict(p, None):
             due.append(blocker)
@@ -2071,25 +2084,40 @@ def spread_labels(ys, gap):
 CHART_DPI = 180
 
 
+def pht_tick(ts):
+    """A bar's open (UTC, as the frames are indexed) as a two-line axis label
+    in Philippine time, 12-hour: 'Nov 21' over '1:00 PM'."""
+    t = ts + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
+    return f"{t:%b} {t.day}\n{t.hour % 12 or 12}:{t:%M %p}"
+
+
+def _num(v, digits=3):
+    """A small number (a MACD value, an axis tick) to `digits` significant
+    digits as plain digits: never an exponent."""
+    return _plain(float(f"{v:.{digits}g}") + 0.0)
+
+
 def chart_figure(df, d, sig, narrow=False):
     """The A-to-B leg as a figure: candles with the entry, stop and R lines
     (each labelled with its price) over the MACD panel with its trough and
     crossover dots; A and B carry their price and MACD value. `d` is the raw
     detection (bar indexes into `df`), `sig` the finished signal (levels).
 
-    Sized for the opened row: 5.2in wide and drawn about 460px wide there, so
-    10pt text reads at 12px without opening the chart full size. `narrow` is the
-    phone render (4.1in for a 360px column): the same chart, taller, with the A
-    and B values moved from the points into the panel titles."""
+    Sized for the opened row, which it spans: 10.4in wide and drawn about 958px
+    wide on a 1280px window, so 10pt text reads at 12px or more and the image
+    is never stretched. `narrow` is the phone render (3.9in for a 344px
+    column): the same chart, taller, with the A and B values moved from the
+    points into the panel titles and the level lines named without their price
+    (the levels strip under the chart has them), which leaves the candles room. Times are Philippine time, 12-hour."""
     end = min(len(df), d["signal_bar"] + 30)
     price_lbl = [_plain(px(d["a_price"])), _plain(px(d["b_price"]))]
-    macd_lbl = [f"{d['a_macd']:.3g}", f"{d['b_macd']:.3g}"]
+    macd_lbl = [_num(d["a_macd"]), _num(d["b_macd"])]
     # A's label sits left of A and B's right of B, so each needs its own width of view on that side:
-    # about 6.5pt a character of a panel some 220pt wide (140pt on a phone, where the label is
+    # about 6.5pt a character of a panel some 560pt wide (190pt on a phone, where the label is
     # just the letter). Past the last bar that is empty space.
-    panel_pt = 140 if narrow else 220
+    panel_pt = 190 if narrow else 560
     chars = 1 if narrow else max(map(len, price_lbl + macd_lbl)) + 2
-    need = min(0.32, chars * 6.5 / panel_pt + 0.05)
+    need = min(0.32, chars * 6.5 / panel_pt + 0.04)
     left, right = d["a_start"] - 10, end
     for _ in range(8):      # widening the view widens the share each label needs; this converges
         w = need * (right - left)
@@ -2101,11 +2129,12 @@ def chart_figure(df, d, sig, narrow=False):
     bull = d["side"] == "bullish"
     bg, fg, mut, line = "#0C111B", "#DCE3EE", "#9AA8BD", "#222D40"      # the page's tokens
     green, red, amber, acc = "#8FBF9F", "#D99AA0", "#D8BE8A", "#8FB4E8"
-    fig = Figure(figsize=(4.1, 5.0) if narrow else (5.2, 4.2), dpi=CHART_DPI, tight_layout=True, facecolor=bg)
+    fig = Figure(figsize=(3.9, 5.2) if narrow else (10.4, 5.4), dpi=CHART_DPI, tight_layout=True, facecolor=bg)
     ax, am = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 2]})
     for a in (ax, am):
         a.set_facecolor(bg)
         a.tick_params(colors=mut, labelsize=10)
+        a.yaxis.set_major_formatter(FuncFormatter(lambda val, _: _num(val, 6)))     # plain digits, no offset text
         for sp in a.spines.values():
             sp.set_color(line)
 
@@ -2121,7 +2150,8 @@ def chart_figure(df, d, sig, narrow=False):
         for txt, i, y, dx, ha in (("A" if narrow else "A " + lbl[0], ia, ya, -6, "right"),
                                   ("B" if narrow else "B " + lbl[1], ib, yb, 6, "left")):
             a.annotate(txt, (i - lo, y), xytext=(dx, 8 * k), textcoords="offset points",
-                       color=fg, fontsize=10, ha=ha, va=va)
+                       color=fg, fontsize=10, ha=ha, va=va,
+                       bbox={"facecolor": bg, "edgecolor": "none", "pad": 1.5, "alpha": 0.8})      # readable over a level line
 
     def room(a, frac):
         """Grow the panel on the side the A / B labels sit, once all its data is in."""
@@ -2129,7 +2159,7 @@ def chart_figure(df, d, sig, narrow=False):
         a.set_ylim(y0 - frac * (y1 - y0) if bull else y0, y1 if bull else y1 + frac * (y1 - y0))
 
     up = (v["close"] >= v["open"]).values
-    body = float(np.clip(0.68 * panel_pt / (right - left), 0.7, 3))       # points: the view shares the panel's width
+    body = float(np.clip(0.68 * panel_pt / (right - left), 0.7, 5))       # points: the view shares the panel's width
     for mask, col in ((up, green), (~up, red)):
         ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=max(0.5, body / 3))
         ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=body)
@@ -2143,7 +2173,7 @@ def chart_figure(df, d, sig, narrow=False):
     y0, y1 = ax.get_ylim()
     # a 10pt label is about a tenth of the price panel's height; the line stays where it is
     for (lvl, col, _, lbl), y in zip(levels, spread_labels([l[0] for l in levels], (y1 - y0) * 0.11)):
-        ax.text(1.01, y, f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
+        ax.text(1.01, y, lbl if narrow else f"{lbl} {_plain(lvl)}", color=col, fontsize=10, va="center",
                 transform=ax.get_yaxis_transform())      # right of the panel, clear of the candles
     head = f"{sig['base']} {TF_CFG[sig['tf']]['label']} {d['side']}, grade {sig['grade']} ({sig['score']})"
     if narrow:
@@ -2151,20 +2181,22 @@ def chart_figure(df, d, sig, narrow=False):
     else:
         ax.set_title(head, fontsize=11, color=fg)
 
-    am.plot(x, v["macd"].values, color=acc, lw=1.2, label="MACD")
-    am.plot(x, v["signal"].values, color=mut, lw=1, label="signal")
+    am.plot(x, v["macd"].values, color=acc, lw=1.2)
+    am.plot(x, v["signal"].values, color=mut, lw=1)
     am.axhline(0, color=line, lw=0.8)
     ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], macd_lbl)
     for bar, direction in d["crosses"]:
         am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
                 color=green if direction > 0 else red)
     room(am, 0.32)
-    am.legend(loc="upper left" if bull else "lower left", fontsize=10, facecolor=bg, edgecolor=line,
-              labelcolor=mut)      # the corner the A / B labels are not in
-    step = max(1, len(v) // (2 if narrow else 4))      # date labels must not run into each other
-    shown = v.index[::step] + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)
-    am.set_xticks(x[::step])
-    am.set_xticklabels([ts.strftime("%b %d\n%H:%M") for ts in shown])
+    # the two lines are named under the axis: a legend box would sit on top of them
+    am.set_xlabel("MACD blue, signal line grey\ntimes in PHT" if narrow else
+                  "MACD line (blue) and its signal line (grey)   \u00b7   times are Philippine time (PHT)",
+                  fontsize=10, color=mut)
+    # three date labels on a phone, six on the wide chart: few enough that they never run into each other
+    ticks = np.unique(np.linspace(0, len(v) - 1, 3 if narrow else 6).round().astype(int))
+    am.set_xticks(ticks)
+    am.set_xticklabels([pht_tick(v.index[i]) for i in ticks])
     ax.set_xlim(left - lo, right - lo)
     return fig
 
@@ -2423,6 +2455,7 @@ def index():
     # cannot drift from the constants the scans actually use.
     tmpl = {
         "__TF_CFG_JSON__": json.dumps({k: {"label": v["label"], "minutes": v["minutes"],
+                                           "htf": "1D" if v["htf_minutes"] == 1440 else "4H",
                                            "fresh_h": v["fresh_h"], "macro_h": MACRO_WAIT_H[k]}
                                        for k, v in TF_CFG.items()}),
         "__DEFAULT_VOL_M__": str(int(DEFAULT_MIN_WEEKLY_VOL / 1e6)),
@@ -3229,22 +3262,86 @@ td.why{min-width:200px}
 .tag.t-venue{color:var(--yes);background:var(--yes-bg);border-color:transparent}
 tr.det td{background:var(--sf);padding:18px 16px}
 /* the table scrolls sideways on a narrow screen; the opened row stays as wide as the screen */
-.detw{position:sticky;left:16px;max-width:calc(100vw - 66px)}
-.dgrid{display:grid;grid-template-columns:minmax(0,1.9fr) minmax(0,1fr) minmax(0,1fr);gap:20px}
-.dgrid + .dgrid{margin-top:20px;padding-top:20px;border-top:1px solid var(--line)}
-@media (max-width:820px){.dgrid{grid-template-columns:minmax(0,1fr)}}
-.dgrid > div{min-width:0;display:flex;flex-direction:column;gap:8px}
-.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:14px}
+.detw{position:sticky;left:16px;max-width:calc(100vw - 66px);display:flex;flex-direction:column;gap:16px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.tfsw{display:flex;gap:4px;align-self:flex-start;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:3px}
+.tfsw button{background:none;border:0;border-radius:6px;padding:5px 14px;color:var(--tx2);font-size:14px}
+.tfsw button[aria-pressed="true"]{background:var(--sf2);color:var(--tx);font-weight:600}
+.tfsw .mark{font-size:12px;font-weight:400;color:var(--tx3);margin-left:8px}
+/* the answer strip is a neutral card: only the pill carries colour */
+.verdict{display:flex;flex-direction:column;gap:10px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.vline{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;padding:3px 10px;border-radius:20px;background:var(--sf);border:1px solid var(--line)}
+.chip i{font-style:normal;font-weight:600}
+.chip.ok i{color:var(--yes)}
+.chip.w i{color:var(--wait)}
+.chip.x i{color:var(--short)}
+.plain{font-size:14px;color:var(--tx);background:var(--sf2);border-radius:8px;padding:8px 12px}
+.plain b{font-weight:600;color:var(--acc);margin-right:6px}
+.alone{font-size:14px;color:var(--tx2);border:1px dashed var(--line);border-radius:8px;padding:8px 12px}
+.alone b{color:var(--tx);font-weight:600}
+.chartbig{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:12px}
+.cimg{display:flex;flex-direction:column;gap:12px}
+img.chart{display:block;width:100%;border-radius:8px;cursor:zoom-in}
+.how{font-size:14px;color:var(--tx2)}
+.how b{color:var(--tx);font-weight:500}
+.nochartbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;border:1px dashed var(--line);border-radius:8px;padding:10px 14px;color:var(--tx2);font-size:14px}
+.nochartbar button{background:var(--sf2);border:1px solid var(--line);border-radius:8px;padding:5px 14px;margin-left:auto}
+.levels{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.levels div{background:var(--bg);padding:10px 12px;display:flex;flex-direction:column;gap:1px;min-width:0;overflow-wrap:anywhere}
+.levels .n{font-size:12px;color:var(--tx3);letter-spacing:.06em;text-transform:uppercase}
+.levels .p{font-size:13px;color:var(--tx3)}
+.levels .h{font-size:12px;color:var(--tx3)}
+.levels .stop .n,.levels .stop .p{color:var(--short)}
+.levels .entry .n{color:var(--acc)}
+.levels .now .n{color:var(--wait)}
+.sec{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px}
+.sec b{font-size:16px;font-weight:600}
+.sec span{color:var(--tx3);font-size:13px}
+.four{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;align-items:stretch}
+.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}
+.card{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card .hl{font-size:16px;font-weight:600}
+.four .card .plain{margin-top:auto}
+.kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 14px;font-size:14px}
 .kv dt{color:var(--tx3)}
-.chk{list-style:none;font-size:14px;display:flex;flex-direction:column;gap:3px}
-.chk li::before{content:"\2713";color:var(--yes);margin-right:8px}
-.chk li.w::before{content:"\2026";color:var(--wait)}
-.chk li.x::before{content:"\00D7";color:var(--short)}
-.full{font-size:13px;color:var(--tx2)}
-img.chart{display:block;width:100%;border:1px solid var(--line);border-radius:8px;cursor:zoom-in}
+.kv dd{overflow-wrap:break-word}
+.four .kv{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.rng{height:6px;background:var(--sf2);border-radius:3px;position:relative;margin:6px 0 4px}
+.rng i{position:absolute;top:-4px;width:4px;height:14px;border-radius:2px;background:var(--wait);transform:translateX(-2px)}
+.rngl{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--tx3)}
+.step{display:grid;grid-template-columns:26px minmax(0,1fr);gap:2px 10px}
+.step .k{width:26px;height:26px;border-radius:50%;background:var(--wait-bg);color:var(--wait);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+.step .t{font-size:13px;color:var(--tx3)}
+.step .v{grid-column:2}
+.say{font-size:14px;color:var(--tx2);border-top:1px solid var(--line);padding-top:10px}
+.say b{color:var(--tx);font-weight:500}
+.sbar{height:8px;border-radius:4px;background:var(--sf2);overflow:hidden}
+.sbar span{display:block;height:100%;background:var(--blue);border-radius:4px}
+.barrow{display:grid;grid-template-columns:70px minmax(0,1fr) 58px;gap:10px;align-items:center;font-size:13px;color:var(--tx2)}
+.barrow .num{text-align:right;color:var(--tx)}
+.parts{display:flex;flex-direction:column;gap:5px;font-size:14px}
+.part{display:grid;grid-template-columns:16px minmax(0,1fr) auto;gap:8px;align-items:baseline}
+.part i{font-style:normal;font-weight:600;color:var(--yes)}
+.part.miss i,.part.miss span{color:var(--tx3)}
+.part.neg i,.part.neg .num{color:var(--short)}
+.part .num{font-size:13px;color:var(--tx3)}
+.tagl{display:flex;flex-direction:column;gap:8px}
+.tagl div{display:flex;flex-direction:column;gap:2px;align-items:flex-start}
+.tagl .tag{margin:0;white-space:normal}
+.tagl .m{font-size:13px;color:var(--tx2)}
+details.words{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 16px}
+details.words summary{cursor:pointer;color:var(--tx2)}
+details.words dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 16px;margin-top:12px;font-size:14px}
+details.words dt{color:var(--tx);font-weight:500}
+details.words dd{color:var(--tx2)}
+@media (max-width:1000px){.four{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:820px){.three{grid-template-columns:minmax(0,1fr)} .levels{grid-template-columns:repeat(4,minmax(0,1fr))} .levels .struct{grid-column:span 2}}
+@media (max-width:560px){.four{grid-template-columns:minmax(0,1fr)} .levels{grid-template-columns:repeat(2,minmax(0,1fr))} details.words dl{grid-template-columns:minmax(0,1fr)}}
 /* margin:auto is restated because the page reset zeroes it, which pinned the dialog to the top-left corner */
 dialog.zoom{margin:auto;padding:0;border:1px solid var(--line);border-radius:12px;background:var(--sf);color:var(--tx);
-  max-width:min(94vw,1000px);max-height:92vh;overflow:hidden;outline:none;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+  max-width:min(96vw,1500px);max-height:92vh;overflow:hidden;outline:none;box-shadow:0 24px 80px rgba(0,0,0,.55)}
 dialog.zoom[open]{display:flex;flex-direction:column;animation:zoomIn .16s ease-out}
 dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
 @keyframes zoomIn{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
@@ -3366,6 +3463,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
   #resT tr.row:hover td{background:none}
   #resT tr.det td{padding:16px 12px}
   .detw{position:static;max-width:none}
+  .chartbig{padding:8px}
   .cal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .rule{flex-wrap:wrap}
   .rule-b{flex:1 1 240px}
@@ -3469,7 +3567,9 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
           <button class="ftab" data-f="enter" onclick="setF(this)" title="Only rows whose answer is Yes.">Enter now</button>
           <button class="ftab" data-f="bull" onclick="setF(this)" title="Bullish divergences (long side) answering Yes or Not yet.">Bullish</button>
           <button class="ftab" data-f="bear" onclick="setF(this)" title="Bearish divergences (short side) answering Yes or Not yet.">Bearish</button>
-          <button class="ftab" data-f="both" onclick="setF(this)" title="The same side diverging on 4H and 1H at once.">4H+1H</button>
+          <button class="ftab" data-f="both" onclick="setF(this)" title="Rows that diverge on both 4H and 1H (the same side on each), answering Yes or Not yet.">4H+1H</button>
+          <button class="ftab" data-f="h4" onclick="setF(this)" title="Rows that diverge on 4H only, not on 1H, answering Yes or Not yet.">4H only</button>
+          <button class="ftab" data-f="h1" onclick="setF(this)" title="Rows that diverge on 1H only, not on 4H, answering Yes or Not yet.">1H only</button>
           <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence listed, including the No rows: ones that already played out, were stopped, or are too old to act on. A signal whose signal bar closed more than __MAX_AGE_H__ hours ago is not listed at all; the audit line under the table counts those. Until you pick this, those are folded under the table.">All</button>
         </div>
       </div>
@@ -3488,7 +3588,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
         </table>
         <button class="fold" id="fold" aria-expanded="false" style="display:none"></button>
       </div>
-      <p class="note">Click a row for its chart, targets, tags and the full checklist. Each row shows two tags at most; the rest are inside.</p>
+      <p class="note">Click a row for its answer in plain words, its chart and levels, what is going on around it, and how it scored. Each row shows two tags at most; the rest are inside. Times are Philippine time (PHT).</p>
       <div id="scan-audit" class="audit"></div>
     </div>
   </section>
@@ -3536,7 +3636,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
 <div id="pg-calendar" class="page">
   <div class="sig-hdr">
     <div><div class="sig-ttl">Calendar &mdash; scheduled market movers</div>
-    <div class="sig-sub">US inflation, jobs, Fed and growth prints, plus the BoJ, ECB and BoE rate decisions. Everything else on the schedule is hidden unless you switch to All high-impact. Times are your local time; hover a chip for UTC.</div></div>
+    <div class="sig-sub">US inflation, jobs, Fed and growth prints, plus the BoJ, ECB and BoE rate decisions. Everything else on the schedule is hidden unless you switch to All high-impact. Times are Philippine time (PHT); hover a chip for UTC.</div></div>
   </div>
   <div class="cal-next" id="cal-next"><span class="cal-next-meta">Loading calendar...</span></div>
   <div class="wbar">
@@ -3560,7 +3660,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
     <div class="tw">
       <table id="calT" style="display:none">
         <thead><tr>
-          <th>Time</th><th>Cur</th><th>Event</th><th>Impact</th><th>Forecast</th><th>Previous</th><th>Actual</th>
+          <th>Time (PHT)</th><th>Cur</th><th>Event</th><th>Impact</th><th>Forecast</th><th>Previous</th><th>Actual</th>
         </tr></thead>
         <tbody id="calB"></tbody>
       </table>
@@ -3574,8 +3674,8 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
     <div class="dash-sec-ttl">What every tag means</div>
     <div class="prose">
       Each tag as it appears on the Scan page, with the same wording as its hover text. A row shows
-      two of its tags and +N; open the row for all of them, and for the regime, which sits in its
-      Setup list. The regime tags set the grade the answer needs (COUNTER TREND needs A), TRIPLE and PARTIAL DATA change the
+      two of its tags and +N; open the row for all of them, each with the first sentence of its meaning, and for
+      the regime, which heads its Trend card. The regime tags set the grade the answer needs (COUNTER TREND needs A), TRIPLE and PARTIAL DATA change the
       score, and LTF / 15M TRIGGER allow Yes (early); every other tag, MACRO included, is context
       for you to weigh.
     </div>
@@ -3664,7 +3764,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run. The brief on top of the Scan page is built from the same rows: BTC's state and the nearest USD print come from the scan, and only the print's countdown keeps running.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open a row for each timeframe's levels and its chart.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open the row and use its 4H | 1H switch for each timeframe's chart, levels, setup and score; the answer strip on top stays the row's, and the other tab says what that timeframe alone would answer. The 4H+1H, 4H only and 1H only filters pick rows by which timeframes diverge.</div></div>
     </div>
   </div>
 
@@ -3760,13 +3860,13 @@ function matches(r, f){
   if(f === 'bull')  return r.side === 'bullish' && v !== 'skip';
   if(f === 'bear')  return r.side === 'bearish' && v !== 'skip';
   if(f === 'both')  return r.tfs.length > 1 && v !== 'skip';
+  if(f === 'h4')    return r.tfs.length === 1 && r.tfs[0] === '4h' && v !== 'skip';
+  if(f === 'h1')    return r.tfs.length === 1 && r.tfs[0] === '1h' && v !== 'skip';
   return true;
 }
 /* The full reason. It can carry a calendar event title from an outside feed. */
-function reason(r){
-  var e = r.entry || {};
-  return calEsc(e.reason) + (e.level != null ? ' ' + fmtPx(e.level) : '');
-}
+function reasonOf(e){ return calEsc(e.reason) + (e.level != null ? ' ' + fmtPx(e.level) : ''); }
+function reason(r){ return reasonOf(r.entry || {}); }
 /* Its first sentence, without the leading Yes / Not yet / No the pill already says. */
 function shortWhy(r){ return reason(r).replace(/^(No|Not yet|Yes[^.]*)\.\s*/, '').split('. ')[0].replace(/\.$/, ''); }
 /* A Yes on a signal bar that is still forming is the early one (the lower timeframe triggered first). */
@@ -3783,17 +3883,18 @@ function sideHtml(r){
 /* k is the tag's name in TIP / TAG_GROUPS (tooltip and colour family); txt is what it says when that differs */
 function tag(k, txt){ return '<span class="tag' + (FAM[k] ? ' t-' + FAM[k] : '') + '"' + tip(k) + '>' + (txt || k) + '</span>'; }
 /* Every tag of a row, pattern tags first. The Coin cell shows two; the opened row shows all. */
-function tagChips(r){
-  var h = (primary(r).tags || []).map(function(f){ return tag(f); });
-  (r.venue_tags || []).forEach(function(f){ h.push(tag(f.indexOf('ALSO ON') === 0 ? 'ALSO ON' : f, f)); });
-  if(r.macro) h.push(tag('MACRO', calEsc(r.macro)));
-  ((r.mover || {}).flags || []).forEach(function(f){ h.push(tag(f)); });
+function rowTags(r){      /* [name in TIP, text shown] */
+  var t = (primary(r).tags || []).map(function(f){ return [f, f]; });
+  (r.venue_tags || []).forEach(function(f){ t.push([f.indexOf('ALSO ON') === 0 ? 'ALSO ON' : f, f]); });
+  if(r.macro) t.push(['MACRO', calEsc(r.macro)]);
+  ((r.mover || {}).flags || []).forEach(function(f){ t.push([f, f]); });
   if(r.flow && r.flow.quadrant){
-    h.push(tag(r.flow.quadrant));
-    (r.flow.flags || []).forEach(function(f){ h.push(tag(f)); });
+    t.push([r.flow.quadrant, r.flow.quadrant]);
+    (r.flow.flags || []).forEach(function(f){ t.push([f, f]); });
   }
-  return h;
+  return t;
 }
+function tagChips(r){ return rowTags(r).map(function(x){ return tag(x[0], x[1]); }); }
 function tfLabel(tf){ return (TFM[tf] && TFM[tf].label) || tf.toUpperCase(); }
 
 /* Every coin the scan did not actually analyse gets named here. The point is
@@ -3861,7 +3962,7 @@ var TIP = {
   'COUNTER TREND':   'BTC (BULL or BEAR) or the coin\'s 200 EMA disagrees with the signal, or BTC data is missing. Needs grade A for Yes; otherwise watch only.',
   'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
   'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100. In practice it is the open interest change into B: unreadable when price extreme B falls on the first bar of wave B (there is no interval to measure), when the exchange has no hourly OI history that far back, or when the venue reports no funding.',
-  'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is Data from in the opened row).',
+  'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is Data from on the Market card of the opened row).',
   'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
@@ -4161,7 +4262,7 @@ var LM = 4;
 function pushLog(msg, cls){
   cls = cls || 'in';
   var c = document.getElementById('lc');
-  var t = new Date().toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  var t = phtTime(new Date(), true) + ' PHT';
   c.querySelectorAll('.lcard').forEach(function(x){ x.classList.remove('in','dn','er'); x.classList.add('ol'); });
   var d = document.createElement('div');
   d.className = 'lcard ' + cls + ' ce';
@@ -4192,7 +4293,7 @@ var BM = 60, BOPS = ['pivot_detect','macd_align','swing_check','line_clean','atr
 function rhex(n){ var s = '0x', h = '0123456789abcdef'; for(var i = 0; i < n; i++) s += h[Math.floor(Math.random()*16)]; return s; }
 function pushBg(pair, isHit){
   var f = document.getElementById('sbgFeed'); if(!f) return;
-  var t = new Date().toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  var t = phtTime(new Date(), true);
   var b = pair ? pair.replace('/USDT:USDT','').replace('/USDT','') : '';
   var op = BOPS[Math.floor(Math.random()*BOPS.length)];
   var txt = isHit ? ('[' + t + '] >>> HIT  ' + b.padEnd(10) + ' DIVERGENCE CONFIRMED  ' + rhex(4))
@@ -4206,35 +4307,67 @@ function pushBg(pair, isHit){
 }
 function resetBg(){ var f = document.getElementById('sbgFeed'); if(f) f.innerHTML = ''; }
 
+/* ── The opened row ───────────────────────────────────────────────────────────
+   Top to bottom: the answer strip, the chart with its levels, four context cards,
+   three pattern cards, a glossary. A row that diverges on both timeframes gets a
+   4H | 1H switch: the answer strip is the row's and stays put; the chart, levels,
+   setup, score and the Trend card follow the tab. */
 function kv(k, v){ return '<dt>' + k + '</dt><dd>' + v + '</dd>'; }
-/* One line per rule of the answer, for the primary timeframe: [class, text] with
+function kvl(a){ return '<dl class="kv">' + a.filter(Boolean).map(function(x){ return kv(x[0], x[1]); }).join('') + '</dl>'; }
+function num(t){ return '<span class="num">' + t + '</span>'; }
+function cap(t){ return t.charAt(0) + t.slice(1).toLowerCase(); }
+function sgn(v, unit){ return v == null ? 'n/a' : (v > 0 ? '+' : '') + v + (unit || '%'); }
+/* three significant digits as plain digits (MACD values are tiny) */
+function sig3(v){ return v == null ? 'n/a' : fmtPx(Number(Number(v).toPrecision(3))); }
+function firstSentence(t){ var m = String(t).match(/^.*?[.!?](\s|$)/); return m ? m[0].trim() : String(t); }
+function plain(t){ return '<p class="plain"><b>In plain words</b>' + t + '</p>'; }
+function unprefixed(t){ return t.replace(/^(No|Not yet|Yes[^.]*)\.\s*/, ''); }
+
+/* One chip per rule of the answer, for the timeframe that supplies it: [class, text] with
    '' = passed, 'w' = waiting on it, 'x' = failed. The answer itself comes from the scan. */
 function checks(r){
-  var p = primary(r), tf = primaryTf(r), cfg = TFM[tf] || {}, a = [];
-  var bars = p.bars_ago + ' completed ' + tfLabel(tf) + ' bar' + (p.bars_ago === 1 ? '' : 's') +
-             ' since the signal (limit ' + cfg.fresh_h * 60 / cfg.minutes + ')';
+  var p = primary(r), tf = primaryTf(r), cfg = TFM[tf] || {}, a = [], lim = cfg.fresh_h * 60 / cfg.minutes;
   a.push(p.forming ? (p.trigger_first ? ['', 'Signal bar still forming, lower timeframe already triggered']
                                       : ['w', 'Signal bar still forming, no lower-timeframe trigger yet'])
-                   : [p.fresh ? '' : 'x', bars]);
-  a.push(p.grade === 'C' ? ['x', 'Grade C (' + p.score + ') is too weak'] : ['', 'Grade ' + p.grade + ' (' + p.score + ')']);
-  a.push(p.regime === 'COUNTER TREND' && p.grade !== 'A' ? ['w', 'Counter trend needs grade A']
-       : ['', p.regime.charAt(0) + p.regime.slice(1).toLowerCase()]);
-  a.push(p.status === 'invalidated' ? ['x', 'Price traded through the stop']
+       : p.fresh ? ['', 'Fresh: ' + p.bars_ago + ' of ' + lim + ' bars used']
+                 : ['x', 'Too old: ' + p.bars_ago + ' ' + tfLabel(tf) + ' bars (limit ' + lim + ')']);
+  a.push(p.grade === 'C' ? ['x', 'Grade C, needs B or better'] : ['', 'Grade ' + p.grade]);
+  a.push(p.regime === 'COUNTER TREND' && p.grade !== 'A' ? ['w', 'Counter trend, needs grade A'] : ['', cap(p.regime)]);
+  a.push(p.status === 'invalidated' ? ['x', 'Stop was hit']
        : p.status === 'ran' ? ['x', 'Already ran ' + p.r_reached + 'R']
-       : p.status === 'extended' ? ['w', 'Price has moved ' + p.pct_chg + '% away from the signal']
-       : ['', 'Price still near the signal']);
+       : p.status === 'extended' ? ['w', 'Price moved ' + Math.abs(p.pct_chg) + '% from the signal']
+       : ['', 'Price near the signal']);
   var b = scanMeta.blocker;          /* undefined: a scan saved before the brief existed */
-  if(b === null) a.push(['', 'No major US release on the calendar']);
+  if(b === null) a.push(['', 'No US release due']);
   else if(b && scanTs){
     var h = (b.ts_ms - scanTs) / 3600000;
     a.push(h >= -1 && h <= cfg.macro_h
       ? ['w', calEsc(b.title) + (h > 0 ? ' was ' + calUntil(h * 3600000) + ' away at the scan' : ' had just printed at the scan')]
-      : ['', 'No US release inside the ' + cfg.macro_h + 'h wait window at the scan']);
+      : ['', 'No US release inside ' + cfg.macro_h + 'h']);
   }
   return a;
 }
-/* One block per diverging timeframe: chart, levels and setup, then the answer's
-   checklist and the tags on the timeframe that supplies the answer. */
+/* What to do with the answer, in one sentence. */
+function whatToDo(r){
+  var v = verdict(r);
+  if(v === 'enter') return (primary(r).forming
+      ? 'This passes early: the lower timeframe triggered before the signal bar closed, so it can still change. '
+      : 'This passes the checklist. ') +
+    'Entry, stop and targets are under the chart. Size the trade so a stop-out is a loss you can accept.';
+  if(v === 'wait'){
+    var w = checks(r).filter(function(c){ return c[0] === 'w'; }).map(function(c){ return c[1]; });
+    return 'Close, but not yet. Watch it' + (w.length ? '; it is waiting on this: ' + w.join('; ') + '.' : '. The sentence above says what it is waiting for.');
+  }
+  return 'Skip this one. Nothing to do until a stronger setup shows up.';
+}
+function verdictStrip(r){
+  var ic = {'': '✓', w: '…', x: '×'}, wd = {'': 'passed', w: 'waiting', x: 'failed'};
+  return '<div class="verdict"><div class="vline">' + ansPill(r) + '<span>' + unprefixed(reason(r)) + '</span></div>' +
+    '<div class="chips">' + checks(r).map(function(c){
+      return '<span class="chip ' + (c[0] || 'ok') + '"><i aria-hidden="true">' + ic[c[0]] + '</i><span class="sr">' + wd[c[0]] + ': </span>' + c[1] + '</span>';
+    }).join('') + '</div>' + plain(whatToDo(r)) + '</div>';
+}
+
 /* The chart enlarges over the page (click or Esc closes it) instead of leaving for a new tab. */
 function zoomChart(src, cap){
   var d = document.getElementById('zoom'), img = document.getElementById('zoomImg');
@@ -4244,51 +4377,205 @@ function zoomChart(src, cap){
   d.showModal();
   return false;
 }
-function tfBlock(r, tf){
-  var s = r.signals[tf], t = s.targets || {}, main = tf === primaryTf(r), trig = s.targets_from === 'trigger';
+/* Charts live in the app's memory: after a restart there is none until the next scan. */
+function noChart(img){
+  var d = document.createElement('div');
+  d.className = 'nochartbar';
+  d.innerHTML = '<span>The chart is not in memory after a restart.</span><button type="button" onclick="startScan()">Scan again to draw it</button>';
+  img.closest('.cimg').replaceWith(d);
+}
+function levelsStrip(r, s, tf){
+  var t = s.targets || {}, e = s.entry_ref_price, up = r.side === 'bullish', trig = s.targets_from === 'trigger';
+  var pct = function(v){ if(v == null || !e) return 'n/a'; var p = (v / e - 1) * 100; return (p > 0 ? '+' : '') + p.toFixed(1) + '%'; };
+  var cell = function(c, n, v, sub, hint){
+    return '<div class="' + c + '"><span class="n">' + n + '</span><span class="num">' + fmtPx(v) + '</span><span class="p num">' + sub + '</span><span class="h">' + hint + '</span></div>'; };
+  return '<div class="levels">' + cell('stop', 'Stop', s.stop_price, pct(s.stop_price), 'get out here if wrong') +
+      cell('entry', 'Entry', e, trig ? 'trigger price' : 'signal price', 'where you would get in') +
+      cell('now', 'Now', r.current_price, pct(r.current_price), 'price at the scan') +
+      cell('', '1R', t['1r'], pct(t['1r']), 'gain = what you risk') + cell('', '2R', t['2r'], pct(t['2r']), 'gain = 2x the risk') +
+      cell('', '3R', t['3r'], pct(t['3r']), 'gain = 3x the risk') +
+      cell('struct', 'Structure', t.structure, pct(t.structure), up ? 'top of the bump between A and B' : 'bottom of the dip between A and B') + '</div>' +
+    '<p class="how">Risk to the stop is <b>' + s.risk_pct + '%</b>. ' +
+      (s.forming ? 'The signal bar is still forming.' : 'The signal bar closed <b>' + b2t(s.bars_ago, tf) + '</b>.') +
+      ' Since then price has gone at most <b>' + s.r_reached + 'R</b> toward the targets' +
+      (s.trigger_price != null && !trig ? '; the lower timeframe triggered at <b>' + fmtPx(s.trigger_price) + '</b>' : '') + '.</p>';
+}
+function chartBlock(r, tf){
+  var s = r.signals[tf], up = r.side === 'bullish', capn = r.base + ' ' + tfLabel(tf) + ' ' + r.side + ' divergence';
   var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf;
-  return '<div class="dgrid">' +
-    /* A phone gets the narrow render, readable at its width. Chosen when the row opens: a <picture> would
-       refetch the uncached image every time the window is resized. */
-    '<div><a href="' + src + '" data-cap="' + r.base + ' ' + tfLabel(tf) + ' ' + r.side + ' divergence" onclick="return zoomChart(this.href, this.dataset.cap)" title="Enlarge the chart"><img class="chart" alt="' +
-      r.base + ' ' + tfLabel(tf) + ' chart needs a fresh scan" src="' + src + (matchMedia('(max-width:640px)').matches ? '&w=narrow' : '') +
-      '" onerror="var p=document.createElement(\'p\');p.className=\'calm\';p.textContent=this.alt;this.parentNode.replaceWith(p)"></a></div>' +
-    '<div><span class="lbl">' + tfLabel(tf) + ' levels</span><dl class="kv num">' +
-      kv('Now', fmtPx(r.current_price)) +
-      kv('Entry', fmtPx(s.entry_ref_price) + (trig ? ' (trigger price)' : ' (signal price)')) +
-      (s.trigger_price != null && !trig ? kv('Trigger', fmtPx(s.trigger_price)) : '') +
-      kv('Stop', fmtPx(s.stop_price) + ' (' + s.risk_pct + '%)') +
-      kv('1R', fmtPx(t['1r'])) + kv('2R', fmtPx(t['2r'])) + kv('3R', fmtPx(t['3r'])) +
-      kv('Structure', fmtPx(t.structure)) + '</dl>' +
-      '<span class="lbl">Setup</span><dl class="kv">' +
-      kv('A', s.pivot1_time + ' @ ' + fmtPx(s.pivot1_price)) +
-      kv('B', s.pivot2_time + ' @ ' + fmtPx(s.pivot2_price)) +
-      kv('Signal', (s.forming ? 'bar still forming' : s.signal_time + ' (' + b2t(s.bars_ago, tf) + ')') + ' @ ' + fmtPx(s.signal_price)) +
-      kv('Regime', '<span' + tip(s.regime) + '>' + s.regime + '</span> &middot; ' + (SC[s.status] || SC.active) +
-        ' (' + (s.pct_chg >= 0 ? '+' : '') + s.pct_chg + '% in signal direction)') +
-      kv('Data from', (r.exchange || '').toUpperCase() + ' &middot; ' + fmtVol(r.weekly_volume) + ' / week') +
-      kv('Timeframes', r.tfs.map(tfLabel).join(' + ')) + '</dl></div>' +
-    '<div>' + (main
-      ? '<span class="lbl">Why this answer</span><ul class="chk">' +
-        checks(r).map(function(c){ return '<li class="' + c[0] + '">' + c[1] + '</li>'; }).join('') + '</ul>' +
-        '<p class="full">' + reason(r) + '</p>'
-      : '<span class="lbl">' + tfLabel(tf) + ' also diverges</span><p class="full">Grade ' + s.grade + ' (' + s.score +
-        '). The answer comes from ' + tfLabel(primaryTf(r)) + '.</p>') +
-      '<span class="lbl">Score inputs</span><dl class="kv">' +
-      kv('MACD A to B', s.pivot1_macd + ' &rarr; ' + s.pivot2_macd) +
-      kv('Higher TF', s.htf_ok == null ? 'n/a' : s.htf_ok ? 'agrees' : 'no') +
-      kv('OI into B', s.oi_chg_pct == null ? 'n/a' : s.oi_chg_pct + '%') +
-      kv('BTC', s.btc_state || 'n/a') +
-      kv('Volume', s.vol_dry ? 'drying' : 'not drying') +
-      kv('Wick', s.wick ? 'yes' : 'no') + (s.triple ? kv('Triple', 'yes') : '') +
-      (s.partial ? kv('Score', 'partial data') : '') + '</dl>' +
-      (main ? '<span class="lbl">All tags</span><div>' + (tagChips(r).join('') || '<span class="calm">None</span>') +
-              (r.context_error ? '<span class="calm" title="' + calEsc(r.context_error) + '"> Movers and OI context unavailable.</span>' : '') + '</div>' : '') +
-    '</div></div>';
+  /* A phone gets the narrow render, readable at its width. Chosen when the row opens: a <picture> would
+     refetch the uncached image every time the window is resized. */
+  return '<div class="chartbig"><div class="cimg"><a href="' + src + '" data-cap="' + capn + '" onclick="return zoomChart(this.href, this.dataset.cap)" title="Enlarge the chart">' +
+      '<img class="chart" alt="' + capn + ': chart with entry, stop and targets" src="' + src + (matchMedia('(max-width:640px)').matches ? '&w=narrow' : '') +
+      '" onerror="noChart(this)"></a>' +
+      '<p class="how"><b>How to read it.</b> Candles are price. <b>A</b> and <b>B</b> are the two ' + (up ? 'lows' : 'highs') +
+      ' being compared. The solid line is the entry, the dashed line is the stop, the dotted lines are profit targets. The lower panel is MACD, a measure of how strong the move is; its two ' +
+      (up ? 'troughs' : 'peaks') + ' at A and B are what the screener compares. Times are Philippine time (PHT).</p></div>' +
+    levelsStrip(r, s, tf) + '</div>';
+}
+
+/* The "In plain words" line of each context card, chosen from the data. */
+function trendSay(r, s){
+  var up = r.side === 'bullish', bet = up ? 'a bet on a rise' : 'a bet on a fall';
+  if(!s.btc_state) return 'BTC data was unavailable at the scan, so the wider trend could not be read. The setup is treated as counter trend and needs grade A.';
+  if(s.regime === 'WITH TREND') return 'The wider market is moving the same way as this trade. That is the easier side to be on.';
+  if(s.regime === 'CHOP') return 'The wider market has no clear direction, so it neither helps nor hurts this trade.';
+  if(s.btc_state === (up ? 'BULL' : 'BEAR')) return 'BTC is moving the same way, but this coin is on the wrong side of its own 200 EMA, so this is still ' + bet + ' against its trend. Only the strongest setups (grade A) qualify.';
+  return 'The wider market is moving the other way and this is ' + bet + '. Trades against the market fail more often, so only the strongest setups (grade A) qualify.';
+}
+var FLOW_SAY = {
+  'CAPITULATION':   'Traders have been closing their bets while price fell. The selling may be running out, but nobody is stepping in to buy yet.',
+  'NEW LONGS':      'New money is betting on a rise while price climbs.',
+  'NEW SHORTS':     'New money is betting on a fall while price drops.',
+  'SHORT COVERING': 'Price is rising because sellers are closing their bets, not because new buyers arrived.',
+  'SPOT-LED':       'Buyers are not paying extra to hold those bets: the healthy version of a rise.',
+  'CROWDED LONGS':  'Buyers are crowded and paying a high fee to stay in, which often comes late in a move.',
+  'SQUEEZE FUEL':   'Sellers are crowded and paying to stay in; if price turns up they may be forced to buy back.',
+  'HIGH OI/VOL':    'Open bets are large next to a normal day of trading, so people leaving can move the price. Size down.'
+};
+function flowSay(r){
+  var f = r.flow;
+  if(!f) return 'Open interest data is unavailable for this coin (' + (r.context_error ? calEsc(r.context_error) : 'too little history') + '), so positioning cannot be read.';
+  if(!f.quadrant) return 'Open bets barely changed over the week. Nothing unusual in how traders are positioned.';
+  return [FLOW_SAY[f.quadrant] || 'Nothing unusual in how traders are positioned.']
+    .concat((f.flags || []).map(function(k){ return FLOW_SAY[k] || ''; }))
+    .concat(f.funding_day_pct == null ? ['Funding is not reported for this coin.'] : []).filter(Boolean).join(' ');
+}
+function daySay(r){
+  var m = r.mover, fl = (m && m.flags) || [];
+  if(!m) return 'Daily candles are unavailable for this coin (' + (r.context_error ? calEsc(r.context_error) : 'too little history') + '), so the last day cannot be read.';
+  var vol = m.vol_mult == null ? 'volume that cannot be compared' : (m.vol_mult >= TH.vol ? 'heavy' : m.vol_mult <= 0.7 ? 'light' : 'normal') + ' volume';
+  var where = fl.indexOf('ABOVE 7D HIGH') >= 0 ? 'above its 7-day high' : fl.indexOf('BELOW 7D LOW') >= 0 ? 'below its 7-day low'
+            : (m.pos_in_range < 25 ? 'near the bottom' : m.pos_in_range > 75 ? 'near the top' : 'in the middle') + ' of its week';
+  return (Math.abs(m.chg_1d_pct) >= TH.chg ? 'A big ' : 'An ordinary ') + (m.chg_1d_pct < 0 ? 'down' : 'up') + ' day on ' + vol + '. Price is ' + where + '.' +
+    (fl.indexOf('RANGE EXPANSION') >= 0 ? ' The day\'s range was unusually wide.' : '');
+}
+function alsoOn(r){
+  var t = (r.venue_tags || []).filter(function(x){ return x.indexOf('ALSO ON ') === 0; })[0];
+  return t ? t.slice(8) : '';
+}
+function marketSay(r){
+  var floor = scanMeta.min_weekly_vol, off = (r.venue_tags || []).indexOf('NOT ON BINANCE') >= 0;
+  return (r.weekly_volume == null ? 'Its weekly volume is unknown.'
+        : floor && r.weekly_volume < floor ? 'Thinly traded: below the volume floor, so expect worse fills and size down.'
+        : 'Busy enough to get in and out easily.') + ' ' +
+    (scanMeta.exchange !== 'all' ? 'Only this exchange was scanned.'
+     : alsoOn(r) ? 'The same setup also shows on ' + alsoOn(r) + '.' : 'The setup shows on this exchange only.') +
+    (off ? ' Binance does not list this coin.' : '');
+}
+function contextCards(r, tf){
+  var s = r.signals[tf], f = r.flow, m = r.mover, word = r.side === 'bullish' ? 'long' : 'short', b = scanMeta.btc;
+  var card = function(lbl, hl, body, say){ return '<div class="card"><span class="lbl">' + lbl + '</span><span class="hl">' + hl + '</span>' + body + plain(say) + '</div>'; };
+  return '<div class="sec"><b>Context</b><span>what is going on around this setup</span></div><div class="four">' +
+    card('Trend &middot; ' + tfLabel(tf), '<span' + tip(s.regime) + '>' + cap(s.regime) + '</span> for a ' + word,
+      kvl([['BTC (4H)', s.btc_state ? s.btc_state.toLowerCase() : 'not available'],
+           [r.base + ' vs 200 EMA', s.above_ema200 ? 'above' : 'below'],
+           ['Higher TF (' + ((TFM[tf] || {}).htf || 'n/a') + ')', s.htf_ok == null ? 'not checked' : s.htf_ok ? 'agrees' : 'does not agree'],
+           ['Since the signal', (SC[s.status] || SC.active) + ', ' + num(sgn(s.pct_chg))]]), trendSay(r, s)) +
+    card('Positioning, 7 days to the last daily close', !f ? 'No data' : f.quadrant ? '<span' + tip(f.quadrant) + '>' + cap(f.quadrant) + '</span>' : 'Quiet',
+      !f ? '' : kvl([f.price_chg_pct != null && ['Price', num(sgn(f.price_chg_pct))], ['Open bets (OI)', num(sgn(f.oi_chg_pct))],
+                     f.quadrant && ['Funding', f.funding_day_pct == null ? 'not reported' : num(sgn(f.funding_day_pct, '% / day'))]]), flowSay(r)) +
+    card('Last daily bar', !m ? 'No data' : num(sgn(m.chg_1d_pct)) + ' on ' + (m.vol_mult == null ? 'unknown' : num(m.vol_mult + 'x')) + ' volume',
+      !m ? '' : '<div><div class="rng"><i style="left:' + m.pos_in_range + '%"></i></div><div class="rngl num"><span>7d low ' + fmtPx(m.r_lo) + '</span><span>7d high ' + fmtPx(m.r_hi) + '</span></div></div>' +
+        kvl([['Prior day', num(fmtPx(m.pdl) + ' to ' + fmtPx(m.pdh))], m.range_mult != null && ['Range vs usual', num(m.range_mult + 'x')],
+             m.chg_live_pct != null && ['Since that close', num(sgn(m.chg_live_pct))]]), daySay(r)) +
+    card('Market', r.weekly_volume == null ? 'Volume unknown' : num(fmtVol(r.weekly_volume)) + ' traded a week',
+      kvl([['Data from', (r.exchange || 'n/a').toUpperCase()], ['Also seen on', alsoOn(r) || (scanMeta.exchange === 'all' ? 'no other exchange' : 'not checked')],
+           ['Diverges on', r.tfs.map(tfLabel).join(' and ')],
+           b ? ['BTC now', b.state.toLowerCase() + ', ' + num(fmtPx(b.close))] : b === null ? ['BTC now', 'not available'] : null,
+           r.macro && ['Calendar', calEsc(r.macro.replace(/^MACRO /, ''))]]), marketSay(r)) +
+    '</div>';
+}
+
+function setupCard(r, s, tf){
+  var up = r.side === 'bullish', dp = ((s.pivot2_price / s.pivot1_price - 1) * 100).toFixed(1);
+  var st = function(k, when, v){ return '<div class="step"><span class="k" aria-hidden="true">' + k + '</span><span class="t">' + when + '</span><span class="v num">' + v + '</span></div>'; };
+  return '<div class="card"><span class="lbl">The setup &middot; ' + tfLabel(tf) + '</span>' +
+    st('A', 'A: ' + s.pivot1_time + ' PHT', fmtPx(s.pivot1_price)) + st('B', 'B: ' + s.pivot2_time + ' PHT', fmtPx(s.pivot2_price)) +
+    st('S', 'Signal bar: ' + (s.forming ? 'still forming' : s.signal_time + ' PHT, ' + b2t(s.bars_ago, tf)), fmtPx(s.signal_price)) +
+    '<p class="say">From A to B price made a <b>' + (up ? 'lower low' : 'higher high') + '</b> (<span class="num">' + (dp > 0 ? '+' : '') + dp +
+    '%</span>) while MACD made a <b>' + (up ? 'higher trough' : 'lower peak') + '</b> (<span class="num">' + sig3(s.pivot1_macd) +
+    '</span> to <span class="num">' + sig3(s.pivot2_macd) + '</span>).</p>' +
+    plain('Price ' + (up ? 'fell further, but the selling had less force' : 'rose further, but the buying had less force') +
+          '. That hints the move is tiring. It is a clue, not a guarantee.') + '</div>';
+}
+/* The score card is drawn from the parts the scan sends (score_parts), never re-derived here. */
+var PART_LBL = {price_move: 'Size of the price move', macd: 'MACD improvement', bump: 'Bump between A and B',
+  zero: 'Both on the right side of zero', vol_dry: 'Volume drying up at B', wick: 'Rejection wick at B',
+  triple: 'Third divergence in a row', htf: 'Higher timeframe agrees', oi: 'Open interest falling into B', btc: 'BTC agrees'};
+function scoreSums(s){
+  var o = {ps: 0, cs: 0, ca: 0, pen: false};
+  (s.score_parts || []).forEach(function(p){
+    if(p.group === 'pattern') o.ps += p.pts;
+    else if(p.checked){ o.cs += p.pts; o.ca += p.max; if(p.pts < 0) o.pen = true; }
+  });
+  return o;
+}
+function scoreSay(s){
+  var o = scoreSums(s), ps = Math.round(o.ps);
+  return (o.ps >= 49 ? 'The pattern itself is strong' : o.ps >= 35 ? 'The pattern itself is decent' : 'The pattern itself is weak') + ' (' + ps + ' of 70)' +
+    (o.ca === 0 ? ', and none of the context around it could be checked.'
+     : o.cs <= 0 ? ', but nothing around it supports it (' + o.cs + ' of ' + o.ca + ').'
+     : o.cs >= o.ca * 2 / 3 ? ' and the market around it supports it (' + o.cs + ' of ' + o.ca + ').'
+     : ', with only partial support around it (' + o.cs + ' of ' + o.ca + ').') +
+    (o.pen ? ' Open interest rose into B against the trade, which costs 10 points.' : '') +
+    (o.ca < 30 ? ' Some context could not be checked, so the score is ' + Math.round(o.ps + o.cs) + ' of the ' + (70 + o.ca) + ' points that could be, scaled to 100: ' + s.score + '.' : '');
+}
+function scoreCard(s, tf){
+  var o = scoreSums(s);
+  var bar = function(n, got, max){ return '<div class="barrow"><span>' + n + '</span><div class="sbar"><span style="width:' + (max ? Math.max(0, got) / max * 100 : 0) +
+    '%"></span></div><span class="num">' + Math.round(got) + ' / ' + max + '</span></div>'; };
+  var extra = {htf: ' (' + ((TFM[tf] || {}).htf || 'n/a') + ')', oi: s.oi_chg_pct == null ? '' : ' (' + sgn(s.oi_chg_pct) + ')', btc: s.btc_state ? ' (' + s.btc_state.toLowerCase() + ')' : ''};
+  var part = function(p){
+    var st = !p.checked ? ['miss', '–', 'not checked'] : p.pts < 0 ? ['neg', '×', Math.round(p.pts) + ' / ' + p.max]
+           : [p.pts > 0 ? '' : 'miss', p.pts > 0 ? '✓' : '–', Math.round(p.pts) + ' / ' + p.max];
+    return '<div class="part ' + st[0] + '"><i aria-hidden="true">' + st[1] + '</i><span>' + PART_LBL[p.key] + (extra[p.key] || '') + '</span><span class="num">' + st[2] + '</span></div>';
+  };
+  return '<div class="card"><span class="lbl">Score ' + s.score + ' of 100 &middot; grade ' + s.grade + ' &middot; ' + tfLabel(tf) + '</span>' +
+    bar('Pattern', o.ps, 70) + bar('Context', o.cs, o.ca) +
+    '<div class="parts">' + (s.score_parts || []).map(part).join('') + '</div>' + plain(scoreSay(s)) + '</div>';
+}
+/* Every tag of the row with the first sentence of its definition (past an 'All-exchanges scan only.' preamble);
+   the full one stays in the tooltip. */
+function tagsCard(r){
+  var t = rowTags(r);
+  return '<div class="card"><span class="lbl">Tags</span>' + (t.length ? '<div class="tagl">' + t.map(function(x){
+      return '<div>' + tag(x[0], x[1]) + '<span class="m">' + firstSentence((TIP[x[0]] || '').replace(/^All-exchanges scan only\.\s*/, '')) + '</span></div>'; }).join('') + '</div>'
+    : '<span class="calm">No tags on this row.</span>') + '</div>';
+}
+function words(up){
+  var W = [['Divergence', 'Price and momentum disagree. Price makes a new ' + (up ? 'low' : 'high') + ' but with less force than before. A hint the move is tiring, not a promise it reverses.'],
+    ['MACD', 'A line that measures how strong a move is. ' + (up ? 'Higher troughs mean selling is weakening.' : 'Lower peaks mean buying is weakening.')],
+    ['R', 'Your risk: the distance from entry to stop. 2R means a gain twice the size of what you risked.'],
+    ['Stop', 'The price where the idea is proven wrong and you exit.'],
+    ['Grade and score', 'How clean the setup is, 0 to 100. A is 70 or more, B is 55 to 69, C is below 55 and is skipped.'],
+    ['Counter trend', 'Trading against the direction of the wider market. Needs grade A.'],
+    ['Open interest (OI)', 'The amount of money in open futures bets. Falling OI means traders are closing positions.'],
+    ['Funding', 'A small fee between buyers and sellers of futures. Strongly positive means buyers are crowded.'],
+    ['200 EMA', 'The average price over the last 200 bars. Above it is broadly an uptrend, below it a downtrend.'],
+    ['PHT', 'Philippine time, UTC+8. Every time on this page uses it.']];
+  return '<details class="words"><summary>Words used here</summary><dl>' + W.map(function(w){ return '<dt>' + w[0] + '</dt><dd>' + w[1] + '</dd>'; }).join('') + '</dl></details>';
+}
+
+var openTf = null;      /* the timeframe tab showing in the opened row; null = the one that supplies the answer */
+function shownTf(r){ return r.signals[openTf] ? openTf : primaryTf(r); }
+function tfSwitch(r, tf){
+  if(r.tfs.length < 2) return '';
+  return '<div class="tfsw" role="group" aria-label="Timeframe shown">' + r.tfs.map(function(t){
+    return '<button type="button" data-tf="' + t + '" aria-pressed="' + (t === tf) + '">' + tfLabel(t) +
+      (t === primaryTf(r) ? '<span class="mark">gives the answer</span>' : '') + '</button>'; }).join('') + '</div>';
 }
 function detailRow(r){
-  var tfs = [primaryTf(r)].concat(r.tfs.filter(function(t){ return t !== primaryTf(r); }));
-  return '<tr class="det"><td colspan="7"><div class="detw">' + tfs.map(function(tf){ return tfBlock(r, tf); }).join('') + '</div></td></tr>';
+  var tf = shownTf(r), s = r.signals[tf], ptf = primaryTf(r), own = (r.verdicts || {})[tf];
+  return '<tr class="det"><td colspan="7"><div class="detw">' + tfSwitch(r, tf) + verdictStrip(r) +
+    (r.tfs.length > 1 ? plain('Both ' + r.tfs.map(tfLabel).join(' and ') + ' show the same ' + r.side + ' divergence. The answer above comes from ' +
+                              tfLabel(ptf) + ', the better of the two; the switch shows each one\'s chart, levels and score.') : '') +
+    (tf !== ptf && own ? '<p class="alone">On ' + tfLabel(tf) + ' alone this would be: <b>' + (own.verdict === 'enter' && s.forming ? 'Yes (early)' : ANS[own.verdict]) +
+                         '</b>. ' + unprefixed(reasonOf(own)) + '</p>' : '') +
+    chartBlock(r, tf) + contextCards(r, tf) +
+    '<div class="sec"><b>The pattern</b><span>what the screener found on ' + tfLabel(tf) + ' and how it scored it</span></div>' +
+    '<div class="three">' + setupCard(r, s, tf) + scoreCard(s, tf) + tagsCard(r) + '</div>' + words(r.side === 'bullish') +
+    '</div></td></tr>';
 }
 var openKey = null, showNo = false;
 function buildRow(r){
@@ -4333,10 +4620,19 @@ function rowEl(k){
 function toggleRow(t){
   var k = t.dataset.k;
   openKey = openKey === k ? null : k;
+  openTf = null;                       /* a row opens on the timeframe that supplies its answer */
   renderAll(pendR);
   if(rowEl(k)) rowEl(k).focus({preventScroll:true});
 }
 document.getElementById('resB').addEventListener('click', function(e){
+  var tab = e.target.closest('.tfsw button');
+  if(tab){                             /* the 4H | 1H switch of the opened row */
+    openTf = tab.dataset.tf;
+    renderAll(pendR);
+    var again = document.querySelector('.tfsw button[data-tf="' + openTf + '"]');
+    if(again) again.focus({preventScroll:true});
+    return;
+  }
   var t = e.target.closest('tr.row'); if(t) toggleRow(t);
 });
 document.getElementById('resB').addEventListener('keydown', function(e){
@@ -4376,7 +4672,7 @@ function renderBrief(){
   var R = pendR, byScore = function(a, b){ return b.score - a.score; };
   var yes = R.filter(function(r){ return verdict(r) === 'enter'; }).sort(byScore);
   var wait = R.filter(function(r){ return verdict(r) === 'wait'; }).sort(byScore);
-  var hr = new Date().getHours(), hi = hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+  var hr = phtParts(new Date()).h, hi = hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
   document.getElementById('briefH').textContent = hi + '. ' + (
     yes.length ? yes.length + (yes.length === 1 ? ' setup passes' : ' setups pass') + ' the checklist; the rest can wait.'
     : wait.length ? 'Nothing passes yet. ' + wait.length + (wait.length === 1 ? ' setup is' : ' setups are') + ' close.'
@@ -4404,7 +4700,7 @@ function renderBrief(){
 document.getElementById('picks').addEventListener('click', function(e){
   var b = e.target.closest('.pick'); if(!b) return;
   var r = pendR.filter(function(x){ return rowKey(x) === b.dataset.k; })[0]; if(!r) return;
-  openKey = b.dataset.k;
+  openKey = b.dataset.k; openTf = null;
   if(!matches(r, af)) setTab('all');
   if(verdict(r) === 'skip') showNo = true;
   renderAll(pendR);
@@ -4539,7 +4835,7 @@ function startScan(){
 
 /* Before any scan the brief is the welcome: headline, one sentence, and the Run Scan button under it. */
 function renderWelcome(){
-  var h = new Date().getHours();
+  var h = phtParts(new Date()).h;
   var subs = ['Ready to find divergences.',
               '4H and 1H, regular divergences only.',
               'Every liquid perp, one scan, one table.',
@@ -4550,7 +4846,6 @@ function renderWelcome(){
 
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 var _cal = {events: [], meta: {}, ts: null}, _cf = 'movers', _calSel = null;
-var CAL_DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 var CAL_MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 /* Short names for the grid chips; the full title lives in the tooltip and the day table. */
 var CAL_SHORT = [
@@ -4578,16 +4873,27 @@ function calShort(t){
   return t.replace(/\s+(m\/m|q\/q|y\/y)$/i, '');
 }
 function calPad(n){ return (n < 10 ? '0' : '') + n; }
-function calHM(d){ return calPad(d.getHours()) + ':' + calPad(d.getMinutes()); }
+/* Every clock time and calendar day on the page is Philippine time (PHT), 12-hour, whatever zone the browser is in. */
+var PHT_PARTS = new Intl.DateTimeFormat('en-US', {timeZone: 'Asia/Manila', hourCycle: 'h23', weekday: 'short',
+                                                  year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric'});
+function phtParts(d){
+  var o = {};
+  PHT_PARTS.formatToParts(d).forEach(function(p){ o[p.type] = p.value; });
+  return {y: +o.year, m: +o.month, d: +o.day, h: +o.hour % 24, dow: o.weekday};
+}
+function phtTime(d, sec){
+  return new Date(d).toLocaleTimeString('en-US', {timeZone: 'Asia/Manila', hour: 'numeric', minute: '2-digit', second: sec ? '2-digit' : undefined});
+}
+function calHM(d){ return phtTime(d); }
 function calUTC(d){ return calPad(d.getUTCHours()) + ':' + calPad(d.getUTCMinutes()) + ' UTC'; }
-function calDayKey(d){ return d.getFullYear() + '-' + calPad(d.getMonth() + 1) + '-' + calPad(d.getDate()); }
-function calDayLabel(d){ return CAL_DOW[d.getDay()] + ' ' + d.getDate() + ' ' + CAL_MON[d.getMonth()]; }
+function calDayKey(d){ var p = phtParts(d); return p.y + '-' + calPad(p.m) + '-' + calPad(p.d); }
+function calDayLabel(d){ var p = phtParts(d); return p.dow + ' ' + p.d + ' ' + CAL_MON[p.m - 1]; }
 /* ForexFactory's own permalink shape, e.g. calendar?day=sep23.2026. If the
    param is ever rejected the site just opens on the current calendar, so a
    miss costs a click rather than a broken link. */
 function calFFUrl(d){
   return 'https://www.forexfactory.com/calendar?day=' +
-         CAL_MON[d.getMonth()].toLowerCase() + d.getDate() + '.' + d.getFullYear();
+         CAL_MON[phtParts(d).m - 1].toLowerCase() + phtParts(d).d + '.' + phtParts(d).y;
 }
 function calUntil(ms){
   if(ms <= 0) return 'now';
@@ -4622,7 +4928,7 @@ function calBanner(now){
   var sibs = _cal.events.filter(function(e){ return e.mover && e.ts === n.e.ts; });
   var d = new Date(n.t), soon = (n.t - now) <= 86400000;
   var names = sibs.map(function(e){ return calShort(e.title); }).join(' + ');
-  var when = calDayLabel(d) + ' ' + calHM(d);
+  var when = calDayLabel(d) + ' ' + calHM(d) + ' PHT';
   var vals = sibs.map(function(e){
     return '<b>' + calEsc(calShort(e.title)) + '</b> fc ' + (calEsc(e.forecast) || '&mdash;') + ' / prev ' + (calEsc(e.previous) || '&mdash;');
   }).join(' &nbsp;&middot;&nbsp; ');
@@ -4644,20 +4950,19 @@ function calGrid(now){
   var g = document.getElementById('cal-grid'); g.innerHTML = '';
   var byDay = {};
   calFiltered().forEach(function(e){ var k = calDayKey(new Date(e.ts)); (byDay[k] = byDay[k] || []).push(e); });
-  var start = new Date(now); start.setHours(0, 0, 0, 0);
-  if(_calSel === null) _calSel = calDayKey(start);
+  if(_calSel === null) _calSel = calDayKey(new Date(now));
   /* Past the horizon the feeds actually cover, a blank cell means "no data", not "quiet".
      This is the requested range, not the last event: an empty Saturday inside a published week is genuinely quiet. */
   var coveredTo = _cal.meta.covered_to || '';
   for(var i = 0; i < 14; i++){
-    var d = new Date(start.getTime()); d.setDate(start.getDate() + i);
+    var d = new Date(now + i * 86400000), dp = phtParts(d);      /* Manila has no clock changes: a day is 24 hours */
     var k = calDayKey(d), list = byDay[k] || [];
     var soon = list.some(function(e){ var t = new Date(e.ts).getTime(); return e.mover && t > now && t - now <= 86400000; });
     var cell = document.createElement('div');
     cell.className = 'cal-day' + (i === 0 ? ' today' : '') + (soon ? ' soon' : '') + (k === _calSel ? ' sel' : '');
     cell.dataset.k = k;
-    var html = '<div class="cal-dh"><span class="cal-dow">' + CAL_DOW[d.getDay()] + '</span>' +
-               '<span class="cal-dn">' + d.getDate() + ((d.getDate() === 1 || i === 0) ? ' ' + CAL_MON[d.getMonth()] : '') + '</span></div>';
+    var html = '<div class="cal-dh"><span class="cal-dow">' + dp.dow + '</span>' +
+               '<span class="cal-dn">' + dp.d + ((dp.d === 1 || i === 0) ? ' ' + CAL_MON[dp.m - 1] : '') + '</span></div>';
     if(list.length === 0){
       var nodata = coveredTo && k > coveredTo;
       html += '<div class="cal-quiet">' + (nodata ? 'no data yet' : 'quiet') + '</div>';
@@ -4683,7 +4988,7 @@ function calGrid(now){
 }
 function calDetail(now){
   var sel = _calSel, rows = calFiltered().filter(function(e){ return calDayKey(new Date(e.ts)) === sel; });
-  var p = sel.split('-'), d = new Date(+p[0], +p[1] - 1, +p[2]);
+  var p = sel.split('-'), d = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2]));      /* midnight UTC is 8 AM that day in Manila */
   var ffl = document.getElementById('cal-ff-day');
   ffl.href = calFFUrl(d);
   ffl.textContent = 'Open ' + calDayLabel(d) + ' on ForexFactory \u2197';

@@ -68,12 +68,27 @@ serves both the API and a browser dashboard.
 - **One row per coin and side**: when 4H and 1H diverge the same way they
   share a row, which takes its answer, grade and levels from the better
   signal (Yes beats Not yet beats No, 4H wins a tie); the brighter timeframe
-  shows which. Click a row (or focus it and press Enter or Space) for each
-  timeframe's levels, setup, score inputs and a chart of the A-to-B leg: A and
-  B labelled with their price and MACD value, the crossovers, and the entry,
-  stop and 1R / 2R / 3R lines with their prices. The primary timeframe also
-  lists "Why this answer" (a tick, wait or cross per check, then the full
-  reason) and every tag.
+  shows which. The `4H+1H`, `4H only` and `1H only` filters pick rows by
+  which timeframes diverge.
+- **The opened row**: click a row (or focus it and press Enter or Space). Top
+  to bottom: the answer strip (the answer, its reason, a tick / dots / cross
+  chip per check and an "In plain words" line saying what to do); the chart
+  of the A-to-B leg across the full width, with a one-line guide and a levels
+  strip (stop, entry, now, 1R / 2R / 3R and the structure target, each with
+  its distance from entry); four context cards (trend, 7-day positioning, the
+  last daily bar, the market), each ending in plain words; then the setup as
+  steps A / B / signal, the score card and every tag with the first sentence
+  of its meaning; and a closed "Words used here" glossary. The score card is
+  drawn from the parts `score_signal` adds up (`score_parts`), so it cannot
+  drift from the score; context that could not be checked reads "not
+  checked". A row that diverges on both timeframes gets a `4H | 1H` switch:
+  the answer strip stays the row's, the chart, levels, setup, score and Trend
+  card follow the tab, and the other tab says what that timeframe alone would
+  answer. After a restart the charts are gone from memory: the row shows one
+  line with a button that scans again.
+- **Philippine time everywhere**: every clock time and calendar day on the
+  five pages and on the chart axis is PHT (UTC+8) in 12-hour form, whatever
+  time zone the browser or the machine is in.
 - **The brief**: the Scan page opens with plain sentences built from the last
   scan: how many setups pass, BTC's 4H state (close, 200 EMA, RSI) and what it
   means for entries, the nearest blocking USD print with a live countdown and
@@ -279,7 +294,7 @@ account with no credits left rather than a bad key; the audit line says
 which. Both caches live in `calendar_state.json`. The Refresh button
 re-fetches at most once every five minutes.
 
-**Times.** Shown in your browser's local time, with UTC in the tooltip. The
+**Times.** Shown in Philippine time (PHT, UTC+8) whatever the browser's time zone, with UTC in the tooltip. The
 script measures JBlanked's clock against the shared ForexFactory events on
 every refresh, corrects it, and reports the shift in the audit line. If
 ForexFactory is unreachable there is nothing to measure against, so the last

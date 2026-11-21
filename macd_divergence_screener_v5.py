@@ -3059,7 +3059,8 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MACD Divergence Screener</title>
+<title>Divergence Screener</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='14' fill='%23121926' stroke='%232C3A52'/%3E%3Cg stroke-width='5' stroke-linecap='round'%3E%3Cpath d='M16 20L48 32' stroke='%23D99AA0'/%3E%3Cpath d='M16 46L48 38' stroke='%238FBF9F'/%3E%3C/g%3E%3Cg fill='%23D99AA0'%3E%3Ccircle cx='16' cy='20' r='4.5'/%3E%3Ccircle cx='48' cy='32' r='4.5'/%3E%3C/g%3E%3Cg fill='%238FBF9F'%3E%3Ccircle cx='16' cy='46' r='4.5'/%3E%3Ccircle cx='48' cy='38' r='4.5'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 /* One calm column: brief first, short table second, everything else on click. Inter for words, mono only for numbers. */
@@ -4380,6 +4381,8 @@ function renderBrief(){
     yes.length ? yes.length + (yes.length === 1 ? ' setup passes' : ' setups pass') + ' the checklist; the rest can wait.'
     : wait.length ? 'Nothing passes yet. ' + wait.length + (wait.length === 1 ? ' setup is' : ' setups are') + ' close.'
     : 'Nothing passes the checklist right now. No trade is a fine answer.');
+  /* the tab says at a glance whether anything passes */
+  document.title = (yes.length ? yes.length + ' Yes · ' : wait.length ? wait.length + ' Not yet · ' : '') + 'Divergence Screener';
   briefState();
   var list = yes.length ? yes.slice(0, 3) : wait.length ? wait.slice(0, 2)
            : R.slice().sort(function(a, b){ return ageMin(a) - ageMin(b); }).slice(0, 3);

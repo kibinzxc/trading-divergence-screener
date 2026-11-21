@@ -207,6 +207,14 @@ class BuildRows(unittest.TestCase):
         self.assertEqual((r["primary_tf"], r["entry"]["verdict"], r["status"], r["tfs"]),
                          ("1h", "enter", "active", ["4h", "1h"]))
 
+    def test_row_carries_each_timeframes_own_verdict(self):
+        r = m.build_rows([full_sig("4h", "bullish", status="invalidated"), full_sig("1h", "bullish")])[0]
+        self.assertEqual({tf: v["verdict"] for tf, v in r["verdicts"].items()}, {"4h": "skip", "1h": "enter"})
+        self.assertIn("hit the stop", r["verdicts"]["4h"]["reason"])
+        self.assertEqual(r["verdicts"][r["primary_tf"]], r["entry"])
+        one = m.build_rows([full_sig("1h", "bearish")])[0]
+        self.assertEqual(list(one["verdicts"]), ["1h"])
+
     def test_4h_is_primary_on_a_verdict_tie(self):
         r = m.build_rows([full_sig("4h", "bullish"), full_sig("1h", "bullish")])[0]
         self.assertEqual(r["primary_tf"], "4h")

@@ -92,6 +92,39 @@ BARE = dict(FULL, zero_ok=False, vol_dry=False, wick=False, triple=False)
 
 
 class Score(unittest.TestCase):
+    CASES = [(FULL, True, -3.0, 0.0, "BULL"), (BARE,), (BARE, True, -3.0, 0.0), (FULL, None, None, None, "BULL"),
+             (FULL, True, 9.0, 0.02, "BULL"), (BARE, False, 1.0, 0.0, "CHOP"),
+             (dict(BARE, price_atr=0.4, macd_frac=0.2, bump_frac=0.4, wick=True), True, 9.0, 0.02, "BEAR"),
+             (dict(FULL, side="bearish"), None, -3.0, 0.01, None)]
+
+    def test_parts_add_up_to_the_score_for_full_and_partial_data(self):
+        for args in self.CASES:
+            parts, (score, _, partial) = m.score_parts(*args), m.score_signal(*args)
+            got = sum(p["pts"] for p in parts if p["checked"])
+            avail = sum(p["max"] for p in parts if p["checked"])
+            self.assertEqual(int(max(0, min(100, round(got / avail * 100)))), score, args)
+            self.assertEqual(avail < 100, partial, args)
+            self.assertEqual(sum(p["max"] for p in parts), 100)
+
+    def test_parts_are_named_grouped_and_say_what_was_not_checked(self):
+        parts = m.score_parts(BARE, True, None, 0.0, "BULL")
+        self.assertEqual([(p["key"], p["group"], p["max"]) for p in parts],
+                         [("price_move", "pattern", 12), ("macd", "pattern", 12), ("bump", "pattern", 8),
+                          ("zero", "pattern", 10), ("vol_dry", "pattern", 10), ("wick", "pattern", 10),
+                          ("triple", "pattern", 8), ("htf", "context", 10), ("oi", "context", 10),
+                          ("btc", "context", 10)])
+        by = {p["key"]: p for p in parts}
+        self.assertEqual((by["oi"]["checked"], by["oi"]["pts"]), (False, 0))        # no OI change: not checked
+        self.assertEqual((by["htf"]["checked"], by["htf"]["pts"], by["btc"]["pts"]), (True, 10, 10))
+        self.assertTrue(all(p["checked"] for p in parts if p["group"] == "pattern"))
+        self.assertFalse(any(p["checked"] for p in m.score_parts(BARE) if p["group"] == "context"))
+
+    def test_the_oi_penalty_is_a_part_worth_minus_ten(self):
+        by = {p["key"]: p for p in m.score_parts(FULL, True, 9.0, 0.02, "BULL")}
+        self.assertEqual((by["oi"]["pts"], by["oi"]["max"], by["oi"]["checked"]), (-10, 10, True))
+        self.assertEqual({p["key"]: p for p in m.score_parts(FULL, True, 3.0, 0.02, "BULL")}["oi"]["pts"], 0)
+        self.assertEqual({p["key"]: p for p in m.score_parts(FULL, True, -3.0, 0.0, "BULL")}["oi"]["pts"], 10)
+
     def test_everything_true_is_100(self):
         self.assertEqual(m.score_signal(FULL, True, -3.0, 0.0, "BULL"), (100, "A", False))
 

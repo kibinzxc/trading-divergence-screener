@@ -62,6 +62,38 @@ class Crosses(unittest.TestCase):
         self.assertEqual(m.macd_crosses(tiny, sig, np.zeros(len(df))), CROSSES)   # no ATR: no check
 
 
+class SlowCross(unittest.TestCase):
+    """A cross whose gap is too small in its first WHIP_BARS bars but becomes real later."""
+    sig = np.zeros(40)
+
+    def line(self, after):
+        # 20 bars at -1, a cross up that stays tiny for 6 bars, then `after`
+        return np.array([-1.0] * 20 + [0.01] * 6 + after)
+
+    def test_counts_on_the_bar_where_the_gap_becomes_real(self):
+        self.assertEqual(m.macd_crosses(self.line([1.0] * 14), self.sig), [(26, 1)])
+
+    def test_never_widening_stays_dropped(self):
+        self.assertEqual(m.macd_crosses(self.line([0.01] * 14), self.sig), [])
+
+    def test_dropped_when_it_crosses_back_before_widening(self):
+        # the tiny up-cross never counts; only the real move back down does
+        self.assertEqual(m.macd_crosses(self.line([-1.0] * 14), self.sig), [(26, -1)])
+
+    def test_atr_floor_applies_to_the_late_bar_too(self):
+        macd = self.line([1.0] * 14)
+        self.assertEqual(m.macd_crosses(macd, self.sig, np.full(40, 100.0)), [])   # 1.0 < 0.05 x 100
+        self.assertEqual(m.macd_crosses(macd, self.sig, np.full(40, 1.0)), [(26, 1)])
+
+    def test_a_cross_real_from_the_start_keeps_its_own_bar(self):
+        self.assertEqual(m.macd_crosses(np.array([-1.0] * 20 + [1.0] * 20), self.sig), [(20, 1)])
+
+    def test_no_lookahead_the_late_cross_is_unknown_before_its_bar(self):
+        macd = self.line([1.0] * 14)
+        self.assertEqual(m.macd_crosses(macd[:26], self.sig[:26]), [])
+        self.assertEqual(m.macd_crosses(macd[:27], self.sig[:27]), [(26, 1)])
+
+
 class Detection(unittest.TestCase):
     def test_w_shape_is_found_on_its_own_side_only(self):
         for side, other in (("bullish", "bearish"), ("bearish", "bullish")):

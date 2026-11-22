@@ -37,8 +37,11 @@ serves both the API and a browser dashboard.
   peak). Two neighbouring troughs A and B, 8 to 80 bars apart with a real
   bump between them, are compared with the lowest wicks inside those same
   waves: price lower, MACD trough higher is a regular bullish divergence
-  (bearish is the mirror). A cross that never opens a gap (5% of the 50-bar
-  MACD range and 0.05 ATR, within 3 bars) and a wave shorter
+  (bearish is the mirror). A cross must open a real gap (5% of the 50-bar
+  MACD range and 0.05 ATR). When it does so within 3 bars, the cross bar
+  itself counts. A slower cross counts on the first later bar whose gap is
+  real, as long as the line has not crossed back; that bar is then the
+  cross. A cross that never opens a gap and a wave shorter
   than 3 bars are merged away, so a double dot cannot split a trough. A
   divergence is reported only once the cross that ends wave B has closed;
   that bar is the signal bar. The still-forming candle is dropped, with one

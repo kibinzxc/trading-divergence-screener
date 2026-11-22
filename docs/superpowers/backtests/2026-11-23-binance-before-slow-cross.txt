@@ -1,0 +1,105 @@
+[1/60] BTC/USDT:USDT: 5 signal(s)
+[2/60] ETH/USDT:USDT: 9 signal(s)
+[3/60] ZEC/USDT:USDT: 10 signal(s)
+[4/60] SOL/USDT:USDT: 12 signal(s)
+[5/60] PIEVERSE/USDT:USDT: 13 signal(s)
+[6/60] EVAA/USDT:USDT: 10 signal(s)
+[7/60] IDOL/USDT:USDT: 3 signal(s)
+[8/60] XRP/USDT:USDT: 10 signal(s)
+[9/60] HYPE/USDT:USDT: 15 signal(s)
+[10/60] NEAR/USDT:USDT: 13 signal(s)
+[11/60] BLESS/USDT:USDT: 5 signal(s)
+[12/60] BNB/USDT:USDT: 9 signal(s)
+[13/60] MMT/USDT:USDT: 7 signal(s)
+[14/60] DOGE/USDT:USDT: 14 signal(s)
+[15/60] 1000PEPE/USDT:USDT: 7 signal(s)
+[16/60] AKE/USDT:USDT: 3 signal(s)
+[17/60] SKYAI/USDT:USDT: 6 signal(s)
+[18/60] UNI/USDT:USDT: 6 signal(s)
+[19/60] ADA/USDT:USDT: 12 signal(s)
+[20/60] SUI/USDT:USDT: 10 signal(s)
+[21/60] VVV/USDT:USDT: 9 signal(s)
+[22/60] ENA/USDT:USDT: 10 signal(s)
+[23/60] ENSO/USDT:USDT: 11 signal(s)
+[24/60] AAVE/USDT:USDT: 7 signal(s)
+[25/60] LINK/USDT:USDT: 10 signal(s)
+[26/60] PUMP/USDT:USDT: 14 signal(s)
+[27/60] ELSA/USDT:USDT: 14 signal(s)
+[28/60] INJ/USDT:USDT: 4 signal(s)
+[29/60] BULLA/USDT:USDT: 9 signal(s)
+[30/60] WLD/USDT:USDT: 7 signal(s)
+[31/60] TAO/USDT:USDT: 9 signal(s)
+[32/60] AIGENSYN/USDT:USDT: 9 signal(s)
+[33/60] TRUMP/USDT:USDT: 7 signal(s)
+[34/60] AVAX/USDT:USDT: 9 signal(s)
+[35/60] DODOX/USDT:USDT: 7 signal(s)
+[36/60] BTW/USDT:USDT: 8 signal(s)
+[37/60] LTC/USDT:USDT: 7 signal(s)
+[38/60] FIL/USDT:USDT: 8 signal(s)
+[39/60] MAGMA/USDT:USDT: 7 signal(s)
+[40/60] XMR/USDT:USDT: 14 signal(s)
+[41/60] CYBER/USDT:USDT: 6 signal(s)
+[42/60] ARB/USDT:USDT: 8 signal(s)
+[43/60] RARE/USDT:USDT: 10 signal(s)
+[44/60] ORCA/USDT:USDT: 13 signal(s)
+[45/60] BCH/USDT:USDT: 7 signal(s)
+[46/60] IRYS/USDT:USDT: 10 signal(s)
+[47/60] INIT/USDT:USDT: 7 signal(s)
+[48/60] LIT/USDT:USDT: 11 signal(s)
+[49/60] BARD/USDT:USDT: 9 signal(s)
+[50/60] TRX/USDT:USDT: 7 signal(s)
+[51/60] QNT/USDT:USDT: 8 signal(s)
+[52/60] DOT/USDT:USDT: 12 signal(s)
+[53/60] ETHFI/USDT:USDT: 8 signal(s)
+[54/60] NIGHT/USDT:USDT: 11 signal(s)
+[55/60] ASTER/USDT:USDT: 5 signal(s)
+[56/60] PROM/USDT:USDT: 8 signal(s)
+[57/60] ONDO/USDT:USDT: 8 signal(s)
+[58/60] ZRO/USDT:USDT: 17 signal(s)
+[59/60] ARIA/USDT:USDT: 6 signal(s)
+[60/60] JCT/USDT:USDT: 8 signal(s)
+
+REG_DIV, 538 signals on 60 pairs (BINANCE, balanced)
+
+4H                in-sample (first 70%)                                   | out-of-sample (last 30%)
+grade regime         n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose |    n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose
+ALL                164   48.8   46.3  -0.09  -0.04  0.91  26.5  0.76    7 |  109   43.1   40.4  -0.19  -0.14  0.74  21.0  0.81   18
+A CHOP               7  insufficient                                      |    2  insufficient                                     
+A COUNTER TREND     15  insufficient                                      |    7  insufficient                                     
+A WITH TREND         0  insufficient                                      |    2  insufficient                                     
+B CHOP              20  insufficient                                      |   12  insufficient                                     
+B COUNTER TREND     27  insufficient                                      |   18  insufficient                                     
+B WITH TREND         1  insufficient                                      |    2  insufficient                                     
+C CHOP              49   49.0   46.9  +0.02  +0.08  1.22  30.0  0.63    5 |   41   48.8   48.8  -0.12  +0.02  1.04  21.0  0.71    4
+C COUNTER TREND     43   48.8   44.2  -0.13  -0.14  0.73  25.0  0.83    4 |   24  insufficient                                     
+C WITH TREND         2  insufficient                                      |    1  insufficient                                     
+
+1H                in-sample (first 70%)                                   | out-of-sample (last 30%)
+grade regime         n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose |    n  win1R  win2R  exp1R  exp2R    PF  bars   MAE lose
+ALL                202   48.5   39.6  +0.00  -0.04  0.92  33.0  0.84   10 |   63   39.7   27.0  -0.19  -0.34  0.50  31.0  1.01   13
+A CHOP               8  insufficient                                      |    1  insufficient                                     
+A COUNTER TREND     16  insufficient                                      |    4  insufficient                                     
+A WITH TREND         2  insufficient                                      |    0  insufficient                                     
+B CHOP              40   50.0   42.5  -0.04  -0.11  0.78  26.5  0.90    8 |    5  insufficient                                     
+B COUNTER TREND     29  insufficient                                      |   17  insufficient                                     
+B WITH TREND         0  insufficient                                      |    4  insufficient                                     
+C CHOP              58   62.1   46.6  +0.30  +0.23  1.63  41.0  0.71    5 |    1  insufficient                                     
+C COUNTER TREND     48   47.9   41.7  -0.07  -0.02  0.97  23.5  0.91    7 |   30   36.7   20.0  -0.19  -0.48  0.33  31.5  1.03   16
+C WITH TREND         1  insufficient                                      |    1  insufficient                                     
+
+4H Grade cutoffs: 70 / 55 kept - no in-sample score has 30+ trades at or above it with expectancy >= +0.3R at 2R.
+1H Grade cutoffs: 70 / 55 kept - no in-sample score has 30+ trades at or above it with expectancy >= +0.3R at 2R.
+
+n = trades resolved under the 2R exit. winNR / expNR = share above zero and average R after
+fees when exiting at the stop, at N x risk, or at the close 30 bars (4H) /
+48 bars (1H) later. PF, bars (median to outcome), MAE (average, in R) and lose
+(longest losing streak, by time) use the 2R exit. Entry: the close of the bar the signal first
+appears on, 0.05% slippage against the trade; fees 0.10% of price round trip, in R.
+A bar touching both the stop and the target counts as the stop. Fewer than 30 -> insufficient.
+Replay: 1500 bars per timeframe, from the 300th (the live minimum) to 30 (4H) /
+48 (1H) bars before the end, so every trade resolves under all three exits.
+
+Known gaps: open interest is not replayed (no bar-by-bar history), so that component is dropped
+and the score rescaled, as live does when OI is missing. The lower-timeframe triggers are not
+replayed, and neither are the scan's pair filters: the weekly volume floor, the 4H ATR% range
+and the spread / OI thin-coin filters (pairs are the most liquid now). Funding is not replayed.

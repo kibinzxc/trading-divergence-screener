@@ -440,7 +440,9 @@ def macd_crosses(macd, signal, atr=None):
 
     The list alternates direction, so consecutive entries bound one wave. A
     cross that never opens a real gap (the whipsaw filter: WHIP_FRAC of the
-    MACD range AND, when `atr` is given and positive, WHIP_ATR x ATR) is dropped, and a
+    MACD range AND, when `atr` is given and positive, WHIP_ATR x ATR) is dropped. One
+    that opens it only after its first WHIP_BARS bars is placed on the bar where
+    the gap became real (it used to be lost for good). A
     wave shorter than MIN_WAVE bars is removed together with the two crosses
     around it. Either way the waves on both sides join into one, which is what
     stops a tiny double dot from splitting one trough into two.
@@ -458,7 +460,21 @@ def macd_crosses(macd, signal, atr=None):
             continue                                   # already on that side
         gap = (s * d[i:i + WHIP_BARS]).max()
         if gap < WHIP_FRAC * rng[i] or (atr is not None and atr[i] > 0 and gap < WHIP_ATR * atr[i]):
-            continue                                   # whipsaw
+            # A slow cross: keep watching while the line stays on this side, and
+            # count it on the first bar whose own gap is real. That bar is the
+            # cross (and the signal bar), so nothing is known before it prints.
+            for j in range(i + WHIP_BARS, len(d)):
+                g = s * d[j]
+                if g <= 0:
+                    j = None                           # crossed back: a whipsaw after all
+                    break
+                if g >= WHIP_FRAC * rng[j] and not (atr is not None and atr[j] > 0 and g < WHIP_ATR * atr[j]):
+                    break
+            else:
+                j = None
+            if j is None:
+                continue                               # whipsaw
+            i = j
         if out and i - out[-1][0] < MIN_WAVE:
             out.pop()                                  # the wave it would close is too short
             continue
@@ -3744,7 +3760,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
     <div class="dash-sec-ttl">The rules a signal has to pass (Balanced)</div>
     <div class="rules">
       <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>Completed candles only.</b> The still-forming bar is dropped before anything is calculated, so two scans inside the same bar agree. The one exception is a row whose signal bar is still forming (its answer and its opened row say so): it is provisional and can disappear.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Waves come from the crossovers.</b> A bear wave runs from a bearish MACD/signal cross to the next bullish cross, a bull wave the other way. A cross only counts if the two lines separate by 5% of the recent MACD range within 3 bars, and a wave shorter than 3 bars is merged into its neighbours, so a tiny double dot cannot split one trough into two.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Waves come from the crossovers.</b> A bear wave runs from a bearish MACD/signal cross to the next bullish cross, a bull wave the other way. A cross only counts once the two lines separate by 5% of the recent MACD range. If that happens within 3 bars, the cross bar itself counts; a slower cross counts on the first later bar where the gap is real, provided the line has not crossed back. A wave shorter than 3 bars is merged into its neighbours, so a tiny double dot cannot split one trough into two.</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>One trough per wave.</b> The MACD trough is the lowest MACD-line value in the wave. The price low is the lowest wick from the start of the wave to 2 bars after it ends, because price often bottoms just after momentum turns.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>A then B, with a real bump between.</b> Two neighbouring troughs, 8 to 80 bars apart. The MACD peak between them must rise at least 25% of the leg's MACD range above the higher trough: that is the middle of the W.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>Minimum size.</b> The price difference must clear both a fixed floor and a fraction of ATR, and the MACD difference must be at least 15% of the leg's MACD range. This is what kills micro-divergences.</div></div>

@@ -309,7 +309,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # divergence scan's saved state, and vice versa.
 MOVERS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "movers_state.json")
-STATE_VERSION = 4    # scan_state.json written by an older row shape is ignored (4: score parts, a verdict per timeframe)
+STATE_VERSION = 5    # scan_state.json written by an older row shape is ignored (5: the bar times a chart is drawn from)
 HTF_BARS_1D   = 200   # daily history, for the 4H signal's higher-timeframe check
 LTF_BARS_15M  = 300   # 15m history (75h), for the 1H and 4H signals' early-entry triggers
 
@@ -374,7 +374,6 @@ _cal_state = {"events": [], "ts": None, "attempt": None, "meta": {},
 # Candles and geometry of the last scan's signals, for /chart.
 # shortcut: memory only, so charts need a fresh scan after a restart; persist
 # a slice per signal in scan_state.json if that becomes annoying.
-_charts = {}
 
 
 # ── Indicators ─────────────────────────────────────────────────────────────────
@@ -613,6 +612,10 @@ def _mk(df, d, cfg, forming=False):
         "bars_ago": n - 1 - sb, "fresh": (n - 1 - sb) * cfg["minutes"] / 60 <= cfg["fresh_h"],
         "forming": forming,
         "b_start_ms": ms(d["b_start"]), "b_ms": ms(bp), "signal_ms": ms(sb),
+        # bar opens of wave A's start and of the price / MACD extremes, so a chart can be
+        # drawn later on freshly fetched candles (place_signal)
+        "a_start_ms": ms(d["a_start"]), "a_ms": ms(d["a_p"]), "a_m_ms": ms(d["a_m"]), "b_m_ms": ms(d["b_m"]),
+        "cross_ms": [[ms(b), int(k)] for b, k in d["crosses"]],
         "signal_close_ms": ms(sb) + cfg["minutes"] * 60_000,
         "above_ema200": bool(sp > float(df["ema200"].iloc[sb])),
         "price_atr": round(d["price_atr"], 3), "macd_frac": round(d["macd_frac"], 4),
@@ -2113,19 +2116,72 @@ def _num(v, digits=3):
     return _plain(float(f"{v:.{digits}g}") + 0.0)
 
 
-def chart_figure(df, d, sig, narrow=False):
+class ChartError(Exception):
+    """A chart or its facts cannot be produced. The message is shown to the user."""
+
+
+CHART_MAX_BARS = {False: 500, True: 200}     # most bars a Now view shows, wide / phone: beyond it candles are hairlines
+
+
+def place_signal(df, sig):
+    """Bar positions of a saved signal on `df` (any frame indexed by bar open,
+    UTC), found by TIME: the frame may have grown or lost old bars since the
+    scan. The shape chart_figure() draws from. A bar the frame does not have
+    raises ChartError: a marker is never put on a neighbouring bar."""
+    def at(key, name):
+        ts = pd.Timestamp(sig[key], unit="ms")
+        i = int(df.index.get_indexer([ts])[0])
+        if i < 0:
+            when = (ts + pd.Timedelta(hours=DISPLAY_TZ_OFFSET_H)).strftime("%b %d, %I:%M %p")
+            raise ChartError(f"The candles fetched now do not include the {name} of this signal ({when} PHT), "
+                             "so its chart cannot be drawn. Scan again.")
+        return i
+
+    d = {"side": sig["side"], "a_start": at("a_start_ms", "start of wave A"),
+         "a_p": at("a_ms", "bar of A"), "a_m": at("a_m_ms", "MACD bar of A"),
+         "b_p": at("b_ms", "bar of B"), "b_m": at("b_m_ms", "MACD bar of B"),
+         "signal_bar": at("signal_ms", "signal bar"),
+         "a_price": sig["pivot1_price"], "b_price": sig["pivot2_price"],
+         "a_macd": sig["pivot1_macd"], "b_macd": sig["pivot2_macd"]}
+    found = df.index.get_indexer([pd.Timestamp(t, unit="ms") for t, _ in sig.get("cross_ms", [])])
+    d["crosses"] = [(int(i), k) for i, (_, k) in zip(found, sig.get("cross_ms", [])) if i >= 0]
+    return d
+
+
+def chart_span(d, n, view, narrow):
+    """(first bar, one past the last bar) a chart of `view` covers on a frame of
+    `n` bars, before room is added for labels. Both views start just before
+    wave A. "signal" ends on the signal bar; "now" runs to the last bar, capped
+    at CHART_MAX_BARS so candles stay readable but never short of the signal bar."""
+    start = d["a_start"] - 10
+    if view == "signal":
+        return start, d["signal_bar"] + 1
+    return start, max(d["signal_bar"] + 1, min(n, start + CHART_MAX_BARS[bool(narrow)]))
+
+
+def chart_figure(df, d, sig, narrow=False, view="signal", forming=False):
     """The A-to-B leg as a figure: candles with the entry, stop and R lines
     (each labelled with its price) over the MACD panel with its trough and
-    crossover dots; A and B carry their price and MACD value. `d` is the raw
-    detection (bar indexes into `df`), `sig` the finished signal (levels).
+    crossover dots; A and B carry their price and MACD value. `d` holds the bar
+    positions in `df` (a detection, or place_signal() on a fresh frame), `sig`
+    the finished signal (levels).
+
+    view "signal": up to and including the signal bar, nothing after it.
+    view "now": the same start, running to the last bar of `df`. The signal
+    bar gets a vertical line, the last price a "Now" line, and when `forming`
+    the last candle (still open) is drawn faded with the MACD reaching it dashed.
 
     Sized for the opened row, which it spans: 10.4in wide and drawn about 958px
     wide on a 1280px window, so 10pt text reads at 12px or more and the image
     is never stretched. `narrow` is the phone render (3.9in for a 344px
     column): the same chart, taller, with the A and B values moved from the
     points into the panel titles and the level lines named without their price
-    (the levels strip under the chart has them), which leaves the candles room. Times are Philippine time, 12-hour."""
-    end = min(len(df), d["signal_bar"] + 30)
+    (the levels strip under the chart has them), which leaves the candles room.
+    Times are Philippine time, 12-hour."""
+    start, end = chart_span(d, len(df), view, narrow)
+    now = view == "now"
+    capped = now and end < len(df)
+    live = now and forming and not capped          # the open candle is the last one in view
     price_lbl = [_plain(px(d["a_price"])), _plain(px(d["b_price"]))]
     macd_lbl = [_num(d["a_macd"]), _num(d["b_macd"])]
     # A's label sits left of A and B's right of B, so each needs its own width of view on that side:
@@ -2134,7 +2190,7 @@ def chart_figure(df, d, sig, narrow=False):
     panel_pt = 190 if narrow else 560
     chars = 1 if narrow else max(map(len, price_lbl + macd_lbl)) + 2
     need = min(0.32, chars * 6.5 / panel_pt + 0.04)
-    left, right = d["a_start"] - 10, end
+    left, right = start, end
     for _ in range(8):      # widening the view widens the share each label needs; this converges
         w = need * (right - left)
         left = min(left, min(d["a_p"], d["a_m"]) - w)
@@ -2175,14 +2231,21 @@ def chart_figure(df, d, sig, narrow=False):
         a.set_ylim(y0 - frac * (y1 - y0) if bull else y0, y1 if bull else y1 + frac * (y1 - y0))
 
     up = (v["close"] >= v["open"]).values
+    done = np.ones(len(v), bool)
+    done[-1] = not live
     body = float(np.clip(0.68 * panel_pt / (right - left), 0.7, 5))       # points: the view shares the panel's width
-    for mask, col in ((up, green), (~up, red)):
-        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=max(0.5, body / 3))
-        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=body)
+    for mask, col, alpha in ((up & done, green, None), (~up & done, red, None),
+                             (up & ~done, green, 0.4), (~up & ~done, red, 0.4)):      # the open candle is faded
+        if not mask.any():
+            continue
+        ax.vlines(x[mask], v["low"].values[mask], v["high"].values[mask], color=col, lw=max(0.5, body / 3), alpha=alpha)
+        ax.vlines(x[mask], v["open"].values[mask], v["close"].values[mask], color=col, lw=body, alpha=alpha)
     ab(ax, d["a_p"], d["b_p"], d["a_price"], d["b_price"], price_lbl)
     t = sig["targets"]
-    levels = ((sig["entry_ref_price"], acc, "-", "Entry"), (sig["stop_price"], red, "--", "Stop"),
-              (t["1r"], mut, ":", "1R"), (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R"))
+    levels = [(sig["entry_ref_price"], acc, "-", "Entry"), (sig["stop_price"], red, "--", "Stop"),
+              (t["1r"], mut, ":", "1R"), (t["2r"], mut, ":", "2R"), (t["3r"], mut, ":", "3R")]
+    if now:
+        levels.append((px(float(df["close"].iloc[-1])), fg, "-.", "Now"))
     for lvl, col, ls, _ in levels:
         ax.axhline(lvl, color=col, lw=0.8, ls=ls)
     room(ax, 0.2)
@@ -2197,17 +2260,30 @@ def chart_figure(df, d, sig, narrow=False):
     else:
         ax.set_title(head, fontsize=11, color=fg)
 
-    am.plot(x, v["macd"].values, color=acc, lw=1.2)
-    am.plot(x, v["signal"].values, color=mut, lw=1)
+    cut = len(v) - 1 if live else len(v)
+    for col, name, lw in ((acc, "macd", 1.2), (mut, "signal", 1)):
+        am.plot(x[:cut], v[name].values[:cut], color=col, lw=lw)
+        if live and len(v) > 1:      # to the open candle: dashed, it can still change
+            am.plot(x[-2:], v[name].values[-2:], color=col, lw=lw, ls="--")
     am.axhline(0, color=line, lw=0.8)
     ab(am, d["a_m"], d["b_m"], d["a_macd"], d["b_macd"], macd_lbl)
     for bar, direction in d["crosses"]:
         am.plot(bar - lo, v["signal"].values[bar - lo], "o", ms=4,
                 color=green if direction > 0 else red)
     room(am, 0.32)
+    if now:      # the signal bar, named on the side of the panel the A / B labels are not
+        for a in (ax, am):
+            a.axvline(d["signal_bar"] - lo, color=mut, lw=0.8, ls=":")
+        late = (d["signal_bar"] - left) / (right - left) > 0.6      # near the right edge the word goes left of the line,
+        ax.annotate("signal", (d["signal_bar"] - lo, 1 if bull else 0), xycoords=("data", "axes fraction"),
+                    xytext=(-4 if late else 4, -4 if bull else 4), textcoords="offset points", color=mut, fontsize=10,
+                    ha="right" if late else "left", va="top" if bull else "bottom",      # clear of the level names
+                    bbox={"facecolor": bg, "edgecolor": "none", "pad": 1.5, "alpha": 0.8})
     # the two lines are named under the axis: a legend box would sit on top of them
-    am.set_xlabel("MACD blue, signal line grey\ntimes in PHT" if narrow else
-                  "MACD line (blue) and its signal line (grey)   \u00b7   times are Philippine time (PHT)",
+    notes = (["the last candle is still open (faded)"] if live else []) + \
+            ([f"showing the first {end - start} bars: the present is past the right edge"] if capped else [])
+    am.set_xlabel("\n".join(["MACD blue, signal line grey", "times in PHT"] + notes) if narrow else
+                  "   \u00b7   ".join(["MACD line (blue) and its signal line (grey)", "times are Philippine time (PHT)"] + notes),
                   fontsize=10, color=mut)
     # three date labels on a phone, six on the wide chart: few enough that they never run into each other
     ticks = np.unique(np.linspace(0, len(v) - 1, 3 if narrow else 6).round().astype(int))
@@ -2217,11 +2293,85 @@ def chart_figure(df, d, sig, narrow=False):
     return fig
 
 
-def render_chart(df, d, sig, narrow=False):
+def render_chart(df, d, sig, narrow=False, view="signal", forming=False):
     """chart_figure() as PNG bytes."""
     buf = io.BytesIO()
-    chart_figure(df, d, sig, narrow).savefig(buf, format="png")
+    chart_figure(df, d, sig, narrow, view, forming).savefig(buf, format="png")
     return buf.getvalue()
+
+
+def chart_facts(df, d, sig, forming, as_of_ms):
+    """What price has done since the signal bar, from the frame a Now chart is
+    drawn from. R is measured from the entry reference, like the chart's lines.
+
+    The top-level numbers include the last candle whether or not it has closed;
+    `closed` holds the same facts for completed bars only, and `forming` /
+    `stop_on_live` say when the difference is the candle still open."""
+    bull = sig["side"] == "bullish"
+    k = 1 if bull else -1
+    entry, stop = sig["entry_ref_price"], sig["stop_price"]
+    risk = abs(sig["targets"]["1r"] - entry)
+    after = df.iloc[d["signal_bar"] + 1:]
+    last = float(df["close"].iloc[-1])
+
+    def since(fr):
+        if not len(fr):
+            return {"bars": 0, "high": None, "low": None, "stop_touched": False, "stop_ms": None, "best_r": 0.0}
+        hi, lo = float(fr["high"].max()), float(fr["low"].min())
+        hit = fr.index[(fr["low"] <= stop) if bull else (fr["high"] >= stop)]
+        best = ((hi - entry) if bull else (entry - lo)) / risk if risk > 0 else 0.0
+        return {"bars": len(fr), "high": px(hi), "low": px(lo), "stop_touched": bool(len(hit)),
+                "stop_ms": int(hit[0].timestamp() * 1000) if len(hit) else None,
+                "best_r": round(max(0.0, best), 2)}
+
+    whole, closed = since(after), since(after.iloc[:-1] if forming else after)
+    return {"as_of_ms": as_of_ms, "forming": bool(forming), "last": px(last),
+            "chg_pct": round((last / sig["signal_price"] - 1) * 100, 2) if len(after) else 0.0,
+            "chg_r": round(k * (last - entry) / risk, 2) if len(after) and risk > 0 else 0.0,
+            "high": whole["high"], "low": whole["low"], "stop_touched": whole["stop_touched"],
+            "stop_ms": whole["stop_ms"], "stop_on_live": whole["stop_touched"] and not closed["stop_touched"],
+            "best_r": whole["best_r"], "bars_since": closed["bars"], "closed": closed}
+
+
+# Candles for charts are fetched when a chart is asked for, never during a scan.
+FRAME_TTL_S = 60            # opening a row, switching views, enlarging and the facts share one fetch
+_frames = {}                # (exchange, pair, timeframe) -> (monotonic time, frame with indicators, forming, as-of ms)
+_frame_lock = threading.Lock()
+_chart_venues = {}          # exchange id -> (ccxt exchange, RateLimiter), built on first use
+
+
+def _fetch_frame(exid, pair, tf):
+    """Raw candles for one pair and timeframe, the still-open one included,
+    as deep as the scan reads so MACD has settled. Raises ChartError."""
+    what = f"{pair} {TF_CFG[tf]['label']} candles"
+    try:
+        if exid not in _chart_venues:
+            _chart_venues[exid] = (make_exchange(exid, rate_limit=False), RateLimiter(SPEED["safe"]["rps"][exid]))
+        ex, limiter = _chart_venues[exid]
+        raw = fetch_df_deep(ex, limiter, pair, tf, TF_CFG[tf]["bars"])
+    except Exception as e:
+        raise ChartError(f"{str(exid).upper()} could not be asked for {what}: {e}") from None
+    if raw is None or raw.empty:
+        raise ChartError(f"{exid.upper()} did not return {what}. Check the connection and try again.")
+    return raw
+
+
+def fresh_frame(exid, pair, tf, refresh=False):
+    """(candles with indicators, last candle still forming?, fetched-at ms) for
+    a chart, fetched now or reused if fetched under FRAME_TTL_S ago; `refresh`
+    always fetches. One fetch at a time: an image and its facts ask together."""
+    key = (exid, pair, tf)
+    with _frame_lock:
+        hit = _frames.get(key)
+        if hit and not refresh and time.monotonic() - hit[0] < FRAME_TTL_S:
+            return hit[1:]
+        raw = _fetch_frame(exid, pair, tf)
+        forming = len(drop_forming_candle(raw, TF_CFG[tf]["minutes"])) < len(raw)
+        out = (with_indicators(raw), forming, int(time.time() * 1000))
+        for old in [k for k, v in _frames.items() if time.monotonic() - v[0] > 10 * FRAME_TTL_S]:
+            del _frames[old]
+        _frames[key] = (time.monotonic(),) + out
+        return out
 
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
@@ -2502,12 +2652,39 @@ def signals_route():
                         "ts": _state["ts"].isoformat() if _state["ts"] else None})
 
 
+def _chart_reply(make):
+    """Find the row and timeframe the request names in the last scan, fetch its
+    candles (fresh_frame), place the saved signal on them and hand
+    (frame, positions, signal, forming, as-of ms) to `make`. Any failure is a
+    JSON {"error": ...} the page can show; it never reaches the scan or the page."""
+    pair, side, tf = (request.args.get(k, "") for k in ("pair", "side", "tf"))
+    with _lock:
+        row = next((r for r in _state["results"] if r.get("pair") == pair and r.get("side") == side), None)
+    sig = ((row or {}).get("signals") or {}).get(tf)
+    if sig is None:
+        return jsonify({"error": "This row is not in the last scan any more. Scan again."}), 404
+    try:
+        df, forming, as_of = fresh_frame(row["exchange"], pair, tf, refresh=request.args.get("refresh") == "1")
+        return make(df, place_signal(df, sig), sig, forming, as_of)
+    except ChartError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        return jsonify({"error": f"The chart could not be made: {e}"}), 500
+
+
 @app.route("/chart")
 def chart_route():
-    hit = _charts.get("|".join(request.args.get(k, "") for k in ("pair", "side", "tf")))
-    if hit is None:
-        return "No chart data for this row. Run the scan again.", 404
-    return Response(render_chart(*hit, narrow=request.args.get("w") == "narrow"), mimetype="image/png")
+    """PNG of one row's leg, drawn now from freshly fetched candles.
+    view=signal ends on the signal bar; view=now (the default) runs to the present."""
+    view, narrow = ("signal" if request.args.get("view") == "signal" else "now"), request.args.get("w") == "narrow"
+    return _chart_reply(lambda df, d, sig, forming, as_of:
+                        Response(render_chart(df, d, sig, narrow, view, forming), mimetype="image/png"))
+
+
+@app.route("/chart_facts")
+def chart_facts_route():
+    """What price has done since the signal bar, from the same candles as the chart."""
+    return _chart_reply(lambda df, d, sig, forming, as_of: jsonify(chart_facts(df, d, sig, forming, as_of)))
 
 
 @app.route("/universe")
@@ -2665,7 +2842,6 @@ def scan_route():
         if btc is None:
             yield sse("log", {"msg": "BTC 4H candles unavailable: every setup is tagged COUNTER TREND "
                                      "and scored without the BTC component (PARTIAL DATA)"})
-        _charts.clear()
         workers = spd["workers"]
         by_venue = " · ".join(f"{v.upper()} {sum(1 for p in pairs if p[0] == v)}" for v in V)
         yield sse("log", {"msg": f"Scanning {len(pairs)} pairs on 4H + 1H · "
@@ -2805,8 +2981,9 @@ def scan_route():
                         fetch_df_deep(ex, limiter, sym, "15m", LTF_BARS_15M), 15)
                     df15 = with_indicators(df15) if df15 is not None and len(df15) >= 80 else None
                 grade_signals(sigs, df4, df1, d1, df15, oi_d, oi_h, funding.get(sym), btc)
-                for s in sigs:
-                    _charts[f"{sym}|{s['side']}|{s['tf']}"] = (s.pop("_df"), s.pop("_d"), dict(s))
+                for s in sigs:       # the frame and the raw detection stay behind: a chart is drawn later from
+                    s.pop("_df")     # candles fetched when it is asked for, placed by the times the signal carries
+                    s.pop("_d")
                 rows = build_rows(sigs, mover, flow, cerr, blocker, macro)
                 ok = confirm(v, base, rows) if merged else {}
                 for row in rows:
@@ -3279,9 +3456,11 @@ tr.det td{background:var(--sf);padding:18px 16px}
 /* the table scrolls sideways on a narrow screen; the opened row stays as wide as the screen */
 .detw{position:sticky;left:16px;max-width:calc(100vw - 66px);display:flex;flex-direction:column;gap:16px}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.tfsw{display:flex;gap:4px;align-self:flex-start;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:3px}
-.tfsw button{background:none;border:0;border-radius:6px;padding:5px 14px;color:var(--tx2);font-size:14px}
+.tfsw,.vsw{display:flex;gap:4px;align-self:flex-start;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:3px}
+.vsw{background:var(--sf)}
+.tfsw button,.vsw button{background:none;border:0;border-radius:6px;padding:5px 14px;color:var(--tx2);font-size:14px}
 .tfsw button[aria-pressed="true"]{background:var(--sf2);color:var(--tx);font-weight:600}
+.vsw button[aria-pressed="true"]{background:var(--sf2);color:var(--tx);font-weight:600}
 .tfsw .mark{font-size:12px;font-weight:400;color:var(--tx3);margin-left:8px}
 /* the answer strip is a neutral card: only the pill carries colour */
 .verdict{display:flex;flex-direction:column;gap:10px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
@@ -3297,12 +3476,25 @@ tr.det td{background:var(--sf);padding:18px 16px}
 .alone{font-size:14px;color:var(--tx2);border:1px dashed var(--line);border-radius:8px;padding:8px 12px}
 .alone b{color:var(--tx);font-weight:600}
 .chartbig{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:12px}
-.cimg{display:flex;flex-direction:column;gap:12px}
-img.chart{display:block;width:100%;border-radius:8px;cursor:zoom-in}
+.chead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}
+.asof{font-size:13px;color:var(--tx3);margin-left:auto}
+.chead .gbtn{padding:5px 14px}
+/* the chart's space is held at the image's own shape while the candles are fetched, so nothing jumps */
+.cbox{position:relative;aspect-ratio:104/54;border-radius:8px;background:var(--sf);overflow:hidden}
+.cbox.narrow{aspect-ratio:39/52}
+.cbox.failed{aspect-ratio:auto;background:none;overflow:visible}
+.cbox a{position:absolute;inset:0;display:block}
+img.chart{display:block;width:100%;height:100%;border-radius:8px;cursor:zoom-in}
+.cload{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:12px;color:var(--tx3);font-size:14px}
+.cfail,.stale{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;border-radius:8px;padding:10px 14px;font-size:14px}
+.cfail{border:1px dashed var(--line);color:var(--tx2)}
+.stale{background:var(--wait-bg);color:var(--tx)}
+.stale b{color:var(--wait);font-weight:600}
+.cfail button,.stale button{background:var(--sf2);border:1px solid var(--line);border-radius:8px;padding:5px 14px;margin-left:auto}
+#chSay{display:flex;flex-direction:column;gap:8px}
+#chSay:empty{display:none}
 .how{font-size:14px;color:var(--tx2)}
 .how b{color:var(--tx);font-weight:500}
-.nochartbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;border:1px dashed var(--line);border-radius:8px;padding:10px 14px;color:var(--tx2);font-size:14px}
-.nochartbar button{background:var(--sf2);border:1px solid var(--line);border-radius:8px;padding:5px 14px;margin-left:auto}
 .levels{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden}
 .levels div{background:var(--bg);padding:10px 12px;display:flex;flex-direction:column;gap:1px;min-width:0;overflow-wrap:anywhere}
 .levels .n{font-size:12px;color:var(--tx3);letter-spacing:.06em;text-transform:uppercase}
@@ -3603,7 +3795,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
         </table>
         <button class="fold" id="fold" aria-expanded="false" style="display:none"></button>
       </div>
-      <p class="note">Click a row for its answer in plain words, its chart and levels, what is going on around it, and how it scored. Each row shows two tags at most; the rest are inside. Times are Philippine time (PHT).</p>
+      <p class="note">Click a row for its answer in plain words, its chart and levels, what is going on around it, and how it scored. Each row shows two tags at most; the rest are inside. The chart is fetched from the exchange when you open the row, so it shows what happened after the scan too. Times are Philippine time (PHT).</p>
       <div id="scan-audit" class="audit"></div>
     </div>
   </section>
@@ -3779,7 +3971,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run. The brief on top of the Scan page is built from the same rows: BTC's state and the nearest USD print come from the scan, and only the print's countdown keeps running.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open the row and use its 4H | 1H switch for each timeframe's chart, levels, setup and score; the answer strip on top stays the row's, and the other tab says what that timeframe alone would answer. The 4H+1H, 4H only and 1H only filters pick rows by which timeframes diverge.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open the row and use its 4H | 1H switch for each timeframe's chart, levels, setup and score; the answer strip on top stays the row's, and the other tab says what that timeframe alone would answer. The chart is not a picture kept from the scan: it is fetched from the exchange when you open the row and has two views. <b>At the signal</b> ends on the signal bar, as the setup stood when it was found. <b>Now</b> runs to the present, with the candle that is still open drawn faded, a line at the current price, and a sentence on what price has done since the signal; if that contradicts a Yes or Not yet from the scan (the stop was hit, or 1R was reached), the row says the answer is out of date. Refresh fetches the candles again. The 4H+1H, 4H only and 1H only filters pick rows by which timeframes diverge.</div></div>
     </div>
   </div>
 
@@ -4392,13 +4584,6 @@ function zoomChart(src, cap){
   d.showModal();
   return false;
 }
-/* Charts live in the app's memory: after a restart there is none until the next scan. */
-function noChart(img){
-  var d = document.createElement('div');
-  d.className = 'nochartbar';
-  d.innerHTML = '<span>The chart is not in memory after a restart.</span><button type="button" onclick="startScan()">Scan again to draw it</button>';
-  img.closest('.cimg').replaceWith(d);
-}
 function levelsStrip(r, s, tf){
   var t = s.targets || {}, e = s.entry_ref_price, up = r.side === 'bullish', trig = s.targets_from === 'trigger';
   var pct = function(v){ if(v == null || !e) return 'n/a'; var p = (v / e - 1) * 100; return (p > 0 ? '+' : '') + p.toFixed(1) + '%'; };
@@ -4406,7 +4591,7 @@ function levelsStrip(r, s, tf){
     return '<div class="' + c + '"><span class="n">' + n + '</span><span class="num">' + fmtPx(v) + '</span><span class="p num">' + sub + '</span><span class="h">' + hint + '</span></div>'; };
   return '<div class="levels">' + cell('stop', 'Stop', s.stop_price, pct(s.stop_price), 'get out here if wrong') +
       cell('entry', 'Entry', e, trig ? 'trigger price' : 'signal price', 'where you would get in') +
-      cell('now', 'Now', r.current_price, pct(r.current_price), 'price at the scan') +
+      '<div class="now" id="lvNow">' + nowCell(s, r.current_price, 'price at the scan') + '</div>' +      /* showChart() puts the fresh price here */
       cell('', '1R', t['1r'], pct(t['1r']), 'gain = what you risk') + cell('', '2R', t['2r'], pct(t['2r']), 'gain = 2x the risk') +
       cell('', '3R', t['3r'], pct(t['3r']), 'gain = 3x the risk') +
       cell('struct', 'Structure', t.structure, pct(t.structure), up ? 'top of the bump between A and B' : 'bottom of the dip between A and B') + '</div>' +
@@ -4415,19 +4600,101 @@ function levelsStrip(r, s, tf){
       ' Since then price has gone at most <b>' + s.r_reached + 'R</b> toward the targets' +
       (s.trigger_price != null && !trig ? '; the lower timeframe triggered at <b>' + fmtPx(s.trigger_price) + '</b>' : '') + '.</p>';
 }
+/* The inside of the levels strip's Now cell: the scan's price until the chart's facts bring a fresh one. */
+function nowCell(s, v, hint){
+  var e = s.entry_ref_price, p = v == null || !e ? null : (v / e - 1) * 100;
+  return '<span class="n">Now</span><span class="num">' + fmtPx(v) + '</span><span class="p num">' +
+    (p == null ? 'n/a' : (p > 0 ? '+' : '') + p.toFixed(1) + '%') + '</span><span class="h">' + hint + '</span>';
+}
+
+/* ── The chart: two views, drawn by the app from candles it fetches when asked ──
+   "At the signal" ends on the signal bar; "Now" runs to the present, open candle included. The row opens on
+   Now. /chart_facts is asked first: it triggers the fetch, says how fresh the candles are and what price has
+   done since the signal; the image that follows is drawn from the same candles (the app keeps them a minute). */
+var openView = 'now', chartSeq = 0;
+function phtWhen(ms){
+  return new Date(ms).toLocaleString('en-US', {timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'}) + ' PHT';
+}
+/* v = when the candles were fetched: the address must differ per fetch, or the browser keeps showing the first image */
+function chartSrc(r, tf, view, v, narrow){
+  return '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '&view=' + view + (narrow ? '&w=narrow' : '') + '&v=' + v;
+}
+function chartLoading(r){ return '<p class="cload" role="status">Fetching candles from ' + (r.exchange || 'the exchange').toUpperCase() + '&hellip;</p>'; }
+var SIGNAL_VIEW_SAY = 'This is the chart as it stood when the signal bar closed: nothing after it is drawn. Switch to Now to see what price has done since.';
 function chartBlock(r, tf){
-  var s = r.signals[tf], up = r.side === 'bullish', capn = r.base + ' ' + tfLabel(tf) + ' ' + r.side + ' divergence';
-  /* v = the scan's time: the address must change with each scan, or the browser keeps showing the first image */
-  var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '&v=' + (scanTs || 0);
-  /* A phone gets the narrow render, readable at its width. Chosen when the row opens: a <picture> would
-     refetch the uncached image every time the window is resized. */
-  return '<div class="chartbig"><div class="cimg"><a href="' + src + '" data-cap="' + capn + '" onclick="return zoomChart(this.href, this.dataset.cap)" title="Enlarge the chart">' +
-      '<img class="chart" alt="' + capn + ': chart with entry, stop and targets" src="' + src + (matchMedia('(max-width:640px)').matches ? '&w=narrow' : '') +
-      '" onerror="noChart(this)"></a>' +
-      '<p class="how"><b>How to read it.</b> Candles are price. <b>A</b> and <b>B</b> are the two ' + (up ? 'lows' : 'highs') +
+  var s = r.signals[tf], up = r.side === 'bullish';
+  return '<div class="chartbig"><div class="chead"><div class="vsw" role="group" aria-label="Chart shown">' +
+      [['signal', 'At the signal'], ['now', 'Now']].map(function(v){
+        return '<button type="button" data-view="' + v[0] + '" aria-pressed="' + (openView === v[0]) + '">' + v[1] + '</button>'; }).join('') + '</div>' +
+      '<span class="asof" id="chAsOf" role="status"></span>' +
+      (openView === 'now' ? '<button type="button" class="gbtn" onclick="loadChart(true)">Refresh</button>' : '') + '</div>' +
+    /* A phone gets the narrow render, readable at its width; chosen when the row opens */
+    '<div class="cbox' + (matchMedia('(max-width:640px)').matches ? ' narrow' : '') + '" id="chBox" data-chart-tf="' + tf + '">' + chartLoading(r) + '</div>' +
+    '<div id="chSay">' + (openView === 'signal' ? plain(SIGNAL_VIEW_SAY) : '') + '</div>' +
+    '<p class="how"><b>How to read it.</b> Candles are price. <b>A</b> and <b>B</b> are the two ' + (up ? 'lows' : 'highs') +
       ' being compared. The solid line is the entry, the dashed line is the stop, the dotted lines are profit targets. The lower panel is MACD, a measure of how strong the move is; its two ' +
-      (up ? 'troughs' : 'peaks') + ' at A and B are what the screener compares. Times are Philippine time (PHT).</p></div>' +
+      (up ? 'troughs' : 'peaks') + ' at A and B are what the screener compares.' +
+      (openView === 'now' ? ' The vertical dotted line is the signal bar, the dash-dot line is the price now, and a faded last candle is one that has not closed yet.' : '') +
+      ' Times are Philippine time (PHT).</p>' +
     levelsStrip(r, s, tf) + '</div>';
+}
+/* One sentence on what price has done since the signal, from the facts of /chart_facts. */
+function nowSay(r, s, f){
+  var moved = (f.chg_pct > 0 ? 'up ' : 'down ') + Math.abs(f.chg_pct) + '%';
+  var open = f.forming ? ' The last candle is still open, so this can change.' : '';
+  if(f.high == null) return 'Nothing has happened since the signal yet: its bar is the latest one' + (f.forming ? ' and is still open.' : '.');
+  if(f.stop_touched) return 'Since the signal, price traded through the stop' + (f.stop_on_live ? ' on the candle that is still open' : '') +
+    ' (' + phtWhen(f.stop_ms) + '). The setup has failed.' + (f.best_r >= 1 ? ' It also got as far as ' + f.best_r + 'R toward the targets.' : '') + open;
+  if(f.best_r >= 1) return 'Since the signal, price went as far as ' + f.best_r + 'R toward the targets: the move has happened. It is now ' + moved +
+    ' from the signal (' + f.chg_r + 'R) and has not touched the stop.' + open;
+  if(Math.abs(f.chg_r) < 0.1) return 'Since the signal, price has barely moved (' + sgn(f.chg_pct) + ', ' + f.chg_r + 'R) and has not touched the stop.' + open;
+  if(f.chg_r > 0) return 'Since the signal, price went ' + moved + ' (' + f.chg_r + 'R toward the targets) and has not touched the stop.' + open;
+  return 'Since the signal, price went ' + moved + ', against the trade (' + Math.abs(f.chg_r) + 'R toward the stop), but has not touched it.' + open;
+}
+/* The scan said Yes or Not yet, and the fresh candles show the stop hit or the move done: say so. The pill stays the scan's. */
+function staleSay(r, f){
+  var v = verdict(r), word = v === 'enter' && primary(r).forming ? 'Yes (early)' : ANS[v];
+  if(v === 'skip' || !(f.stop_touched || f.best_r >= 1)) return '';
+  return 'The scan answered ' + word + ', but price has since ' +
+    (f.stop_touched ? 'traded through the stop' : 'gone ' + f.best_r + 'R toward the targets: the move has happened') + '. That answer is out of date.';
+}
+function staleHtml(t){
+  return t ? '<p class="stale" role="alert"><b>&#9888; Out of date</b><span>' + t + '</span><button type="button" onclick="startScan()">Scan again</button></p>' : '';
+}
+function loadChart(refresh){
+  var box = document.getElementById('chBox'), r = pendR.filter(function(x){ return rowKey(x) === openKey; })[0];
+  if(!box || !r) return;
+  var tf = shownTf(r), seq = ++chartSeq;
+  box.classList.remove('failed');
+  box.innerHTML = chartLoading(r);
+  fetch('/chart_facts?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + (refresh ? '&refresh=1' : ''))
+    .then(function(res){ return res.json().then(function(j){ return {ok: res.ok, j: j}; }); })
+    .then(function(x){
+      if(seq !== chartSeq || !document.getElementById('chBox')) return;      /* the row closed or changed meanwhile */
+      if(x.ok) showChart(r, tf, x.j); else chartFailed(x.j.error);
+    })
+    .catch(function(){ if(seq === chartSeq) chartFailed('The app did not answer. Is it still running?'); });
+}
+function showChart(r, tf, f){
+  var box = document.getElementById('chBox'), s = r.signals[tf];
+  var capn = r.base + ' ' + tfLabel(tf) + ' ' + r.side + ' divergence, ' + (openView === 'now' ? 'now' : 'at the signal');
+  /* the enlarged chart is always the wide render of the view that is showing */
+  box.innerHTML = chartLoading(r) + '<a href="' + chartSrc(r, tf, openView, f.as_of_ms, false) + '" data-cap="' + capn +
+    '" onclick="return zoomChart(this.href, this.dataset.cap)" title="Enlarge the chart"><img class="chart" alt="' + capn +
+    ': chart with entry, stop and targets" src="' + chartSrc(r, tf, openView, f.as_of_ms, box.classList.contains('narrow')) +
+    '" onload="var l=this.closest(\'.cbox\').querySelector(\'.cload\');if(l)l.remove()" onerror="chartFailed(\'The chart could not be drawn from the candles.\')"></a>';
+  document.getElementById('chAsOf').textContent = openView === 'now' ? 'candles as of ' + phtTime(f.as_of_ms) + ' PHT' : '';
+  document.getElementById('chSay').innerHTML = (tf === primaryTf(r) ? staleHtml(staleSay(r, f)) : '') +
+    plain(openView === 'now' ? nowSay(r, s, f) : SIGNAL_VIEW_SAY);
+  var cell = document.getElementById('lvNow');
+  if(cell) cell.innerHTML = nowCell(s, f.last, 'fresh price, ' + phtTime(f.as_of_ms) + ' PHT');
+}
+function chartFailed(msg){
+  var box = document.getElementById('chBox');
+  if(!box) return;
+  box.classList.add('failed');
+  box.innerHTML = '<div class="cfail" role="alert"><span>' + calEsc(msg || 'The chart could not be loaded.') + '</span><button type="button" onclick="loadChart(true)">Try again</button></div>';
+  document.getElementById('chAsOf').textContent = '';
 }
 
 /* The "In plain words" line of each context card, chosen from the data. */
@@ -4629,6 +4896,7 @@ function renderAll(results){
   f.style.display = no ? '' : 'none';
   f.textContent = showNo ? 'Hide the ' + no + ' that did not pass' : 'Show ' + no + ' that did not pass, newest first';
   f.setAttribute('aria-expanded', showNo);
+  loadChart();                         /* the opened row's chart, if a row is open */
 }
 function rowEl(k){
   return Array.prototype.filter.call(document.querySelectorAll('#resB tr.row'), function(t){ return t.dataset.k === k; })[0];
@@ -4637,10 +4905,19 @@ function toggleRow(t){
   var k = t.dataset.k;
   openKey = openKey === k ? null : k;
   openTf = null;                       /* a row opens on the timeframe that supplies its answer */
+  openView = 'now';                    /* ...and on the chart as it is now */
   renderAll(pendR);
   if(rowEl(k)) rowEl(k).focus({preventScroll:true});
 }
 document.getElementById('resB').addEventListener('click', function(e){
+  var view = e.target.closest('.vsw button');
+  if(view){                            /* At the signal | Now */
+    openView = view.dataset.view;
+    renderAll(pendR);
+    var same = document.querySelector('.vsw button[data-view="' + openView + '"]');
+    if(same) same.focus({preventScroll:true});
+    return;
+  }
   var tab = e.target.closest('.tfsw button');
   if(tab){                             /* the 4H | 1H switch of the opened row */
     openTf = tab.dataset.tf;
@@ -4716,7 +4993,7 @@ function renderBrief(){
 document.getElementById('picks').addEventListener('click', function(e){
   var b = e.target.closest('.pick'); if(!b) return;
   var r = pendR.filter(function(x){ return rowKey(x) === b.dataset.k; })[0]; if(!r) return;
-  openKey = b.dataset.k; openTf = null;
+  openKey = b.dataset.k; openTf = null; openView = 'now';
   if(!matches(r, af)) setTab('all');
   if(verdict(r) === 'skip') showNo = true;
   renderAll(pendR);

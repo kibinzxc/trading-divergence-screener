@@ -71,11 +71,11 @@ class SavedState(unittest.TestCase):
         with open(m.STATE_FILE) as f:
             saved = json.load(f)
         self.assertEqual(sorted(saved), ["meta", "results", "ts"])
-        self.assertEqual(saved["meta"]["v"], 4)
+        self.assertEqual(saved["meta"]["v"], 5)
 
-    def test_state_from_before_the_score_parts_is_ignored(self):
+    def test_state_from_before_the_bar_times_is_ignored(self):
         self.write({"results": [{"pair": "X", "tfs": ["4h"]}],
-                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 3}})
+                    "ts": "2026-11-19T00:00:00+00:00", "meta": {"tfs": ["4h", "1h"], "v": 4}})
         m.load_state()
         self.assertEqual(m._state["results"], [])
 
@@ -136,11 +136,6 @@ class Chart(unittest.TestCase):
         s = m.signals_for_tf(wave_df(LONG), "1h", m.STRICTNESS["balanced"],
                              100.5, "ENS/USDT:USDT", 9e7)[0]
         self.hit = (s.pop("_df"), s.pop("_d"), s)
-        m._charts[self.KEY] = self.hit
-        self.c = m.app.test_client()
-
-    def tearDown(self):
-        m._charts.clear()
 
     def test_render_is_a_png(self):
         self.assertEqual(m.render_chart(*self.hit)[:4], b"\x89PNG")
@@ -208,36 +203,36 @@ class Chart(unittest.TestCase):
         self.assertTrue(all(b - a >= 0.5 for a, b in zip(ys, ys[1:])), ys)
         self.assertEqual(m.spread_labels([5.0, 1.0, 9.0], 2.0), [5.0, 1.0, 9.0])   # nothing collides
 
-    def boxes(self, hit, narrow=False):
+    def boxes(self, hit, narrow=False, view="signal"):
         """Per panel: the A / B value labels, the right-hand level labels, and the
         A-to-B line, all in pixels as the PNG is drawn."""
         from matplotlib.backends.backend_agg import FigureCanvasAgg
-        fig = m.chart_figure(*hit, narrow=narrow)
+        fig = m.chart_figure(*hit, narrow=narrow, view=view, forming=view == "now")
         FigureCanvasAgg(fig)
         fig.canvas.draw()
         r = fig.canvas.get_renderer()
         out = []
         for ax in fig.axes:
             ab = [t.get_window_extent(r) for t in ax.texts if t.get_text().split(" ")[0] in ("A", "B")]
-            lv = [t.get_window_extent(r) for t in ax.texts if t.get_text().split(" ")[0] not in ("A", "B")]
+            lv = [t.get_window_extent(r) for t in ax.texts if t.get_text().split(" ")[0] not in ("A", "B", "signal")]
             seg = next(l for l in ax.lines if l.get_marker() == "o" and len(l.get_xdata()) == 2)
             out.append((ab, lv, ax.transData.transform(seg.get_xydata()), ax.get_window_extent(r)))
         return fig, out
 
     def variants(self):
         """The fixture as found, its bearish mirror, and each with B squeezed up against A,
-        with B on the last bar, and at a sub-cent price (long labels)."""
+        with B right before the signal bar, and at a sub-cent price (long labels)."""
         s = m.signals_for_tf(wave_df(LONG, side="bearish"), "1h", m.STRICTNESS["balanced"],
                              99.5, "ENS/USDT:USDT", 9e7)[0]
         for df, d, sig in (self.hit, (s.pop("_df"), s.pop("_d"), s)):
             yield df, d, sig
             yield df, dict(d, b_p=d["a_p"] + 2, b_m=d["a_m"] + 2), sig
-            yield df, dict(d, b_p=len(df) - 1, b_m=len(df) - 1), sig
+            yield df, dict(d, b_p=d["signal_bar"] - 1, b_m=d["signal_bar"] - 1), sig
             yield df, dict(d, a_price=d["a_price"] * 1e-7, b_price=d["b_price"] * 1e-7), sig
 
     def test_a_and_b_labels_touch_neither_each_other_nor_their_line(self):
-        for hit, narrow in [(h, n) for h in self.variants() for n in (False, True)]:
-            for ab, _, ((x0, y0), (x1, y1)), panel in self.boxes(hit, narrow)[1]:
+        for hit, narrow, view in [(h, n, v) for h in self.variants() for n in (False, True) for v in ("signal", "now")]:
+            for ab, _, ((x0, y0), (x1, y1)), panel in self.boxes(hit, narrow, view)[1]:
                 self.assertEqual(len(ab), 2)
                 for b in ab:      # inside the panel: not over the axis ticks, not over the level labels
                     self.assertTrue(panel.x0 <= b.x0 and b.x1 <= panel.x1 and panel.y0 <= b.y0 and b.y1 <= panel.y1,
@@ -248,9 +243,9 @@ class Chart(unittest.TestCase):
                     self.assertFalse(any(b.contains(*pt) for b in ab), (hit[1]["side"], pt))
 
     def test_level_labels_do_not_overlap_on_the_drawn_chart(self):
-        for hit, narrow in [(h, n) for h in self.variants() for n in (False, True)]:
-            lv = self.boxes(hit, narrow)[1][0][1]
-            self.assertEqual(len(lv), 5)
+        for hit, narrow, view in [(h, n, v) for h in self.variants() for n in (False, True) for v in ("signal", "now")]:
+            lv = self.boxes(hit, narrow, view)[1][0][1]
+            self.assertEqual(len(lv), 5 if view == "signal" else 6)      # the Now view adds the Now line
             if hit[1]["a_price"] < 1:      # the sub-cent variant only stretches the A / B labels
                 continue
             for i, a in enumerate(lv):
@@ -276,27 +271,300 @@ class Chart(unittest.TestCase):
         self.assertIn("A %.3g" % d["a_macd"], titles[1])
         self.assertIn("B %.3g" % d["b_macd"], titles[1])
 
+    # ── the two views ──
+    def candles(self, fig):
+        """(x, low end, high end) of every candle body drawn on the price panel, left to right."""
+        segs = [s for c in fig.axes[0].collections for s in c.get_segments()]
+        bodies = {}
+        for (x0, y0), (x1, y1) in segs:
+            if x0 == x1:
+                bodies.setdefault(round(x0), []).append((min(y0, y1), max(y0, y1)))
+        return sorted(bodies.items())
+
+    def grown(self, extra=15):
+        """The fixture's frame with `extra` later bars, price drifting up from the signal close."""
+        df, d, sig = self.hit
+        more = df.iloc[-extra:].copy()
+        more.index = m.pd.date_range(df.index[-1] + m.pd.Timedelta(hours=1), periods=extra, freq="1h")
+        step = m.np.arange(1, extra + 1) * 0.2
+        for c in ("open", "high", "low", "close"):
+            more[c] = df[c].iloc[-1] + step
+        return m.pd.concat([df, more])
+
+    def test_signal_view_never_shows_a_bar_after_the_signal_bar(self):
+        df, d, sig = self.hit
+        for frame in (df, self.grown()):
+            for narrow in (False, True):
+                self.assertEqual(m.chart_span(d, len(frame), "signal", narrow)[1], d["signal_bar"] + 1)
+                got = self.candles(m.chart_figure(frame, d, sig, narrow=narrow, view="signal"))
+                last_x, _ = got[-1]
+                start = d["signal_bar"] - last_x                    # the frame index of x = 0
+                self.assertEqual([x for x, _ in got], list(range(last_x + 1)))      # every bar up to it, none after
+                self.assertGreater(d["a_start"], start)             # wave A is in view
+                bar = frame.iloc[d["signal_bar"]]
+                self.assertIn((bar["low"], bar["high"]), got[-1][1])          # the last candle is the signal bar
+                texts = [t.get_text() for ax in m.chart_figure(frame, d, sig, view="signal").axes for t in ax.texts]
+                self.assertFalse([t for t in texts if t.startswith(("Now", "signal"))], texts)
+
+    def test_now_view_runs_to_the_last_candle_and_marks_now_and_the_signal_bar(self):
+        df, d, sig = self.hit
+        frame = self.grown()
+        for narrow in (False, True):
+            fig = m.chart_figure(frame, d, sig, narrow=narrow, view="now", forming=True)
+            got = self.candles(fig)
+            self.assertEqual([x for x, _ in got], list(range(got[-1][0] + 1)))
+            self.assertEqual(len(got) - len(self.candles(m.chart_figure(frame, d, sig, narrow=narrow, view="signal"))),
+                             len(frame) - 1 - d["signal_bar"])       # the same start, plus every bar since
+            last = frame.iloc[-1]
+            self.assertIn((last["low"], last["high"]), got[-1][1])
+            texts = [t.get_text() for ax in fig.axes for t in ax.texts]
+            self.assertIn("signal", texts)
+            now = [t for t in texts if t.startswith("Now")]
+            self.assertEqual(len(now), 1)
+            if not narrow:
+                self.assertEqual(now[0], "Now " + m._plain(m.px(float(frame["close"].iloc[-1]))))
+            # the still-forming candle is drawn faded and the MACD reaches it dashed
+            self.assertTrue(any(c.get_alpha() is not None and c.get_alpha() < 1 for c in fig.axes[0].collections))
+            self.assertTrue(any(l.get_linestyle() == "--" and len(l.get_xdata()) == 2 for l in fig.axes[1].lines))
+            closed = m.chart_figure(frame, d, sig, narrow=narrow, view="now", forming=False)
+            self.assertFalse(any(c.get_alpha() is not None and c.get_alpha() < 1 for c in closed.axes[0].collections))
+            self.assertFalse(any(l.get_linestyle() == "--" and len(l.get_xdata()) == 2 for l in closed.axes[1].lines))
+
+    def test_a_long_now_view_is_capped_but_keeps_a_b_and_the_signal_bar(self):
+        d = self.hit[1]
+        for narrow in (False, True):
+            start, end = m.chart_span(d, 5000, "now", narrow)
+            self.assertLessEqual(end - start, m.CHART_MAX_BARS[narrow])
+            self.assertLess(start, d["a_start"])
+            self.assertGreater(end, d["signal_bar"])
+            self.assertEqual(m.chart_span(d, len(self.hit[0]), "now", narrow)[1], len(self.hit[0]))
+        late = dict(d, a_start=100, a_p=120, a_m=120, b_p=380, b_m=380, signal_bar=395)     # a leg longer than the phone cap
+        self.assertGreater(m.chart_span(late, 5000, "now", True)[1], 395)
+
+
+class ChartData(unittest.TestCase):
+    """Charts are drawn on demand from candles fetched then. The exchange is mocked: no network."""
+    Q = {"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"}
+    OHLCV = ["open", "high", "low", "close", "volume"]
+
+    def setUp(self):
+        self.df = wave_df(LONG)
+        s = m.signals_for_tf(self.df, "1h", m.STRICTNESS["balanced"], 100.5, "ENS/USDT:USDT", 9e7)[0]
+        s.pop("_df")
+        self.d, self.sig = s.pop("_d"), s
+        row = m.build_rows([dict(s)])[0]
+        row.update(exchange="binance", venue_tags=[])
+        m._state.update({"results": [row], "ts": None, "meta": {}})
+        self.frame, self.calls, self.fail = self.df[self.OHLCV], [], None
+        self._fetch, m._fetch_frame = m._fetch_frame, self.fetch
+        m._frames.clear()
+        self.c = m.app.test_client()
+
+    def tearDown(self):
+        m._fetch_frame = self._fetch
+        m._frames.clear()
+        m._state.update({"results": [], "ts": None, "meta": {}})
+
+    def fetch(self, exid, pair, tf):
+        self.calls.append((exid, pair, tf))
+        if self.fail:
+            raise m.ChartError(self.fail)
+        return self.frame
+
+    def later(self, extra, **cols):
+        """`extra` bars after the fixture's last, flat at 100.5 unless a column is given per bar."""
+        idx = m.pd.date_range(self.df.index[-1] + m.pd.Timedelta(hours=1), periods=extra, freq="1h")
+        more = m.pd.DataFrame({"open": 100.5, "high": 101.0, "low": 100.0, "close": 100.5, "volume": 1.0}, index=idx)
+        for k, v in cols.items():
+            more[k] = v
+        return m.pd.concat([self.df[self.OHLCV], more])
+
+    # ── saved times -> bars of a fresh frame ──
+    def test_the_saved_signal_carries_the_time_of_every_bar_the_chart_marks(self):
+        ms = lambda i: int(self.df.index[i].timestamp() * 1000)
+        d, s = self.d, self.sig
+        self.assertEqual([s[k] for k in ("a_start_ms", "a_ms", "a_m_ms", "b_ms", "b_m_ms", "signal_ms")],
+                         [ms(d[k]) for k in ("a_start", "a_p", "a_m", "b_p", "b_m", "signal_bar")])
+        self.assertEqual(s["cross_ms"], [[ms(b), k] for b, k in d["crosses"]])
+        json.dumps(s)
+
+    def test_bars_are_placed_by_time_on_the_same_frame_and_on_one_that_has_grown(self):
+        keys = ("a_start", "a_p", "a_m", "b_p", "b_m", "signal_bar")
+        got = m.place_signal(self.df, self.sig)
+        self.assertEqual([got[k] for k in keys], [self.d[k] for k in keys])
+        self.assertEqual(got["crosses"], [tuple(c) for c in self.d["crosses"]])
+        self.assertEqual((got["side"], got["a_price"], got["b_macd"]),
+                         ("bullish", self.sig["pivot1_price"], self.sig["pivot2_macd"]))
+        grown = self.later(40).iloc[25:]             # 25 old bars gone, 40 new ones: every index moves
+        moved = m.place_signal(grown, self.sig)
+        self.assertEqual([moved[k] for k in keys], [self.d[k] - 25 for k in keys])
+        self.assertEqual(grown.index[moved["signal_bar"]], self.df.index[self.d["signal_bar"]])
+
+    def test_a_time_missing_from_the_fresh_frame_is_an_error_not_a_marker_on_the_wrong_bar(self):
+        for drop, name in ((self.d["b_p"], "B"), (self.d["signal_bar"], "signal bar"), (self.d["a_p"], "A")):
+            with self.assertRaises(m.ChartError) as e:
+                m.place_signal(self.df.drop(self.df.index[drop]), self.sig)
+            self.assertIn(name, str(e.exception))
+            self.assertIn("PHT", str(e.exception))
+        with self.assertRaises(m.ChartError):        # history that no longer reaches back to wave A
+            m.place_signal(self.df.iloc[self.d["a_p"] + 1:], self.sig)
+
+    # ── facts since the signal ──
+    def facts(self, frame, forming=False, sig=None, side="bullish"):
+        sig = sig or self.sig
+        return m.chart_facts(frame, m.place_signal(frame, sig), sig, forming, 1234)
+
+    def test_facts_quiet_since_the_signal(self):
+        f = self.facts(self.later(5))
+        self.assertEqual((f["as_of_ms"], f["forming"], f["stop_touched"], f["stop_ms"], f["bars_since"]),
+                         (1234, False, False, None, 5 + len(self.df) - 1 - self.d["signal_bar"]))
+        self.assertEqual(f["last"], 100.5)
+        self.assertAlmostEqual(f["chg_pct"], round((100.5 / self.sig["signal_price"] - 1) * 100, 2))
+        self.assertEqual(f["closed"]["stop_touched"], False)
+        json.dumps(f)
+
+    def test_facts_stop_touched_and_r_reached_bullish(self):
+        s = self.sig
+        risk = abs(s["targets"]["1r"] - s["entry_ref_price"])
+        hi = [101.0, s["entry_ref_price"] + 1.5 * risk, 101.0, 101.0]
+        lo = [100.0, 100.0, s["stop_price"] - 0.1, 100.0]
+        frame = self.later(4, high=hi, low=lo)
+        f = self.facts(frame)
+        self.assertTrue(f["stop_touched"])
+        self.assertEqual(f["stop_ms"], int(frame.index[-2].timestamp() * 1000))
+        self.assertFalse(f["stop_on_live"])
+        self.assertAlmostEqual(f["best_r"], 1.5, places=2)
+        self.assertEqual((f["high"], f["low"]), (m.px(max(hi)), m.px(min(lo))))
+        self.assertAlmostEqual(f["chg_r"], round((100.5 - s["entry_ref_price"]) / risk, 2))
+
+    def test_facts_keep_the_forming_candle_apart_from_completed_bars(self):
+        s = self.sig
+        frame = self.later(3, low=[100.0, 100.0, s["stop_price"] - 0.1])      # only the open candle is through the stop
+        f = self.facts(frame, forming=True)
+        self.assertEqual((f["forming"], f["stop_touched"], f["stop_on_live"], f["closed"]["stop_touched"]),
+                         (True, True, True, False))
+        self.assertEqual(f["closed"]["bars"], f["bars_since"])
+        self.assertEqual(self.facts(frame, forming=False)["closed"]["stop_touched"], True)
+        only = self.df[self.OHLCV].iloc[:self.d["signal_bar"] + 1]              # the signal bar is the open candle
+        f = self.facts(only, forming=True)
+        self.assertEqual((f["bars_since"], f["stop_touched"], f["best_r"], f["high"], f["low"]), (0, False, 0.0, None, None))
+
+    def test_facts_bearish_mirror(self):
+        df = wave_df(LONG, side="bearish")
+        s = m.signals_for_tf(df, "1h", m.STRICTNESS["balanced"], 99.5, "ENS/USDT:USDT", 9e7)[0]
+        risk = abs(s["targets"]["1r"] - s["entry_ref_price"])
+        idx = m.pd.date_range(df.index[-1] + m.pd.Timedelta(hours=1), periods=3, freq="1h")
+        more = m.pd.DataFrame({"open": 99.5, "high": [100.0, 100.0, s["stop_price"] + 0.1],
+                               "low": [99.0, s["entry_ref_price"] - 2 * risk, 99.0], "close": 99.0, "volume": 1.0}, index=idx)
+        frame = m.pd.concat([df[self.OHLCV], more])
+        f = self.facts(frame, sig=s)
+        self.assertTrue(f["stop_touched"])
+        self.assertEqual(f["stop_ms"], int(idx[-1].timestamp() * 1000))
+        self.assertAlmostEqual(f["best_r"], 2.0, places=2)
+        self.assertGreater(f["chg_r"], 0)                # price fell: that is in a short's favour
+        self.assertLess(f["chg_pct"], 0)
+
+    # ── one fetch shared for about a minute ──
+    def test_frames_are_cached_briefly_and_refresh_bypasses_the_cache(self):
+        a = m.fresh_frame("binance", "ENS/USDT:USDT", "1h")
+        b = m.fresh_frame("binance", "ENS/USDT:USDT", "1h")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIs(a[0], b[0])
+        self.assertIn("macd", a[0].columns)
+        m.fresh_frame("binance", "ENS/USDT:USDT", "4h")
+        self.assertEqual(len(self.calls), 2)             # another timeframe is another frame
+        c = m.fresh_frame("binance", "ENS/USDT:USDT", "1h", refresh=True)
+        self.assertEqual(len(self.calls), 3)
+        self.assertGreaterEqual(c[2], a[2])
+        key = ("binance", "ENS/USDT:USDT", "1h")
+        m._frames[key] = (m._frames[key][0] - m.FRAME_TTL_S - 1,) + m._frames[key][1:]
+        m.fresh_frame("binance", "ENS/USDT:USDT", "1h")
+        self.assertEqual(len(self.calls), 4)             # older than the limit: fetched again
+
+    def test_both_routes_and_both_views_share_one_fetch(self):
+        for q in (dict(self.Q, view="now"), dict(self.Q, view="signal"), dict(self.Q, view="now", w="narrow")):
+            r = self.c.get("/chart", query_string=q)
+            self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"), q)
+            self.assertIn("no-store", r.headers["Cache-Control"])
+        f = self.c.get("/chart_facts", query_string=self.Q)
+        self.assertEqual(f.status_code, 200)
+        self.assertEqual(self.calls, [("binance", "ENS/USDT:USDT", "1h")])
+        self.assertEqual(self.c.get("/chart_facts", query_string=dict(self.Q, refresh="1")).status_code, 200)
+        self.assertEqual(len(self.calls), 2)
+        for k in ("as_of_ms", "last", "forming", "chg_pct", "chg_r", "high", "low", "stop_touched", "stop_ms",
+                  "stop_on_live", "best_r", "bars_since", "closed"):
+            self.assertIn(k, f.get_json(), k)
+
     def test_route_serves_a_narrower_png_for_phones(self):
         import struct
-        q = {"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"}
-        wide = self.c.get("/chart", query_string=q).data
-        narrow = self.c.get("/chart", query_string=dict(q, w="narrow")).data
-        w = [struct.unpack(">I", png[16:20])[0] for png in (wide, narrow)]      # IHDR width
+        w = [struct.unpack(">I", self.c.get("/chart", query_string=dict(self.Q, **x)).data[16:20])[0]
+             for x in ({}, {"w": "narrow"})]             # IHDR width
         self.assertLess(w[1], w[0], w)
 
-    def test_route_serves_the_chart_of_a_scanned_row(self):
-        r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"})
-        self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"))
+    def test_charts_draw_from_saved_state_alone(self):
+        self.assertFalse(hasattr(m, "_charts"))          # nothing is kept from the scan
+        import inspect
+        self.assertNotIn("fresh_frame", inspect.getsource(m.scan_route))     # and the scan fetches nothing for charts
 
-    def test_chart_is_never_cached_and_its_address_changes_per_scan(self):
-        r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h", "v": "123"})
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("no-store", r.headers["Cache-Control"])
-        self.assertIn("'&tf=' + tf + '&v=' + (scanTs || 0)", m.app.test_client().get("/").get_data(as_text=True))
+    def test_a_failed_fetch_is_a_clear_error_and_nothing_else_breaks(self):
+        self.fail = "BINANCE did not return candles for ENS/USDT:USDT (1h)."
+        for path in ("/chart", "/chart_facts"):
+            r = self.c.get(path, query_string=self.Q)
+            self.assertEqual(r.status_code, 502, path)
+            self.assertEqual(r.get_json(), {"error": self.fail})
+        self.assertEqual(self.c.get("/").status_code, 200)
+        self.assertEqual(self.c.get("/signals").status_code, 200)
+        self.fail = None                                 # the failure was not cached
+        self.assertEqual(self.c.get("/chart_facts", query_string=self.Q).status_code, 200)
 
-    def test_unknown_row_is_404(self):
-        r = self.c.get("/chart", query_string={"pair": "NOPE/USDT:USDT", "side": "bullish", "tf": "1h"})
-        self.assertEqual(r.status_code, 404)
+    def test_an_error_inside_the_exchange_call_becomes_a_chart_error(self):
+        m._fetch_frame = self._fetch
+        make, m.make_exchange = m.make_exchange, lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            with self.assertRaises(m.ChartError) as e:
+                m._chart_venues.clear()
+                m._fetch_frame("binance", "ENS/USDT:USDT", "1h")
+            self.assertIn("BINANCE", str(e.exception))
+        finally:
+            m.make_exchange = make
+            m._chart_venues.clear()
+
+    def test_fetch_uses_the_apps_exchange_and_limiter_and_no_candles_is_an_error(self):
+        class Ex:
+            id = "binance"
+            def parse_timeframe(self, tf): return 3600
+            def fetch_ohlcv(self, sym, timeframe=None, limit=None, since=None, params=None): return self.rows
+        ex, made = Ex(), []
+        m._fetch_frame = self._fetch
+        make, m.make_exchange = m.make_exchange, lambda exid, rate_limit=True: (made.append((exid, rate_limit)), ex)[1]
+        try:
+            m._chart_venues.clear()
+            ex.rows = [[int(t.timestamp() * 1000), 1.0, 2.0, 0.5, 1.5, 9.0] for t in self.df.index]
+            got = m._fetch_frame("binance", "ENS/USDT:USDT", "1h")
+            self.assertEqual((len(got), list(got.columns)), (len(self.df), self.OHLCV))
+            m._fetch_frame("binance", "ENS/USDT:USDT", "1h")
+            self.assertEqual(made, [("binance", False)])          # one exchange object, paced by the app's limiter
+            self.assertIsInstance(m._chart_venues["binance"][1], m.RateLimiter)
+            ex.rows = []
+            with self.assertRaises(m.ChartError):
+                m._fetch_frame("binance", "ENS/USDT:USDT", "1h")
+        finally:
+            m.make_exchange = make
+            m._chart_venues.clear()
+
+    def test_unknown_row_or_timeframe_is_404(self):
+        for q in (dict(self.Q, pair="NOPE/USDT:USDT"), dict(self.Q, tf="4h"), dict(self.Q, side="bearish")):
+            for path in ("/chart", "/chart_facts"):
+                r = self.c.get(path, query_string=q)
+                self.assertEqual(r.status_code, 404, q)
+                self.assertIn("error", r.get_json())
+        self.assertEqual(self.calls, [])
+
+    def test_a_signal_the_fresh_candles_no_longer_cover_is_a_clear_error(self):
+        self.frame = self.df[self.OHLCV].iloc[self.d["b_p"]:]
+        r = self.c.get("/chart", query_string=self.Q)
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("A", r.get_json()["error"])
 
 
 class Page(unittest.TestCase):
@@ -429,10 +697,12 @@ class Page(unittest.TestCase):
         for want in ('data-f="h4"', 'data-f="h1"', 'data-f="both"', "Rows that diverge on 4H only", "Rows that diverge on 1H only",
                      "function verdictStrip", "function chartBlock", "function levelsStrip", "function contextCards",
                      "function scoreCard", "function tagsCard", "function words", ".tfsw button[aria-pressed",
+                     "function loadChart", "function showChart", "function chartFailed", ".vsw button[aria-pressed",
+                     ".cbox{position:relative;aspect-ratio:", "fetched from the exchange when you open the row",
                      "timeZone: 'Asia/Manila'", "Times are Philippine time (PHT)", "<th>Time (PHT)</th>"):
             self.assertIn(want, self.html, want)
         for gone in ("dgrid", "Why this answer", "toLocaleTimeString('en-GB'", ".getHours()", "your local time",
-                     "function tfBlock"):
+                     "function tfBlock", "noChart", "nochartbar", "not in memory", "chart needs a fresh scan"):
             self.assertNotIn(gone, self.html, gone)
 
     def test_pivot_era_ui_is_gone(self):
@@ -598,7 +868,7 @@ class OpenedRow(PageLogic):
         self.assertEqual(got[:2], ["1h", "1h"])
         self.assertEqual(re.findall(r'data-tf="(\w+)" aria-pressed="(\w+)"', got[2]), [("4h", "false"), ("1h", "true")])
         self.assertRegex(got[2], r'data-tf="1h" aria-pressed="true">1H<span class="mark">gives the answer')
-        self.assertIn("&tf=1h", got[2])
+        self.assertIn('data-chart-tf="1h"', got[2])
         self.assertNotIn("alone this would be", got[2])
         self.assertIn("Both 4H and 1H show the same bullish divergence", re.sub(r"<[^>]+>", "", got[2]))
         for one in got[3:]:
@@ -609,8 +879,8 @@ class OpenedRow(PageLogic):
         a, b = self.js_value("(function(){ openTf = null; var a = detailRow(BOTH); openTf = '4h'; return [a, detailRow(BOTH)]; })()")
         strip = lambda h: re.search(r'<div class="verdict">.*?</p></div>', h, re.S).group(0)
         self.assertEqual(strip(a), strip(b))                    # the row's answer does not move with the tab
-        self.assertIn("&tf=4h", b)
-        self.assertNotIn("&tf=1h", b)
+        self.assertIn('data-chart-tf="4h"', b)
+        self.assertNotIn('data-chart-tf="1h"', b)
         self.assertRegex(re.sub(r"<[^>]+>", "", b), r"On 4H alone this would be: No\. Price already hit the stop")
         self.assertEqual(re.findall(r'data-tf="(\w+)" aria-pressed="true"', b), ["4h"])
         self.assertEqual(self.js_value("(openTf = '4h', shownTf(ONE))"), "1h")     # a tab the row does not have
@@ -706,11 +976,82 @@ class OpenedRow(PageLogic):
         self.assertIn(">ALSO ON OKX, BYBIT</span>", got[0])
         self.assertIn("No tags", got[1])
 
-    def test_no_chart_in_memory_is_one_slim_line_with_a_scan_button(self):
-        self.assertIn('onerror="noChart(this)"', self.js_value("chartBlock(ONE, '1h')"))
-        src = re.search(r"function noChart\(img\)\{.*?\n\}", self.js, re.S).group(0)
-        for want in ("The chart is not in memory after a restart", 'onclick="startScan()"', "nochartbar", ".cimg"):
-            self.assertIn(want, src)
+    # ── the chart: two views, fetched when the row opens ──
+    F = ("{as_of_ms: Date.UTC(2026, 10, 22, 7, 42), forming: false, last: 10.36, chg_pct: 3.6, chg_r: 0.7, high: 10.4,"
+         " low: 9.9, stop_touched: false, stop_ms: null, stop_on_live: false, best_r: 0.8, bars_since: 5, closed: {}}")
+
+    def facts(self, **kw):
+        return "Object.assign(%s, %s)" % (self.F, json.dumps(kw))
+
+    def test_chart_block_opens_on_now_with_a_switch_refresh_and_reserved_space(self):
+        now, sig = self.js_value("(function(){ openView = 'now'; var a = chartBlock(ONE, '1h'); openView = 'signal'; "
+                                 "var b = chartBlock(ONE, '1h'); openView = 'now'; return [a, b]; })()")
+        self.assertEqual(self.js_value("openView"), "now")
+        self.assertEqual(re.findall(r'data-view="(\w+)" aria-pressed="(\w+)">([^<]+)<', now),
+                         [("signal", "false", "At the signal"), ("now", "true", "Now")])
+        self.assertEqual(re.findall(r'data-view="(\w+)" aria-pressed="true"', sig), ["signal"])
+        self.assertIn('onclick="loadChart(true)">Refresh</button>', now)
+        self.assertNotIn("Refresh", sig)                         # nothing to refresh on the frozen view
+        for h in (now, sig):
+            self.assertIn('<div class="cbox" id="chBox" data-chart-tf="1h">', h)
+            self.assertIn('role="status">Fetching candles from OKX', h)
+            self.assertNotIn("<img", h)                          # the image arrives with its facts
+            self.assertIn('id="chAsOf"', h)
+            self.assertIn('id="lvNow"', h)
+        self.assertIn("nothing after it is drawn", sig)
+        self.assertIn("dash-dot line is the price now", now)
+
+    def test_chart_address_names_the_view_and_is_unique_per_fetch(self):
+        got = self.js_value("[chartSrc(ONE, '1h', 'now', 111, false), chartSrc(ONE, '1h', 'signal', 222, true)]")
+        self.assertEqual(got, ["/chart?pair=SOL%2FUSDT%3AUSDT&side=bullish&tf=1h&view=now&v=111",
+                               "/chart?pair=SOL%2FUSDT%3AUSDT&side=bullish&tf=1h&view=signal&w=narrow&v=222"])
+        src = re.search(r"function showChart\(.*?\n\}", self.js, re.S).group(0)
+        for want in ("f.as_of_ms", "zoomChart(this.href, this.dataset.cap)", "'candles as of ' + phtTime(f.as_of_ms) + ' PHT'",
+                     "chartFailed(", "lvNow"):
+            self.assertIn(want, src, want)
+        load = re.search(r"function loadChart\(.*?\n\}", self.js, re.S).group(0)
+        for want in ("/chart_facts?", "&refresh=1", "chartFailed(", "seq !== chartSeq"):
+            self.assertIn(want, load, want)
+        fail = re.search(r"function chartFailed\(.*?\n\}", self.js, re.S).group(0)
+        self.assertIn('onclick="loadChart(true)">Try again</button>', fail)
+
+    def test_plain_words_since_the_signal(self):
+        bear = "vary(ONE, {side: 'bearish'})"
+        cases = [
+            ("ONE", self.facts(), r"^Since the signal, price went up 3\.6% \(0\.7R toward the targets\) and has not touched the stop\.$"),
+            (bear, self.facts(chg_pct=-3.6), r"price went down 3\.6% \(0\.7R toward the targets\) and has not touched the stop"),
+            ("ONE", self.facts(chg_pct=-1.2, chg_r=-0.4), r"price went down 1\.2%, against the trade \(0\.4R toward the stop\), but has not touched it"),
+            (bear, self.facts(chg_pct=1.2, chg_r=-0.4), r"price went up 1\.2%, against the trade \(0\.4R toward the stop\)"),
+            ("ONE", self.facts(chg_pct=0.1, chg_r=0.03), r"price has barely moved \(\+0\.1%, 0\.03R\) and has not touched the stop"),
+            ("ONE", self.facts(best_r=1.4), r"went as far as 1\.4R toward the targets: the move has happened\. It is now up 3\.6% from the signal \(0\.7R\) and has not touched the stop"),
+            ("ONE", self.facts(stop_touched=True, stop_ms=1795323600000), r"price traded through the stop \(Nov 22, 1:00 PM PHT\)\. The setup has failed\.$"),
+            (bear, self.facts(stop_touched=True, stop_ms=1795323600000, stop_on_live=True, forming=True, best_r=1.2),
+             r"through the stop on the candle that is still open \(Nov 22, 1:00 PM PHT\)\. The setup has failed\. It also got as far as 1\.2R toward the targets\. The last candle is still open, so this can change\.$"),
+            ("ONE", self.facts(forming=True), r"has not touched the stop\. The last candle is still open, so this can change\.$"),
+            ("ONE", self.facts(high=None, low=None, bars_since=0, forming=True), r"^Nothing has happened since the signal yet: its bar is the latest one and is still open\.$"),
+        ]
+        got = self.js_value("[" + ", ".join("nowSay(%s, null, %s)" % (r, f) for r, f, _ in cases) + "]")
+        for say, (_, _, want) in zip(got, cases):
+            self.assertRegex(say, want)
+            self.assertNotRegex(say, r"undefined|NaN|null")
+
+    def test_stale_answer_warning_only_when_the_facts_contradict_a_live_answer(self):
+        yes = "vary(ONE, {entry: {verdict: 'enter', reason: 'Yes (confirmed).'}, sig: {forming: false}})"
+        no = "vary(ONE, {entry: {verdict: 'skip', reason: 'No.'}})"
+        got = self.js_value("[staleSay(%s, %s), staleSay(ONE, %s), staleSay(%s, %s), staleSay(%s, %s), staleSay(ONE, %s), staleHtml('x'), staleHtml('')]"
+                            % (yes, self.facts(stop_touched=True), self.facts(best_r=1.4), yes, self.facts(),
+                               no, self.facts(stop_touched=True, best_r=2), self.facts(best_r=0.99)))
+        self.assertRegex(got[0], r"The scan answered Yes, but price has since traded through the stop\. That answer is out of date\.")
+        self.assertRegex(got[1], r"The scan answered Not yet, but price has since gone 1\.4R toward the targets")
+        self.assertEqual(got[2:5], ["", "", ""])                # nothing contradicts; a No stays a No; 0.99R is not 1R
+        self.assertIn('onclick="startScan()">Scan again</button>', got[5])
+        self.assertIn("Out of date", got[5])
+        self.assertEqual(got[6], "")
+
+    def test_now_cell_says_whether_its_price_is_the_scans_or_fresh(self):
+        got = self.js_value("(function(){ var s = ONE.signals['1h']; return [text(levelsStrip(ONE, s, '1h')), text(nowCell(s, s.entry_ref_price * 1.02, 'fresh price, 3:42 PM PHT'))]; })()")
+        self.assertIn("price at the scan", got[0])
+        self.assertRegex(got[1], r"Now [\d.]+ \+2\.0% fresh price, 3:42 PM PHT")
 
     def test_every_clock_time_is_12_hour_philippine_time_whatever_the_zone(self):
         expr = ("[new Date(2026, 0, 1).getTimezoneOffset(), phtTime(new Date('2026-11-21T05:00:00Z')),"

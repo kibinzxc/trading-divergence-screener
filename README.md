@@ -87,8 +87,17 @@ serves both the API and a browser dashboard.
   checked". A row that diverges on both timeframes gets a `4H | 1H` switch:
   the answer strip stays the row's, the chart, levels, setup, score and Trend
   card follow the tab, and the other tab says what that timeframe alone would
-  answer. After a restart the charts are gone from memory: the row shows one
-  line with a button that scans again.
+  answer.
+- **The chart is fetched when you open the row**, from the row's own exchange,
+  and placed on the fresh candles by the bar times saved with the signal, so
+  it works for any saved row after a restart. Two views: **At the signal**
+  ends on the signal bar; **Now** (the default) runs to the present, with the
+  still-open candle faded, a "Now" line at the last price, the signal bar
+  marked, and one plain sentence on what price has done since (from
+  `/chart_facts`). If that contradicts a Yes or Not yet from the scan (stop
+  hit, or 1R reached) the row says the answer is out of date; the pill itself
+  stays the scan's. Fetched candles are reused for 60 seconds; Refresh
+  fetches again. A scan fetches nothing for charts.
 - **Philippine time everywhere**: every clock time and calendar day on the
   five pages and on the chart axis is PHT (UTC+8) in 12-hour form, whatever
   time zone the browser or the machine is in.
@@ -244,7 +253,8 @@ without re-scanning.
 | `/movers` | GET (SSE) | Run the daily movers scan; `thin=1` adds the low-liquidity band |
 | `/mover_signals` | GET | Last cached `/movers` result (`rows`, `meta`, `ts`) |
 | `/universe` | GET | Size of the tradable universe at a given volume floor (no scan) |
-| `/chart` | GET | PNG of one row's A-to-B leg from the last scan (`pair`, `side`, `tf`) |
+| `/chart` | GET | PNG of one row of the last scan, drawn from candles fetched now (`pair`, `side`, `tf`; `view=now` or `signal`; `w=narrow`; `refresh=1`) |
+| `/chart_facts` | GET | JSON from the same candles: as-of time, last price, change since the signal in % and R, high / low, stop touched and when, best R, open-candle flag |
 | `/calendar` | GET | Upcoming economic events, cached; `refresh=1` forces a re-fetch (at most every 5 min) |
 
 Common query params (all optional, sane defaults apply):

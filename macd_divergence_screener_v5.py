@@ -148,9 +148,9 @@ GRADE_A, GRADE_B = 70, 55
 # bar stays enterable (counted in bars, so the backtest stays deterministic).
 # htf / ltf are the timeframes used for agreement and for the early-entry trigger.
 TF_CFG = {
-    "4h": {"label": "4H", "minutes": 240, "bars": 720, "fresh_h": 24,
+    "4h": {"label": "4H", "minutes": 240, "bars": 720, "fresh_h": 48,
            "htf_minutes": 1440, "ltf": "1h", "ltf_minutes": 60},
-    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "fresh_h": 8,
+    "1h": {"label": "1H", "minutes": 60,  "bars": 500, "fresh_h": 12,
            "htf_minutes": 240, "ltf": "15m", "ltf_minutes": 15},
 }
 LTF15_WINDOW_H = 8    # a 4H signal's 15m trigger must close within this many hours of the 4H close
@@ -914,8 +914,11 @@ def entry_verdict(sig, blocker=None):
     """Is this setup enterable as of the scan? A CHECKLIST, not a prediction.
 
     First matching rule wins (spec "Good to enter?"):
-      skip   stop hit · already ran 1R+ · signal bar too old · grade C
-      wait   counter trend below grade A · price ran >MOVED_PCT from the signal ·
+      skip   stop hit · already ran 1R+ · grade C · signal bar past the fresh
+             window with price moved away from the signal
+      wait   signal bar past the fresh window but price still at the entry
+             (watch only, never a Yes) · counter trend below grade A ·
+             price ran >MOVED_PCT from the signal ·
              a USD blocker due inside MACRO_WAIT_H or printed in the last
              hour · signal bar still forming with no lower-timeframe trigger
       enter  none of the above: "Yes (early)" on a forming signal bar,
@@ -935,13 +938,20 @@ def entry_verdict(sig, blocker=None):
     if st == "ran":
         return out("skip", f"No. Price already moved {sig['r_reached']:g}x the risk toward the "
                            "target. The move has happened; entering now is chasing it.")
-    if not sig["fresh"]:
-        return out("skip", f"No. {sig['bars_ago']} completed {cfg['label']} bars "
-                           f"({sig['bars_ago'] * cfg['minutes'] / 60:g}h) have closed after the signal "
-                           f"bar, too many to act on (the limit on {cfg['label']} is "
-                           f"{cfg['fresh_h'] * 60 // cfg['minutes']} bars, {cfg['fresh_h']}h).")
     if sig["grade"] == "C":
         return out("skip", f"No. Weak setup: grade C, score {sig['score']} of 100.")
+    if not sig["fresh"]:
+        age = (f"{sig['bars_ago']} completed {cfg['label']} bars "
+               f"({sig['bars_ago'] * cfg['minutes'] / 60:g}h) have closed after the signal bar")
+        lim = f"{cfg['fresh_h'] * 60 // cfg['minutes']} bars"
+        if st != "active":       # old AND price has left the entry: nothing left to watch
+            return out("skip", f"No. {age}, too many to act on (the limit on {cfg['label']} is "
+                               f"{lim}, {cfg['fresh_h']}h), and price has moved away from the signal.")
+        # Past the window but price still sits at the entry with the stop untouched:
+        # kept visible as a watch item. It never becomes a Yes at this age.
+        return out("wait", f"Not yet. Watch only: {age}, past the {lim} ({cfg['fresh_h']}h) for a "
+                           f"fresh entry on {cfg['label']}. Price is still near the signal price and the "
+                           "stop is untouched, so it stays on watch; at this age it does not become a Yes.")
     if sig["regime"] == "COUNTER TREND" and sig["grade"] != "A":
         return out("wait", "Not yet. Watch only: this is against the trend, and a counter-trend "
                            f"setup needs grade A. This one is grade {sig['grade']}.")
@@ -3786,7 +3796,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
             <th title="The coin, then at most two of its tags and +N for the rest. Open the row for every tag; hover a tag for its definition, or open the Tags page for the full list.">Coin</th>
             <th title="long: a regular bullish divergence. Across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. short: a regular bearish divergence, the mirror on two peaks. Then the timeframes that diverge; the brighter one supplies the answer and the levels.">Side and TF</th>
             <th title="Grade and quality score 0-100: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
-            <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar, or the grade is C. Not yet: counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Under the answer: the first sentence of the reason; open the row for all of it. Default order: Yes, then Not yet, then No; highest score first, No rows newest first. Click to return to it.">Answer</th>
+            <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the grade is C, or more than 12 completed 4H bars (48h) / 12 completed 1H bars (12h) have closed after the signal bar and price has moved away from the signal. Not yet: past that window but price still at the signal with the stop untouched (watch only, it never becomes a Yes), counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Under the answer: the first sentence of the reason; open the row for all of it. Default order: Yes, then Not yet, then No; highest score first, No rows newest first. Click to return to it.">Answer</th>
             <th title="The entry reference: the signal price (the close of the MACD cross that ends the second wave), or the lower-timeframe trigger price when that fired first. 1R / 2R / 3R are measured from it; open the row to see them.">Entry</th>
             <th title="Beyond price extreme B by 0.25 ATR, and the distance to it from the entry as a percentage. Price trading through it means the divergence has failed.">Stop</th>
             <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. On OKX it covers all of the coin's contracts, not just this one. Click to sort, biggest build-up first.">7d OI</th>
@@ -3966,8 +3976,8 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
   <div class="dash-sec">
     <div class="dash-sec-ttl">The answer &mdash; a checklist, not a prediction</div>
     <div class="rules">
-      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, more than 6 completed 4H bars (24h) / 8 completed 1H bars (8h) have closed after the signal bar (counted to the last completed bar, not the clock), or the grade is C.</div></div>
-      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment rate, FOMC rate / statement / press conference, Fed Chair speech or testimony) due within 12 hours for a 4H signal or 4 hours for a 1H signal, or printed in the last hour, or a signal bar that has not closed and has no lower-timeframe trigger. BoJ / ECB / BoE rate decisions and the rest of the market movers never block; one due within 24 hours shows as a MACRO tag, and so does a USD print above that the answer does not name (e.g. CPI in 6 hours on a 1H row).</div></div>
+      <div class="rule"><div class="rule-n">01</div><div class="rule-b"><b>No comes first.</b> The stop was hit, price already made 1R or more, the grade is C, or more than 12 completed 4H bars (48h) / 12 completed 1H bars (12h) have closed after the signal bar (counted to the last completed bar, not the clock) and price has moved away from the signal.</div></div>
+      <div class="rule"><div class="rule-n">02</div><div class="rule-b"><b>Not yet names the one thing missing.</b> A setup past its fresh window whose price is still at the signal with the stop untouched (watch only: at that age it never becomes a Yes), a counter-trend setup below grade A (watch only), a pullback to the signal price after price ran more than 2%, a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment rate, FOMC rate / statement / press conference, Fed Chair speech or testimony) due within 12 hours for a 4H signal or 4 hours for a 1H signal, or printed in the last hour, or a signal bar that has not closed and has no lower-timeframe trigger. BoJ / ECB / BoE rate decisions and the rest of the market movers never block; one due within 24 hours shows as a MACRO tag, and so does a USD print above that the answer does not name (e.g. CPI in 6 hours on a 1H row).</div></div>
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run. The brief on top of the Scan page is built from the same rows: BTC's state and the nearest USD print come from the scan, and only the print's countdown keeps running.</div></div>
@@ -4537,6 +4547,7 @@ function checks(r){
   a.push(p.forming ? (p.trigger_first ? ['', 'Signal bar still forming, lower timeframe already triggered']
                                       : ['w', 'Signal bar still forming, no lower-timeframe trigger yet'])
        : p.fresh ? ['', 'Fresh: ' + p.bars_ago + ' of ' + lim + ' bars used']
+       : p.status === 'active' && p.grade !== 'C' ? ['w', 'Past the fresh window: ' + p.bars_ago + ' ' + tfLabel(tf) + ' bars (limit ' + lim + '), watch only']
                  : ['x', 'Too old: ' + p.bars_ago + ' ' + tfLabel(tf) + ' bars (limit ' + lim + ')']);
   a.push(p.grade === 'C' ? ['x', 'Grade C, needs B or better'] : ['', 'Grade ' + p.grade]);
   a.push(p.regime === 'COUNTER TREND' && p.grade !== 'A' ? ['w', 'Counter trend, needs grade A'] : ['', cap(p.regime)]);
@@ -4562,6 +4573,8 @@ function whatToDo(r){
       : 'This passes the checklist. ') +
     'Entry, stop and targets are under the chart. Size the trade so a stop-out is a loss you can accept.';
   if(v === 'wait'){
+    if(!primary(r).fresh && !primary(r).forming)
+      return 'This one is past its fresh window. Price is still at the entry, so it stays on your watch list, but it will not turn into a Yes. Wait for a new signal.';
     var w = checks(r).filter(function(c){ return c[0] === 'w'; }).map(function(c){ return c[1]; });
     return 'Close, but not yet. Watch it' + (w.length ? '; it is waiting on this: ' + w.join('; ') + '.' : '. The sentence above says what it is waiting for.');
   }

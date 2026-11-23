@@ -816,7 +816,14 @@ class PageLogic(unittest.TestCase):
         self.assertEqual([c[0] for c in got[0]], ["", "", "", "", "w"])       # the print is inside the 12h window
         self.assertEqual([c[0] for c in got[1]], ["", "", "", "w", "w"])
         self.assertEqual(got[2][1], ["x", "Grade C, needs B or better"])
-        self.assertEqual(got[0][0][1], "Fresh: 1 of 6 bars used")
+        self.assertEqual(got[0][0][1], "Fresh: 1 of 12 bars used")
+        old = self.js_value("[checks(row('EEE', 'wait', 'Not yet. Watch only: old', {fresh: false, bars_ago: 14})),"
+                            " checks(row('FFF', 'skip', 'No. old', {fresh: false, bars_ago: 14, status: 'extended'}))]")
+        self.assertEqual(old[0][0], ["w", "Past the fresh window: 14 4H bars (limit 12), watch only"])
+        self.assertEqual(old[1][0], ["x", "Too old: 14 4H bars (limit 12)"])
+        say = self.js_value("whatToDo(row('EEE', 'wait', 'Not yet. Watch only: old', {fresh: false, bars_ago: 14}))")
+        self.assertIn("past its fresh window", say)
+        self.assertIn("will not turn into a Yes", say)
 
 
 def real_rows():

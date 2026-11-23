@@ -195,8 +195,9 @@ class GradeSignals(unittest.TestCase):
         self.assertIsNone(late["trigger_price"])
 
     def test_a_stale_4h_signal_gets_no_15m_trigger(self):
-        s = self.sig("4h", n=102)
-        self.assertFalse(s["fresh"])
+        # 13 bars (52h) after the signal bar, past the 48h window
+        s = m.signals_for_tf(wave_df(LONG[:-1] + [(14, 1, 0)], freq="4h"), "4h", self.R, 100.5, "ENS/USDT:USDT", 9e7)[0]
+        self.assertEqual((s["bars_ago"], s["fresh"]), (13, False))
         self.assertNotIn("15M TRIGGER", self.grade(s, df15=ltf_for(s))["tags"])
 
     def test_oi_uses_hourly_when_it_covers_wave_b_else_daily(self):

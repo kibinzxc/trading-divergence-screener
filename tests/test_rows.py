@@ -42,14 +42,32 @@ class EntryVerdict(unittest.TestCase):
         self.assertEqual(v["verdict"], "skip")
         self.assertIn("2.5x the risk", v["reason"])
 
-    def test_old_signal_bar_is_no(self):
+    def test_fresh_windows_are_48h_on_4h_and_12h_on_1h(self):
+        self.assertEqual((m.TF_CFG["4h"]["fresh_h"], m.TF_CFG["1h"]["fresh_h"]), (48, 12))
+
+    def test_old_signal_with_price_still_at_entry_is_watch_only(self):
         v = m.entry_verdict(sig(fresh=False, bars_ago=20))
+        self.assertEqual((v["verdict"], v["level"]), ("wait", None))
+        self.assertTrue(v["reason"].startswith("Not yet. Watch only:"))
+        self.assertIn("20 completed 1H bars (20h) have closed after the signal bar", v["reason"])
+        self.assertIn("past the 12 bars (12h) for a fresh entry on 1H", v["reason"])
+        v = m.entry_verdict(sig(tf="4h", fresh=False, bars_ago=13))
+        self.assertIn("13 completed 4H bars (52h)", v["reason"])
+        self.assertIn("past the 12 bars (48h) for a fresh entry on 4H", v["reason"])
+
+    def test_old_signal_never_becomes_yes(self):
+        for kw in ({}, {"forming": True, "trigger_first": True}, {"grade": "B"}, {"regime": "COUNTER TREND", "grade": "A"}):
+            self.assertEqual(self.verdict(sig(fresh=False, bars_ago=20, **kw)), "wait", kw)
+
+    def test_old_signal_is_no_once_price_has_left_the_entry_or_the_grade_is_c(self):
+        v = m.entry_verdict(sig(fresh=False, bars_ago=20, status="extended", pct_chg=3.1))
         self.assertEqual(v["verdict"], "skip")
         self.assertIn("20 completed 1H bars (20h) have closed after the signal bar", v["reason"])
-        self.assertIn("limit on 1H is 8 bars, 8h", v["reason"])
-        v = m.entry_verdict(sig(tf="4h", fresh=False, bars_ago=7))
-        self.assertIn("7 completed 4H bars (28h)", v["reason"])
-        self.assertIn("limit on 4H is 6 bars, 24h", v["reason"])
+        self.assertIn("limit on 1H is 12 bars, 12h", v["reason"])
+        self.assertIn("moved away", v["reason"])
+        self.assertEqual(self.verdict(sig(fresh=False, bars_ago=20, grade="C", score=41)), "skip")
+        self.assertEqual(self.verdict(sig(fresh=False, bars_ago=20, status="invalidated")), "skip")
+        self.assertEqual(self.verdict(sig(fresh=False, bars_ago=20, status="ran", r_reached=2.5)), "skip")
 
     def test_grade_c_is_no(self):
         v = m.entry_verdict(sig(grade="C", score=41))
@@ -220,7 +238,7 @@ class BuildRows(unittest.TestCase):
         self.assertEqual(r["primary_tf"], "4h")
 
     def test_wait_beats_skip(self):
-        r = m.build_rows([full_sig("4h", "bullish", fresh=False),
+        r = m.build_rows([full_sig("4h", "bullish", status="invalidated"),
                           full_sig("1h", "bullish", status="extended")])[0]
         self.assertEqual((r["primary_tf"], r["entry"]["verdict"]), ("1h", "wait"))
 

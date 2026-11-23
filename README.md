@@ -121,9 +121,11 @@ serves both the API and a browser dashboard.
   bars). Nothing further is fetched for it, and the audit line says how many
   were hidden. The backtest still replays every signal.
 - **Good to enter?** (the Answer column): every row answers Yes, Not yet or No in plain language.
-  First matching rule wins. No: stop hit, already ran 1R, more than 6
-  completed 4H bars (24h) / 8 completed 1H bars (8h) after the signal bar
-  (counted to the last completed bar's close, not the clock), or grade C. Not yet:
+  First matching rule wins. No: stop hit, already ran 1R, grade C, or more than 12
+  completed 4H bars (48h) / 12 completed 1H bars (12h) after the signal bar
+  (counted to the last completed bar's close, not the clock) with price moved
+  away from the signal. Not yet: past that window but price still at the signal
+  with the stop untouched (watch only, never a Yes),
   counter trend below grade A, price more than 2% past the signal price, or
   a high-impact USD print (CPI, Core PCE, PPI, non-farm payrolls, unemployment
   rate, FOMC rate / statement / press conference, Fed Chair) due within 12

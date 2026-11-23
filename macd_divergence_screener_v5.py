@@ -4417,7 +4417,8 @@ function levelsStrip(r, s, tf){
 }
 function chartBlock(r, tf){
   var s = r.signals[tf], up = r.side === 'bullish', capn = r.base + ' ' + tfLabel(tf) + ' ' + r.side + ' divergence';
-  var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf;
+  /* v = the scan's time: the address must change with each scan, or the browser keeps showing the first image */
+  var src = '/chart?pair=' + encodeURIComponent(r.pair) + '&side=' + r.side + '&tf=' + tf + '&v=' + (scanTs || 0);
   /* A phone gets the narrow render, readable at its width. Chosen when the row opens: a <picture> would
      refetch the uncached image every time the window is resized. */
   return '<div class="chartbig"><div class="cimg"><a href="' + src + '" data-cap="' + capn + '" onclick="return zoomChart(this.href, this.dataset.cap)" title="Enlarge the chart">' +

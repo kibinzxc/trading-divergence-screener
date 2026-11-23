@@ -288,6 +288,12 @@ class Chart(unittest.TestCase):
         r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h"})
         self.assertEqual((r.status_code, r.mimetype, r.data[:4]), (200, "image/png", b"\x89PNG"))
 
+    def test_chart_is_never_cached_and_its_address_changes_per_scan(self):
+        r = self.c.get("/chart", query_string={"pair": "ENS/USDT:USDT", "side": "bullish", "tf": "1h", "v": "123"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("no-store", r.headers["Cache-Control"])
+        self.assertIn("'&tf=' + tf + '&v=' + (scanTs || 0)", m.app.test_client().get("/").get_data(as_text=True))
+
     def test_unknown_row_is_404(self):
         r = self.c.get("/chart", query_string={"pair": "NOPE/USDT:USDT", "side": "bullish", "tf": "1h"})
         self.assertEqual(r.status_code, 404)

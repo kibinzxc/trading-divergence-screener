@@ -3328,8 +3328,8 @@ HTML = r"""<!DOCTYPE html>
   --blue:#9DB7DA;--blue-bg:#1C2636;--violet:#B3A6D6;--violet-bg:#252238;--teal:#8CC2C0;--teal-bg:#18292B;
   --sans:'Inter',system-ui,sans-serif;--mono:'JetBrains Mono',ui-monospace,monospace;
 }
-body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.55;padding:0 16px 64px}
-.shell{max-width:1020px;margin:0 auto}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.55;padding:0 24px 64px}
+.shell{max-width:1440px;margin:0 auto}   /* wide screens get the room; prose stays at 68ch */
 button,select,input{font:inherit;color:inherit}
 button{cursor:pointer}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:4px}
@@ -3467,7 +3467,8 @@ td .sub{display:block;font-size:13px;color:var(--tx3)}
 td.none{color:var(--tx3);cursor:default}
 td.coin{white-space:nowrap}
 td.why{min-width:200px}
-#resT th,#resT td{padding-inline:12px}
+#resT th,#resT td{padding-inline:18px}
+#resT tr.row td{padding-block:16px}
 .tf{font-size:12px;color:var(--tx3);margin-left:6px}
 .tf.on{color:var(--tx2)}
 .tag,.bdg,.thin-badge,.cal-imp{display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin:4px 4px 0 0;white-space:nowrap}

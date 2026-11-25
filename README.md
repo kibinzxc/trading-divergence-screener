@@ -73,6 +73,11 @@ serves both the API and a browser dashboard.
   signal (Yes beats Not yet beats No, 4H wins a tie); the brighter timeframe
   shows which. The `4H+1H`, `4H only` and `1H only` filters pick rows by
   which timeframes diverge.
+- **Both sides on one coin**: a coin with a long and a short row is tagged
+  `BOTH SIDES`. On the same timeframe the newer completed signal replaces the
+  older one, which answers No (its MACD has crossed back the other way); a
+  forming or stopped signal never replaces anything. On different timeframes
+  both stay as separate trades.
 - **The opened row**: click a row (or focus it and press Enter or Space). Top
   to bottom: the answer strip (the answer, its reason, a tick / dots / cross
   chip per check and an "In plain words" line saying what to do); the chart
@@ -107,10 +112,11 @@ serves both the API and a browser dashboard.
   what waits on it, and up to three cards (the Yes rows, highest score first;
   failing that the two closest Not yet rows; failing that the three newest
   signals and why each is a No). A card opens its row in the table.
-- **A seven-column table**: Coin (with two tags and +N), Side and TF, Grade,
-  Answer (with the first sentence of the reason), Entry, Stop, 7d OI. No rows
-  are folded under "Show N that did not pass, newest first" until you unfold
-  them or pick the All filter. The scan controls (exchange, volume floor,
+- **An eight-column table**: Coin (with two tags and +N), Side and TF, Signal
+  (how long ago the signal bar closed, and its PHT time; click to sort newest
+  first), Grade, Answer (with the first sentence of the reason), Entry, Stop,
+  7d OI. No rows are listed by default under the All filter; the button under
+  the table folds them away. The scan controls (exchange, volume floor,
   strictness, max pairs, speed, specific coins) are in the closed
   "Scan settings" panel next to the Run Scan button. The answer pill reads
   Yes, Yes (early), Not yet or No. On a screen narrower than 640px each row

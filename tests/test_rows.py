@@ -219,6 +219,23 @@ class BuildRows(unittest.TestCase):
         self.assertEqual(sorted((r["side"], r["tfs"][0]) for r in rows),
                          [("bearish", "1h"), ("bullish", "4h")])
 
+    def test_same_tf_newer_opposite_signal_replaces_the_older(self):
+        old = full_sig("1h", "bearish", bars_ago=14, signal_time="Nov 25 2026, 03:00 AM")
+        new = full_sig("1h", "bullish", bars_ago=5, signal_time="Nov 25 2026, 12:00 PM")
+        r = {r["side"]: r for r in m.build_rows([old, new])}
+        self.assertEqual(r["bearish"]["entry"]["verdict"], "skip")
+        self.assertIn("Replaced by the newer long divergence on 1H (signal Nov 25 2026, 12:00 PM PHT)",
+                      r["bearish"]["entry"]["reason"])
+        self.assertEqual(r["bullish"]["entry"]["verdict"], "enter")
+
+    def test_forming_stopped_or_other_tf_opposite_signal_replaces_nothing(self):
+        for new in (full_sig("1h", "bullish", bars_ago=0, forming=True, signal_time="x"),
+                    full_sig("1h", "bullish", bars_ago=5, status="invalidated", signal_time="x"),
+                    full_sig("4h", "bullish", bars_ago=1, signal_time="x")):
+            old = full_sig("1h", "bearish", bars_ago=14, fresh=False, signal_time="y")
+            r = {r["side"]: r for r in m.build_rows([old, new])}
+            self.assertNotIn("Replaced", r["bearish"]["entry"]["reason"])
+
     def test_fresh_1h_is_primary_when_the_4h_signal_is_dead(self):
         r = m.build_rows([full_sig("4h", "bullish", status="invalidated"),
                           full_sig("1h", "bullish")])[0]

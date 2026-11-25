@@ -578,7 +578,7 @@ class Page(unittest.TestCase):
                          ["calendar", "learn", "movers", "scan", "tags"])
 
     def test_oi_column_and_tags_page(self):
-        for want in ('data-sort="oi"', "function oiCell", 'id="tagsBody"', 'colspan="7"'):
+        for want in ('data-sort="oi"', "function oiCell", 'id="tagsBody"', 'colspan="8"'):
             self.assertIn(want, self.html, want)
         # every tag the Tags page lists has a definition
         groups = re.search(r"var TAG_GROUPS = \[(.*?)\n\];", self.html, re.S).group(1)
@@ -613,11 +613,11 @@ class Page(unittest.TestCase):
                      "function gradeCell", "/chart?pair=", "'W-PATTERN'", "'LTF TRIGGER'"):
             self.assertIn(want, self.html, want)
 
-    def test_seven_columns(self):
+    def test_eight_columns(self):
         head = re.search(r'<table id="resT">\s*<thead>(.*?)</thead>', self.html, re.S).group(1)
         self.assertEqual(re.findall(r"<th[^>]*>([^<]+)</th>", head),
-                         ["Coin", "Side and TF", "Grade", "Answer", "Entry", "Stop", "7d OI"])
-        for gone in ('colspan="11"', "function ctxCell", 'data-sort="age"'):
+                         ["Coin", "Side and TF", "Signal", "Grade", "Answer", "Entry", "Stop", "7d OI"])
+        for gone in ('colspan="11"', "function ctxCell"):
             self.assertNotIn(gone, self.html, gone)
 
     def test_brief_and_fold(self):

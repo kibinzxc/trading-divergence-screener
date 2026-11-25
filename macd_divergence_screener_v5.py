@@ -914,7 +914,8 @@ def entry_verdict(sig, blocker=None):
     """Is this setup enterable as of the scan? A CHECKLIST, not a prediction.
 
     First matching rule wins (spec "Good to enter?"):
-      skip   stop hit · already ran 1R+ · grade C · signal bar past the fresh
+      skip   stop hit · already ran 1R+ · replaced by a newer opposite signal
+             on the same timeframe (set by build_rows) · grade C · signal bar past the fresh
              window with price moved away from the signal
       wait   signal bar past the fresh window but price still at the entry
              (watch only, never a Yes) · counter trend below grade A ·
@@ -938,6 +939,11 @@ def entry_verdict(sig, blocker=None):
     if st == "ran":
         return out("skip", f"No. Price already moved {sig['r_reached']:g}x the risk toward the "
                            "target. The move has happened; entering now is chasing it.")
+    rep = sig.get("replaced_by")
+    if rep:
+        return out("skip", f"No. Replaced by the newer {'long' if rep['side'] == 'bullish' else 'short'} "
+                           f"divergence on {cfg['label']} (signal {rep['signal_time']} PHT): MACD has "
+                           "crossed back the other way, so the momentum this setup needs is gone.")
     if sig["grade"] == "C":
         return out("skip", f"No. Weak setup: grade C, score {sig['score']} of 100.")
     if not sig["fresh"]:
@@ -2022,6 +2028,15 @@ def build_rows(sigs, mover=None, flow=None, context_error=None, blocker=None, ma
             "mover": mover, "flow": flow, "context_error": context_error})
         r["tfs"].append(s["tf"])
         r["signals"][s["tf"]] = s
+    # Both sides on one timeframe: the newer cross reversed the older one's momentum, so the
+    # older is replaced. Not by a forming cross (it can still undo) or a stopped one (that
+    # stop-out is the older side's move resuming).
+    if len(rows) == 2:
+        for tf in set(rows["bullish"]["signals"]) & set(rows["bearish"]["signals"]):
+            old, new = sorted((rows["bullish"]["signals"][tf], rows["bearish"]["signals"][tf]),
+                              key=lambda s: -s["bars_ago"])
+            if old["bars_ago"] > new["bars_ago"] and not new["forming"] and new["status"] != "invalidated":
+                old["replaced_by"] = {"side": new["side"], "signal_time": new["signal_time"]}
     for r in rows.values():
         verdicts = {tf: entry_verdict(r["signals"][tf], blocker)
                     for tf in r["tfs"]}
@@ -3787,7 +3802,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
           <button class="ftab" data-f="both" onclick="setF(this)" title="Rows that diverge on both 4H and 1H (the same side on each), answering Yes or Not yet.">4H+1H</button>
           <button class="ftab" data-f="h4" onclick="setF(this)" title="Rows that diverge on 4H only, not on 1H, answering Yes or Not yet.">4H only</button>
           <button class="ftab" data-f="h1" onclick="setF(this)" title="Rows that diverge on 1H only, not on 4H, answering Yes or Not yet.">1H only</button>
-          <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence listed, including the No rows: ones that already played out, were stopped, or are too old to act on. A signal whose signal bar closed more than __MAX_AGE_H__ hours ago is not listed at all; the audit line under the table counts those. Until you pick this, those are folded under the table.">All</button>
+          <button class="ftab active" data-f="all" onclick="setF(this)" title="Every divergence listed, including the No rows: ones that already played out, were stopped, or are too old to act on. A signal whose signal bar closed more than __MAX_AGE_H__ hours ago is not listed at all; the audit line under the table counts those. The button under the table folds the No rows away.">All</button>
         </div>
       </div>
       <div class="tw">
@@ -3795,8 +3810,9 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
           <thead><tr>
             <th title="The coin, then at most two of its tags and +N for the rest. Open the row for every tag; hover a tag for its definition, or open the Tags page for the full list.">Coin</th>
             <th title="long: a regular bullish divergence. Across two MACD troughs, price makes a lower low while the MACD line makes a higher trough. short: a regular bearish divergence, the mirror on two peaks. Then the timeframes that diverge; the brighter one supplies the answer and the levels.">Side and TF</th>
+            <th class="sortable" data-sort="age" title="When the signal bar of the timeframe that gives the answer closed: how long before the scan, and the time in PHT. forming: the signal bar is the candle still open. Click to sort, newest first.">Signal</th>
             <th title="Grade and quality score 0-100: A is 70 or more, B is 55-69, C is below 55. Pattern points (up to 70) plus context points (higher timeframe, OI with funding, BTC state: 10 each). Context the data cannot check is left out and the score is rescaled to 100 (tag PARTIAL DATA). It describes the setup; it is not a win rate. Run the backtest to see how each grade has done.">Grade</th>
-            <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, the grade is C, or more than 12 completed 4H bars (48h) / 12 completed 1H bars (12h) have closed after the signal bar and price has moved away from the signal. Not yet: past that window but price still at the signal with the stop untouched (watch only, it never becomes a Yes), counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Under the answer: the first sentence of the reason; open the row for all of it. Default order: Yes, then Not yet, then No; highest score first, No rows newest first. Click to return to it.">Answer</th>
+            <th class="sortable sorted" data-sort="score" title="A checklist, not a prediction. First matching rule wins. No: the stop was hit, price already ran 1R, a newer completed signal on the other side of the same timeframe replaced it, the grade is C, or more than 12 completed 4H bars (48h) / 12 completed 1H bars (12h) have closed after the signal bar and price has moved away from the signal. Not yet: past that window but price still at the signal with the stop untouched (watch only, it never becomes a Yes), counter trend below grade A, price more than 2% past the signal price, a USD CPI / PCE / PPI / jobs / FOMC / Fed Chair print due within 12h (4H) or 4h (1H) or printed in the last hour, or a signal bar still forming with no lower-timeframe trigger. Otherwise Yes. Under the answer: the first sentence of the reason; open the row for all of it. Default order: Yes, then Not yet, then No; highest score first, No rows newest first. Click to return to it.">Answer</th>
             <th title="The entry reference: the signal price (the close of the MACD cross that ends the second wave), or the lower-timeframe trigger price when that fired first. 1R / 2R / 3R are measured from it; open the row to see them.">Entry</th>
             <th title="Beyond price extreme B by 0.25 ATR, and the distance to it from the entry as a percentage. Price trading through it means the divergence has failed.">Stop</th>
             <th class="sortable" data-sort="oi" title="Change in this coin's open interest (in dollars) over the last 7 days. Context only: it never changes the answer or the score. n/a means the exchange has too little OI history for this contract. On OKX it covers all of the coin's contracts, not just this one. Click to sort, biggest build-up first.">7d OI</th>
@@ -3981,7 +3997,7 @@ dialog.zoom::backdrop{background:rgba(5,8,14,.78);backdrop-filter:blur(3px)}
       <div class="rule"><div class="rule-n">03</div><div class="rule-b"><b>Yes (confirmed) and Yes (early).</b> Confirmed means the signal bar has closed and nothing above applies. Early means the signal bar is still forming but the lower timeframe (1H or 15m for 4H, 15m for 1H) has already crossed its MACD and closed beyond its last swing since B. A 4H signal's 15m trigger counts only if it closes within 8 hours of the 4H close.</div></div>
       <div class="rule"><div class="rule-n">04</div><div class="rule-b"><b>Regime changes the bar, it never blocks.</b> BTC 4H is BULL (RSI above 55 and close above its 200 EMA), BEAR (RSI below 45 and close below it) or CHOP (anything else). WITH TREND means the BTC state and the coin's own 200 EMA both agree with the signal. CHOP keeps the normal cutoff, because ranges are where reversals work. Anything else, missing BTC data included, is COUNTER TREND and needs grade A.</div></div>
       <div class="rule"><div class="rule-n">05</div><div class="rule-b"><b>The answer ages.</b> It uses the live price at the moment of the scan. Once the scan is more than an hour old the answers dim and the page asks for a re-run. The brief on top of the Scan page is built from the same rows: BTC's state and the nearest USD print come from the scan, and only the print's countdown keeps running.</div></div>
-      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open the row and use its 4H | 1H switch for each timeframe's chart, levels, setup and score; the answer strip on top stays the row's, and the other tab says what that timeframe alone would answer. The chart is not a picture kept from the scan: it is fetched from the exchange when you open the row and has two views. <b>At the signal</b> ends on the signal bar, as the setup stood when it was found. <b>Now</b> runs to the present, with the candle that is still open drawn faded, a line at the current price, and a sentence on what price has done since the signal; if that contradicts a Yes or Not yet from the scan (the stop was hit, or 1R was reached), the row says the answer is out of date. Refresh fetches the candles again. The 4H+1H, 4H only and 1H only filters pick rows by which timeframes diverge.</div></div>
+      <div class="rule"><div class="rule-n">06</div><div class="rule-b"><b>One row per coin and side.</b> When 4H and 1H diverge the same way the row shows both timeframes and takes its answer, grade and levels from the better one (Yes beats Not yet beats No, 4H wins a tie); the brighter one shows which. Open the row and use its 4H | 1H switch for each timeframe's chart, levels, setup and score; the answer strip on top stays the row's, and the other tab says what that timeframe alone would answer. The chart is not a picture kept from the scan: it is fetched from the exchange when you open the row and has two views. <b>At the signal</b> ends on the signal bar, as the setup stood when it was found. <b>Now</b> runs to the present, with the candle that is still open drawn faded, a line at the current price, and a sentence on what price has done since the signal; if that contradicts a Yes or Not yet from the scan (the stop was hit, or 1R was reached), the row says the answer is out of date. Refresh fetches the candles again. The 4H+1H, 4H only and 1H only filters pick rows by which timeframes diverge. A coin with a long and a short row is tagged BOTH SIDES; when the two are on the same timeframe, the newer completed signal replaces the older one, which answers No (its MACD has crossed back the other way). The Signal column says when each row's signal bar closed; click it to sort newest first.</div></div>
     </div>
   </div>
 
@@ -4102,6 +4118,7 @@ function tag(k, txt){ return '<span class="tag' + (FAM[k] ? ' t-' + FAM[k] : '')
 /* Every tag of a row, pattern tags first. The Coin cell shows two; the opened row shows all. */
 function rowTags(r){      /* [name in TIP, text shown] */
   var t = (primary(r).tags || []).map(function(f){ return [f, f]; });
+  if(otherSide(r)) t.unshift(['BOTH SIDES', 'BOTH SIDES']);   /* first, so the Coin cell always shows it */
   (r.venue_tags || []).forEach(function(f){ t.push([f.indexOf('ALSO ON') === 0 ? 'ALSO ON' : f, f]); });
   if(r.macro) t.push(['MACRO', calEsc(r.macro)]);
   ((r.mover || {}).flags || []).forEach(function(f){ t.push([f, f]); });
@@ -4180,6 +4197,7 @@ var TIP = {
   'CHOP':            'BTC 4H is neither BULL nor BEAR: RSI between 45 and 55, or RSI and the 200 EMA disagree. A reversal keeps the normal cutoff (grade B is enough for Yes); the BTC score points are not earned.',
   'PARTIAL DATA':    'Some score context could not be checked (higher timeframe, open interest or funding, or BTC). It is left out and the score is what was earned out of what could be checked, scaled to 100. In practice it is the open interest change into B: unreadable when price extreme B falls on the first bar of wave B (there is no interval to measure), when the exchange has no hourly OI history that far back, or when the venue reports no funding.',
   'NOT ON BINANCE':  'All-exchanges scan only. Binance does not list this coin, so its data comes from whichever of OKX / Bybit trades more of it (the venue is Data from on the Market card of the opened row).',
+  'BOTH SIDES':      'This coin has a long and a short divergence in the same scan. On the same timeframe the newer completed signal replaces the older one, which answers No. On different timeframes (say a 4H short and a 1H long) both stay: separate trades, often a bounce inside a bigger move. Open the row to see the other side.',
   'ALSO ON':         'All-exchanges scan only. The same divergence, same side and timeframe, also fires on the named venue(s) within one bar of this one. Confirmation only: it adds no points. A venue that could not be fetched is simply not named.'
 };
 function tip(k){ return TIP[k] ? ' title="' + TIP[k] + '"' : ''; }
@@ -4191,6 +4209,7 @@ var TAG_GROUPS = [
   ['Regime (sets how high the grade must be)', '', ['WITH TREND','CHOP','COUNTER TREND']],
   ['Score', 'caution', ['PARTIAL DATA']],
   ['Exchanges (All scan only, e.g. ALSO ON OKX, BYBIT)', 'caution', ['NOT ON BINANCE','ALSO ON']],
+  ['Direction', 'caution', ['BOTH SIDES']],
   ['Calendar (shown with the print and its countdown, e.g. MACRO BOJ Policy Rate in 6h)', 'caution', ['MACRO']],
   ['Open interest: 7-day positioning', 'flow', ['7d OI','NEW LONGS','NEW SHORTS','SHORT COVERING','CAPITULATION']],
   ['Open interest: funding and crowding', 'flow', ['SPOT-LED','CROWDED LONGS','SQUEEZE FUEL','HIGH OI/VOL']],
@@ -4544,6 +4563,7 @@ function unprefixed(t){ return t.replace(/^(No|Not yet|Yes[^.]*)\.\s*/, ''); }
    '' = passed, 'w' = waiting on it, 'x' = failed. The answer itself comes from the scan. */
 function checks(r){
   var p = primary(r), tf = primaryTf(r), cfg = TFM[tf] || {}, a = [], lim = cfg.fresh_h * 60 / cfg.minutes;
+  if(p.replaced_by) a.push(['x', 'Replaced by the newer ' + (p.replaced_by.side === 'bullish' ? 'long' : 'short') + ' on ' + tfLabel(tf)]);
   a.push(p.forming ? (p.trigger_first ? ['', 'Signal bar still forming, lower timeframe already triggered']
                                       : ['w', 'Signal bar still forming, no lower-timeframe trigger yet'])
        : p.fresh ? ['', 'Fresh: ' + p.bars_ago + ' of ' + lim + ' bars used']
@@ -4863,9 +4883,10 @@ function tfSwitch(r, tf){
 }
 function detailRow(r){
   var tf = shownTf(r), s = r.signals[tf], ptf = primaryTf(r), own = (r.verdicts || {})[tf];
-  return '<tr class="det"><td colspan="7"><div class="detw">' + tfSwitch(r, tf) + verdictStrip(r) +
+  return '<tr class="det"><td colspan="8"><div class="detw">' + tfSwitch(r, tf) + verdictStrip(r) +
     (r.tfs.length > 1 ? plain('Both ' + r.tfs.map(tfLabel).join(' and ') + ' show the same ' + r.side + ' divergence. The answer above comes from ' +
                               tfLabel(ptf) + ', the better of the two; the switch shows each one\'s chart, levels and score.') : '') +
+    bothSides(r) +
     (tf !== ptf && own ? '<p class="alone">On ' + tfLabel(tf) + ' alone this would be: <b>' + (own.verdict === 'enter' && s.forming ? 'Yes (early)' : ANS[own.verdict]) +
                          '</b>. ' + unprefixed(reasonOf(own)) + '</p>' : '') +
     chartBlock(r, tf) + contextCards(r, tf) +
@@ -4873,12 +4894,23 @@ function detailRow(r){
     '<div class="three">' + setupCard(r, s, tf) + scoreCard(s, tf) + tagsCard(r) + '</div>' + words(r.side === 'bullish') +
     '</div></td></tr>';
 }
-var openKey = null, showNo = false;
+/* The same coin's row on the other side, if the scan has one. */
+function otherSide(r){ return pendR.filter(function(x){ return x.pair === r.pair && x.side !== r.side; })[0]; }
+function bothSides(r){
+  var o = otherSide(r); if(!o) return '';
+  return plain('This coin also has a ' + (o.side === 'bullish' ? 'long' : 'short') + ' divergence on ' + o.tfs.map(tfLabel).join(' and ') +
+    ', signal ' + primary(o).signal_time + ' PHT. On the same timeframe the newer completed one replaces the older (that one answers No); ' +
+    'on different timeframes they are separate trades, so check which one you are taking.');
+}
+var openKey = null, showNo = true;    /* No rows show until folded away */
 function buildRow(r){
   var p = primary(r), k = rowKey(r), tags = tagChips(r), more = tags.length - 2;
   return '<tr class="row" data-k="' + k + '" tabindex="0" aria-expanded="' + (openKey === k) + '">' +
     '<td class="coin"><b>' + r.base + '</b><span class="sub">' + tags.slice(0, 2).join('') + (more > 0 ? '<span class="tag">+' + more + '</span>' : '') + '</span></td>' +
-    '<td>' + sideHtml(r) + '</td><td>' + gradeCell(p) + '</td><td class="why">' + evCell(r) + '</td>' +
+    '<td>' + sideHtml(r) + '</td>' +
+    '<td class="num" data-l="Signal">' + (p.forming ? 'forming' : b2t(p.bars_ago, primaryTf(r)) +
+      '<span class="sub">' + String(p.signal_time).replace(/ \d{4},/, ',') + '</span>') + '</td>' +
+    '<td>' + gradeCell(p) + '</td><td class="why">' + evCell(r) + '</td>' +
     '<td class="num" data-l="Entry">' + fmtPx(p.entry_ref_price) + '</td>' +
     '<td class="num" data-l="Stop">' + fmtPx(p.stop_price) + '<span class="sub">risk ' + p.risk_pct + '%</span></td>' +
     '<td class="num ' + (oiVal(r) > 0 ? 'oi-up' : oiVal(r) < 0 ? 'oi-dn' : '') + '" data-l="7d OI">' + oiCell(r) + '</td></tr>';
@@ -4891,6 +4923,7 @@ function renderAll(results){
   var rows = results.filter(function(d){ return matches(d, af); });
   rows.sort(function(a, b){
     if(sortKey === 'oi'){ var x = oiVal(a), y = oiVal(b); return (y == null ? -1e9 : y) - (x == null ? -1e9 : x); }
+    if(sortKey === 'age') return (ageMin(a) - ageMin(b)) || (b.score - a.score);
     return (EV_RANK[verdict(a)] - EV_RANK[verdict(b)]) ||
            (verdict(a) === 'skip' ? ageMin(a) - ageMin(b) : 0) ||   /* played-out rows: newest first */
            (b.score - a.score);
@@ -4901,7 +4934,7 @@ function renderAll(results){
     h += buildRow(r);
     if(openKey === rowKey(r)) h += detailRow(r);
   });
-  if(!h) h = '<tr><td class="none" colspan="7">' + (!results.length ? 'No divergences found.'
+  if(!h) h = '<tr><td class="none" colspan="8">' + (!results.length ? 'No divergences found.'
     : af === 'all' ? 'No setup passes or is waiting right now.' : 'No setup matches this filter.') + '</td></tr>';
   document.getElementById('resB').innerHTML = h;
   document.getElementById('resWrap').style.display = '';
